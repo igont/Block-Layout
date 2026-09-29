@@ -1,0 +1,89 @@
+{
+  "schema_version": "1.0",
+  "fixture_id": "forestbrick-first-10-courses",
+  "integrity": {
+    "source_line_count": 16,
+    "opening_count": 237,
+    "course_count": 10,
+    "course_height_mm": 63,
+    "course_z_mm": [
+      -252,
+      -189,
+      -126,
+      -63,
+      0,
+      63,
+      126,
+      189,
+      252,
+      315
+    ]
+  },
+  "characterization": {
+    "oracle_status": "comparison-only-not-accepted-as-correct",
+    "total_block_count": 1229,
+    "blocks_per_course": [
+      136,
+      135,
+      136,
+      135,
+      114,
+      115,
+      114,
+      115,
+      114,
+      115
+    ]
+  },
+  "normative": {
+    "legacy_block_output_assertions": [],
+    "regular_640_strategy": {
+      "expected_outcome": "unsupported-input",
+      "reason_code": "wall-length-not-divisible-by-grid-step",
+      "non_regular_source_lines": [
+        {
+          "line_index": 0,
+          "source_volume_guid": "94D035A8-07B3-4B9B-9406-9ECBF07386C3",
+          "length_mm": 14400,
+          "remainder_mm": 320
+        },
+        {
+          "line_index": 1,
+          "source_volume_guid": "1A94D040-EB70-4566-95C5-92F663B17C7E",
+          "length_mm": 2240,
+          "remainder_mm": 320
+        },
+        {
+          "line_index": 3,
+          "source_volume_guid": "804C47BF-D645-4A41-85E2-0E920FA1425A",
+          "length_mm": 2240,
+          "remainder_mm": 320
+        },
+        {
+          "line_index": 7,
+          "source_volume_guid": "86FD2350-EEEC-49EC-8D1D-F070F7D45F96",
+          "length_mm": 3520,
+          "remainder_mm": 320
+        },
+        {
+          "line_index": 10,
+          "source_volume_guid": "6AC3FEE0-A67D-4A97-A216-BC2F484D5450",
+          "length_mm": 4160,
+          "remainder_mm": 320
+        },
+        {
+          "line_index": 11,
+          "source_volume_guid": "2EEC9B09-8CAB-4320-9C3A-A21DA4C23F49",
+          "length_mm": 2240,
+          "remainder_mm": 320
+        },
+        {
+          "line_index": 14,
+          "source_volume_guid": "4744D1F0-29E9-4FF9-996C-C9BD29BF7F43",
+          "length_mm": 4160,
+          "remainder_mm": 320
+        }
+      ]
+    }
+  }
+}

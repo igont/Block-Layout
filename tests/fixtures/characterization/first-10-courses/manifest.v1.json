@@ -1,0 +1,84 @@
+{
+  "schema_version": "1.0",
+  "fixture_id": "forestbrick-first-10-courses",
+  "fixture_kind": "characterization",
+  "description": "Первые десять венцов сложной модели для переноса на новый движок раскладки.",
+  "provenance": {
+    "captured_at_local": "25.08.2026 16:55",
+    "source_location_note": "Исходный каталог не является частью переносимого контракта.",
+    "source_layer": {
+      "file": "layer -252.json",
+      "sha256": "b271dc796da71b3d55adedfa7378b175c64136b5ba741eec5bd13aac32571e96",
+      "modified_at_local": "25.08.2026 16:55"
+    },
+    "source_openings": {
+      "file": "openings.json",
+      "sha256": "8da7ce1673897de3459730ed91239a04e51c55ab987812d070106e7f3a85d430",
+      "modified_at_local": "25.08.2026 16:55"
+    },
+    "source_config": {
+      "file": "config JAR.txt",
+      "sha256": "334ce129f98ea66f4ec68b93829799e5dfd10c29f02356257c0d03a6b9d5d323",
+      "modified_at_local": "24.04.2026 15:26"
+    },
+    "source_blocks": {
+      "file": "blocks.json",
+      "sha256": "fb2cc24b82fb3f35225668b316a6555dcd398df2480c33b24a89c05ac8ba229e",
+      "modified_at_local": "25.08.2026 16:55"
+    },
+    "source_log": {
+      "file": "log JAR.txt",
+      "sha256": "8e3701351ff2e194a1699f5fe6e0d15a494a05538148764c41762c43eff602c5",
+      "modified_at_local": "25.08.2026 16:55"
+    },
+    "producer_binary": "not-pinned",
+    "producer_note": "Текущий ForestBrick.jar новее blocks.json, поэтому он не объявлен точным бинарным производителем этого результата."
+  },
+  "files": {
+    "request": "input/layout-request.v1.json",
+    "observed_result": "observed/layout-result.v1.json",
+    "assertions": "contract/assertions.v1.json",
+    "raw_layer": "raw/input/layer_-252.json",
+    "raw_openings": "raw/input/openings.json",
+    "raw_config": "raw/input/config_JAR.txt",
+    "checksums": "SHA256SUMS.txt"
+  },
+  "test_contract": {
+    "request_is_normative_input": true,
+    "observed_result_is_normative_output": false,
+    "observed_result_use": "characterization-diff-only",
+    "comparison": {
+      "collection_semantics": "unordered-multiset",
+      "linear_quantum_m": 1E-06,
+      "angle_quantum_rad": 1E-09,
+      "source_volume_guids_semantics": "unordered-set",
+      "cuts_semantics": "unordered-multiset",
+      "compare_all_block_fields": true,
+      "block_fields": [
+        "posX",
+        "posY",
+        "angleRad",
+        "floor",
+        "switchToX",
+        "length",
+        "isDobor",
+        "removePipesStart",
+        "removePipesEnd",
+        "uteplitAdd",
+        "isBridge",
+        "bridgeCode1",
+        "bridgeCode2",
+        "bridgeNominalLength",
+        "sourceVolumeGuid",
+        "sourceVolumeGuids",
+        "cuts"
+      ],
+      "cut_fields": [
+        "cut",
+        "x",
+        "y"
+      ]
+    },
+    "normative_assertions_file": "contract/assertions.v1.json"
+  }
+}

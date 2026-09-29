@@ -1,0 +1,330 @@
+{
+  "$schema": "https://codex.local/schemas/boundary-contract-v1.schema.json",
+  "schema": "boundary-contract/v1",
+  "contract_id": "BC-FBL-LAYOUT-RESULT",
+  "contract_version": "1",
+  "status": "BLOCKED",
+  "human_contract": "BC-FBL-LAYOUT-RESULT.md",
+  "producer": {
+    "module": "FB Layout: вычислительный контур Rust",
+    "responsibility": "Материализовать проверенный полный план с учтёнными конструктивными ограничениями либо вернуть типизированный отказ"
+  },
+  "execution_scope": {
+    "platform_strategy": "CURRENT_ONLY",
+    "current_environments": [
+      "Windows local с Archicad, TestAddon и отдельным вычислительным процессом"
+    ],
+    "deferred_environments": [
+      {
+        "environment": "Linux local",
+        "architecture_status": "UNDEFINED",
+        "implementation_status": "NOT_IMPLEMENTED"
+      },
+      {
+        "environment": "macOS local",
+        "architecture_status": "UNDEFINED",
+        "implementation_status": "NOT_IMPLEMENTED"
+      }
+    ],
+    "ports": [
+      {
+        "id": "PORT-FBL-LEGACY-RESULT-FILE",
+        "owner": "Действующий Java-процесс ForestBrick",
+        "capabilities": [
+          "записать C:\\ForestBrick\\blocks.json",
+          "передать список блоков потребителю TestAddon"
+        ],
+        "required_now": true,
+        "implementation_status": "IMPLEMENTED"
+      },
+      {
+        "id": "PORT-FBL-RUST-RESULT",
+        "owner": "FB Layout: вычислительный контур Rust",
+        "capabilities": [
+          "атомарно опубликовать C:\\ForestBrick\\operations\\<requestId>\\result.json",
+          "связать исход с requestId, хэшем снимка и редакцией каталога"
+        ],
+        "required_now": true,
+        "implementation_status": "NOT_IMPLEMENTED"
+      }
+    ]
+  },
+  "consumers": [
+    "TestAddon: интеграционный контур Archicad"
+  ],
+  "machine_contracts": [],
+  "inputs": [
+    {
+      "id": "IN-FBL-LAYOUT-REQUEST",
+      "meaning": "Принятый запрос той же операции по BC-FBL-LAYOUT-REQUEST",
+      "required": true,
+      "producer": "TestAddon: интеграционный контур Archicad",
+      "authority": {
+        "kind": "DERIVED",
+        "source_ref": "../../../../ACAPI/TestAddon/Docs/BoundaryContracts/BC-FBL-LAYOUT-REQUEST.boundary.json",
+        "sha256": "f9eaf070579acabbf1e507b47ef718585eefd0341e2d7439de194e2c0f8afd0e"
+      },
+      "format": "BC-FBL-LAYOUT-REQUEST версии 1",
+      "schema_ref": "../../../../ACAPI/TestAddon/Docs/BoundaryContracts/BC-FBL-LAYOUT-REQUEST.boundary.json",
+      "version": "1",
+      "identity": "Идентификатор одной операции раскладки",
+      "units": "Исходные миллиметры с десятичной точностью по BC-FBL-LAYOUT-REQUEST",
+      "precision": "Адаптер FB Layout нормализует один раз до 0,01 мм и сохраняет происхождение",
+      "order": "UNORDERED",
+      "cardinality": "1"
+    },
+    {
+      "id": "IN-FBL-PRODUCTION-BLOCK-PLAN",
+      "meaning": "Полный ПланПроизводственныхБлоков из ПроверенногоПланаРаскладки с учтёнными конструктивными ограничениями",
+      "required": true,
+      "producer": "FB Layout: материализатор проверенного плана",
+      "authority": {
+        "kind": "DERIVED",
+        "source_ref": "../TDR/TDR-FBL-1 - Аналитический контур раскладки.md",
+        "sha256": "84451bf74c23e0279d02d67c5e68415e8a0df84e6bbe9a2e5bb0206f39288134"
+      },
+      "format": "ПланПроизводственныхБлоков",
+      "schema_ref": "../TDR/TDR-FBL-1 - Аналитический контур раскладки.md",
+      "version": "1",
+      "identity": "Сохраняет requestId, хэш снимка, редакцию каталога и происхождение блоков от исходных объектов и плана",
+      "units": "Миллиметры",
+      "precision": "EXACT",
+      "order": "ORDERED",
+      "cardinality": "1"
+    },
+    {
+      "id": "IN-FBL-TYPED-DIAGNOSTIC",
+      "meaning": "Типизированная диагностика вычислительного компонента, остановившего расчёт или публикацию",
+      "required": true,
+      "producer": "FB Layout: вычислительный контур Rust",
+      "authority": {
+        "kind": "DERIVED",
+        "source_ref": "../TDR/TDR-FBL-1 - Аналитический контур раскладки.md",
+        "sha256": "84451bf74c23e0279d02d67c5e68415e8a0df84e6bbe9a2e5bb0206f39288134"
+      },
+      "format": "ТипизированнаяДиагностика",
+      "schema_ref": "BLOCKED: общий словарь диагностики должен быть проверен на интеграционном этапе",
+      "version": "1",
+      "identity": "Сохраняет идентификатор запроса, локализацию и имя отказавшего вычислительного компонента",
+      "units": "NOT_APPLICABLE",
+      "precision": "EXACT",
+      "order": "ORDERED",
+      "cardinality": "Один исход с одной или несколькими локализованными причинами",
+      "constraints": [
+        "Диагностика создаётся без требования успешного проверенного плана",
+        "До ACCEPTED каждый обязательный источник отказа должен отображаться в общий словарь"
+      ]
+    }
+  ],
+  "outputs": [
+    {
+      "id": "OUT-FBL-LAYOUT-RESULT",
+      "meaning": "Полный конечный ПланПроизводственныхБлоков для одной принятой операции",
+      "producer": "FB Layout: вычислительный контур Rust",
+      "format": "C:\\ForestBrick\\operations\\<requestId>\\result.json в UTF-8, один исход на requestId",
+      "schema_ref": "BLOCKED: проверяемая JSON-схема версии 1 ещё не создана",
+      "version": "1",
+      "identity": "requestId, хэш снимка, профиль и редакция каталога, ID блока и исходные GUID",
+      "units": "Миллиметры",
+      "precision": "Координаты 0,01 мм; правило округления и исходное значение сохраняются в происхождении",
+      "order": "ORDERED",
+      "cardinality": "Ровно один полный результат на успешную операцию",
+      "creation_condition": "ПроверенныйПланРаскладки допущен, проёмы, балки и перемычки обработаны, ПланПроизводственныхБлоков полон",
+      "lineage": [
+        "TR-FBL-PUBLISH-RESULT"
+      ],
+      "constraints": [
+        "Частичный список блоков не является успехом",
+        "Каждый блок содержит устойчивый ID, связь с венцом, стеной, узлом, исходными GUID и записью плана",
+        "Запилы, коды каталога, перемычки, hideSpikesLeft и hideSpikesRight передаются как производственные признаки",
+        "Потребитель не принимает решений о сетке, узлах и конструктивных препятствиях"
+      ]
+    },
+    {
+      "id": "OUT-FBL-LAYOUT-FAILURE",
+      "meaning": "Типизированный отказ расчёта или публикации результата",
+      "producer": "FB Layout: вычислительный контур Rust",
+      "format": "C:\\ForestBrick\\operations\\<requestId>\\result.json в UTF-8 с исходом отказа",
+      "schema_ref": "BLOCKED: проверяемая JSON-схема типизированных отказов ещё не создана",
+      "version": "1",
+      "identity": "Отказ связан с requestId, хэшем снимка и редакцией каталога",
+      "units": "NOT_APPLICABLE",
+      "precision": "EXACT",
+      "order": "ORDERED",
+      "cardinality": "Один исход с одной или несколькими локализованными причинами",
+      "creation_condition": "Расчёт или публикация не может завершиться полным допустимым результатом",
+      "lineage": [
+        "TR-FBL-PUBLISH-FAILURE"
+      ],
+      "constraints": [
+        "Отказ не сопровождается частичным успешным результатом",
+        "Диагностика содержит безопасное следующее действие"
+      ]
+    }
+  ],
+  "transformations": [
+    {
+      "id": "TR-FBL-PUBLISH-RESULT",
+      "owner": "FB Layout: вычислительный контур Rust",
+      "kind": "ENCODE",
+      "input_ids": [
+        "IN-FBL-LAYOUT-REQUEST",
+        "IN-FBL-PRODUCTION-BLOCK-PLAN"
+      ],
+      "output_ids": [
+        "OUT-FBL-LAYOUT-RESULT"
+      ],
+      "rule": "Закодировать полный ПланПроизводственныхБлоков с requestId, хэшем снимка, редакцией каталога, флагами и происхождением без нового решения раскладки",
+      "loss": "UNRESOLVED",
+      "lost_data": [
+        "Поля производственного плана, не попавшие в ещё не проверенную JSON-схему"
+      ],
+      "loss_justification": "Точная схема и producer/consumer сохранность ещё не проверены"
+    },
+    {
+      "id": "TR-FBL-PUBLISH-FAILURE",
+      "owner": "FB Layout: вычислительный контур Rust",
+      "kind": "ENCODE",
+      "input_ids": [
+        "IN-FBL-LAYOUT-REQUEST",
+        "IN-FBL-TYPED-DIAGNOSTIC"
+      ],
+      "output_ids": [
+        "OUT-FBL-LAYOUT-FAILURE"
+      ],
+      "rule": "Закодировать типизированную диагностику в единственный транспортный исход операции без частичного списка блоков",
+      "loss": "UNRESOLVED",
+      "lost_data": [
+        "Локализация и контекст ошибки, обязательные прямому потребителю"
+      ],
+      "loss_justification": "Словарь отказов и восстановление TestAddon ещё не проверены на исполняемой паре"
+    }
+  ],
+  "handoffs": [
+    {
+      "id": "HO-FBL-RESULT-TO-ARCHICAD",
+      "from": "FB Layout: вычислительный контур Rust",
+      "to": "TestAddon: интеграционный контур Archicad",
+      "through": [],
+      "surface": "Windows local: временный JSON-файл и атомарное переименование в C:\\ForestBrick\\operations\\<requestId>\\result.json",
+      "data_ids": [
+        "OUT-FBL-LAYOUT-RESULT",
+        "OUT-FBL-LAYOUT-FAILURE"
+      ],
+      "preconditions": [
+        "Запрос принят по BC-FBL-LAYOUT-REQUEST",
+        "result.json опубликован атомарно и относится к той же операции"
+      ],
+      "consumer_obligations": [
+        "Проверить версию, requestId, хэш снимка, профиль и редакцию каталога, исход и полноту до создания элементов",
+        "Не выдавать частичный или устаревший результат за успех",
+        "Не принимать дополнительных решений раскладки"
+      ],
+      "success": "Потребитель получил один полный конечный план той же операции и создал ожидаемые элементы Archicad",
+      "failures": [
+        "LAYOUT_REJECTED",
+        "CATALOG_MISMATCH",
+        "PROCESS_FAILED",
+        "APPLY_FAILED",
+        "UNSUPPORTED_VERSION",
+        "RESULT_CORRUPTED",
+        "TRANSFER_FAILED"
+      ],
+      "acceptance_refs": [
+        "../Дорожная карта/00 Дорожная карта.md"
+      ],
+      "unblocks": [
+        "Интеграционный этап дорожной карты"
+      ]
+    }
+  ],
+  "flow_edges": [
+    {
+      "from": "TestAddon: интеграционный контур Archicad",
+      "to": "FB Layout: вычислительный контур Rust",
+      "data_ids": [
+        "IN-FBL-LAYOUT-REQUEST"
+      ]
+    },
+    {
+      "from": "FB Layout: материализатор проверенного плана",
+      "to": "FB Layout: вычислительный контур Rust",
+      "data_ids": [
+        "IN-FBL-PRODUCTION-BLOCK-PLAN"
+      ]
+    },
+    {
+      "from": "FB Layout: вычислительный контур Rust",
+      "to": "TestAddon: интеграционный контур Archicad",
+      "data_ids": [
+        "OUT-FBL-LAYOUT-RESULT",
+        "OUT-FBL-LAYOUT-FAILURE"
+      ]
+    }
+  ],
+  "evidence": {
+    "integration_decision": {
+      "status": "BLOCKED",
+      "reason": "Дизайн локального result.json и атомарной публикации выбран; BLOCKED сохраняется до схемы, исполняемого производителя и проверки TestAddon",
+      "authority_ref": {
+        "path": "BC-FBL-LAYOUT-RESULT.md",
+        "sha256": "34a2e00b5b50f675cb85bb9e4f7f16fd72053a2d87d2ea6f012ee8205a8ad54e"
+      }
+    },
+    "contract_tests": [
+      {
+        "path": "BLOCKED: контрактный тест производителя создаётся на интеграционном этапе",
+        "status": "BLOCKED"
+      }
+    ],
+    "integration_tests": [
+      {
+        "path": "BLOCKED: реальный проход Rust -> TestAddon создаётся на интеграционном этапе",
+        "status": "BLOCKED"
+      }
+    ]
+  },
+  "blockers": [
+    {
+      "id": "BL-FBL-RESULT-SCHEMA",
+      "unknown": "Проверяемая JSON-схема полного конечного результата и сохранность производственных признаков",
+      "owner": "Владелец FB Layout",
+      "required_evidence": "Публичная JSON-схема и независимый пример принятого профиля: I/L для тонкого прохода; проёмы, балки, перемычки и флаги для расширенной приёмки",
+      "resolution_condition": "Схема принята, производитель проходит контрактный тест полного результата в заявленном профиле; расширение профиля требует отдельной приёмки",
+      "blocked_consumers": [
+        "TestAddon: интеграционный контур Archicad"
+      ]
+    },
+    {
+      "id": "BL-FBL-RESULT-FAILURES",
+      "unknown": "Словарь типизированных отказов и безопасное восстановление потребителя",
+      "owner": "Владельцы FB Layout и TestAddon",
+      "required_evidence": "Сопоставление предметных, процессных и применительных отказов с наблюдаемым состоянием Archicad",
+      "resolution_condition": "Каждый обязательный отказ имеет код, локализацию, границу последствий и проверенный следующий вход",
+      "blocked_consumers": [
+        "Интеграционный этап дорожной карты",
+        "TestAddon: интеграционный контур Archicad"
+      ]
+    },
+    {
+      "id": "BL-FBL-RESULT-CATALOG",
+      "unknown": "Авторитетный источник, формат и редакция технологического каталога конструкций",
+      "owner": "Владельцы FB Layout и технологического каталога ForestBrick",
+      "required_evidence": "Локальный снимок каталога с SHA-256, правила идентичности и проверка обязательных конструкций",
+      "resolution_condition": "Планировщик использует одну принятую редакцию каталога, а контрактный тест проверяет отсутствующую конструкцию",
+      "blocked_consumers": [
+        "FB Layout: планировщик блоков"
+      ]
+    },
+    {
+      "id": "BL-FBL-RESULT-SURFACE",
+      "unknown": "Исполняемое подтверждение атомарной публикации и связи result.json с исходным запросом",
+      "owner": "Владельцы FB Layout и TestAddon",
+      "required_evidence": "Исполняемый производитель Rust, минимальный потребитель TestAddon и интеграционный тест без подмены транспорта",
+      "resolution_condition": "Потребитель различает полный результат и отказ до изменения модели, реальный тонкий проход проходит",
+      "blocked_consumers": [
+        "Интеграционный этап дорожной карты"
+      ]
+    }
+  ]
+}
