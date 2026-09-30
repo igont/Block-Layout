@@ -79,10 +79,17 @@ fn export_block(
             let sources = fields
                 .next()
                 .ok_or_else(|| issue(block, "Не указано происхождение врезки"))?;
+            // Legacy-сборка 8/8.1 хранит y до перестановки сторон GDL.
+            // Канонический FbEdgeMatrix ждёт Тип 8 на Н-НЧ, Тип 8.1 на В-НЧ.
+            let canonical_y = if matches!(key, "Type8" | "Type8_1") {
+                4 - y
+            } else {
+                y
+            };
             let position = ((i64::from(x) - 1) * 32_000).min(block.length_centimm);
-            tokens.push((position, y, product));
+            tokens.push((position, canonical_y, product));
             node_cuts.push(json!({"product_type":format!("Тип {}",key.trim_start_matches("Type").replace('_',".")),
-                "x":x,"y":y,"position_mm":mm(position),"face":match y {1=>"Н",2=>"С",_=>"В"},
+                "x":x,"y":canonical_y,"position_mm":mm(position),"face":match canonical_y {1=>"Н",2=>"С",_=>"В"},
                 "source_run_ids":sources.split(',').collect::<Vec<_>>()}));
         } else {
             let mut trim = json!({"description":cut});
@@ -338,5 +345,37 @@ mod tests {
             .unwrap()
             .iter()
             .any(|t| t["kind"] == "wall_boundary"));
+    }
+
+    #[test]
+    fn legacy_type8_faces_are_converted_before_both_canonical_views() {
+        let standard = parse_request(include_str!(
+            "../Документация/Граничные контракты/examples/layout-request.v1.json"
+        ))
+        .unwrap();
+        let request = standard.to_layout_request().unwrap();
+        let profile: Profile =
+            serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
+        let blocks = [
+            block(
+                "8",
+                "node_T",
+                Some("Type8"),
+                vec!["Type8:x1:y3:run-example"],
+            ),
+            block(
+                "8.1",
+                "node_T",
+                Some("Type8_1"),
+                vec!["Type8_1:x1:y1:run-example"],
+            ),
+        ];
+        let result = export_codes(&standard, &request, &profile, &blocks, &[]).unwrap();
+        assert_eq!(result["blocks"][0]["code1"], "П640 [Н-НЧ-Тип 8]");
+        assert_eq!(result["blocks"][0]["code2"], "П640 [В-КН-Тип 8]");
+        assert_eq!(result["blocks"][0]["node_cuts"][0]["y"], 1);
+        assert_eq!(result["blocks"][1]["code1"], "П640 [В-НЧ-Тип 8.1]");
+        assert_eq!(result["blocks"][1]["code2"], "П640 [Н-КН-Тип 8.1]");
+        assert_eq!(result["blocks"][1]["node_cuts"][0]["face"], "В");
     }
 }
