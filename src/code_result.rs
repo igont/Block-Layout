@@ -193,6 +193,20 @@ fn export_block(
     let angle = f64::from(block.rotation_deg).to_radians();
     let (sin, cos) = angle.sin_cos();
     let clean = |v: f64| if v.abs() < 1e-12 { 0.0 } else { v };
+    // SUP принимает габарит с L-выступами и начало этого габарита.
+    // Код и раскладочная сетка сохраняют длину тела между узлами.
+    let l_extension = |end| {
+        if tokens.iter().any(|(position, _, product)| {
+            *position == end && matches!(product.as_str(), "1" | "2" | "3" | "4")
+        }) {
+            96.5
+        } else {
+            0.0
+        }
+    };
+    let begin_extension = l_extension(0);
+    let physical_length =
+        mm(block.length_centimm) + begin_extension + l_extension(block.length_centimm);
     let product_type = match block.product_key.as_deref() {
         Some(key) if key.starts_with("Type") => {
             format!("Тип {}", key.trim_start_matches("Type").replace('_', "."))
@@ -203,9 +217,9 @@ fn export_block(
     };
     Ok(
         json!({"id":block.id,"code1":code1,"code2":code2,"product_type":product_type,
-        "placement":{"origin_mm":[mm(block.start.x),mm(block.start.y),mm(block.z_centimm)],
+        "placement":{"origin_mm":[mm(block.start.x)-begin_extension*cos,mm(block.start.y)-begin_extension*sin,mm(block.z_centimm)],
             "x_axis":[clean(cos),clean(sin),0.0],"y_axis":[clean(-sin),clean(cos),0.0],"z_axis":[0.0,0.0,1.0]},
-        "length_mm":mm(block.length_centimm),"nominal_length_mm":mm(block.catalog_nominal_centimm.unwrap_or(block.length_centimm)),
+        "length_mm":physical_length,"nominal_length_mm":mm(block.catalog_nominal_centimm.unwrap_or(block.length_centimm)),
         "width_mm":width,"height_mm":mm(profile.index_centimm),"course_index":block.course_index,
         "source_ids":source_ids,"wall_ids":wall_ids,"hide_spikes_left":block.hide_spikes_left,"hide_spikes_right":block.hide_spikes_right,
         "node_cuts":node_cuts,"trims":trims}),
@@ -319,6 +333,51 @@ mod tests {
             assert_eq!(value["source_ids"], json!(["wall-example"]));
             assert_eq!(value["wall_ids"], json!(["wall-example"]));
         }
+    }
+
+    #[test]
+    fn l_corner_exports_sup_extent_without_moving_the_nominal_grid() {
+        let standard = parse_request(include_str!(
+            "../Документация/Граничные контракты/examples/layout-request.v1.json"
+        ))
+        .unwrap();
+        let request = standard.to_layout_request().unwrap();
+        let profile: Profile =
+            serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
+        for rotation in [0, 90, 180, 270] {
+            for (product, face) in [("Type1", 1), ("Type2", 3), ("Type3", 3), ("Type4", 1)] {
+                let mut corner = block("L", "node_L", Some(product), vec![]);
+                corner.rotation_deg = rotation;
+                corner.start = crate::domain::Point {
+                    x: 100000,
+                    y: 200000,
+                };
+                corner.cuts = vec![format!("{product}:x1:y{face}:run-example")];
+                let value = export_block(&request, &profile, &corner).unwrap();
+                assert_eq!(value["length_mm"], 736.5);
+                assert_eq!(value["nominal_length_mm"], 640.0);
+                assert!(value["code1"].as_str().unwrap().starts_with("П640 "));
+                // SUP сдвигает начало тела от origin на 96.5 мм.
+                // После преобразования его начало обязано совпасть с узлом.
+                for axis in 0..2 {
+                    let origin = value["placement"]["origin_mm"][axis].as_f64().unwrap();
+                    let direction = value["placement"]["x_axis"][axis].as_f64().unwrap();
+                    assert!((origin + 96.5 * direction - [1000.0, 2000.0][axis]).abs() < 1e-8);
+                }
+            }
+        }
+        let mut both = block(
+            "L",
+            "node_L",
+            Some("Type1"),
+            vec!["Type1:x1:y1:run-example", "Type1:x3:y3:run-example"],
+        );
+        let value = export_block(&request, &profile, &both).unwrap();
+        assert_eq!(value["length_mm"], 833.0);
+        both.cuts = vec!["Type1:x3:y3:run-example".into()];
+        let value = export_block(&request, &profile, &both).unwrap();
+        assert_eq!(value["length_mm"], 736.5);
+        assert_eq!(value["placement"]["origin_mm"], json!([0.0, 0.0, -252.0]));
     }
 
     #[test]

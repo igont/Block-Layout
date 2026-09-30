@@ -670,6 +670,18 @@ fn choose_pieces_on_span(
     phase: i64,
     residue: Option<i64>,
 ) -> Option<Vec<(i64, bool)>> {
+    choose_pieces_with_roof_ends(start, end, profile, phase, residue, false, false)
+}
+
+fn choose_pieces_with_roof_ends(
+    start: i64,
+    end: i64,
+    profile: &Profile,
+    phase: i64,
+    residue: Option<i64>,
+    roof_start: bool,
+    roof_end: bool,
+) -> Option<Vec<(i64, bool)>> {
     if end <= start {
         return Some(Vec::new());
     }
@@ -681,7 +693,7 @@ fn choose_pieces_on_span(
         let mut at = start;
         while at < end {
             let remaining = end - at;
-            if remaining < profile.minimum_cut_centimm {
+            if remaining < profile.minimum_cut_centimm && !roof_end {
                 let Some(last) = result.last_mut() else {
                     // Материал задан моделью. Фрагмент остаётся в кандидате,
                     // а производственный минимум проверяется предупреждением.
@@ -699,7 +711,7 @@ fn choose_pieces_on_span(
             if distance == 0 {
                 distance = profile.ordinary_length_centimm;
             }
-            if distance < profile.minimum_cut_centimm {
+            if distance < profile.minimum_cut_centimm && !(roof_start && at == start) {
                 distance += profile.ordinary_length_centimm;
             }
             let piece = if remaining <= profile.ordinary_length_centimm {
@@ -763,6 +775,44 @@ fn choose_pieces_on_span(
         cursor += piece;
     }
     Some(pieces)
+}
+
+/// Наклонный верх обрывает run внутри исходной стены в текущем венце.
+/// Настоящий торец стены и нижние венцы сохраняют обычные правила подрезки.
+fn roof_clips_end(
+    topology: &Topology,
+    course: &crate::domain::Course,
+    run: &crate::domain::WallRun,
+    point: Point,
+    profile: &Profile,
+) -> bool {
+    if point != run.start && point != run.end {
+        return false;
+    }
+    run.sources.iter().any(|source| {
+        let Some(wall) = topology.walls.iter().find(|w| w.id == source.wall_id) else {
+            return false;
+        };
+        if wall.top_start == wall.top_end {
+            return false;
+        }
+        let dx = (i128::from(wall.end.x) - i128::from(wall.start.x)) as f64;
+        let dy = (i128::from(wall.end.y) - i128::from(wall.start.y)) as f64;
+        let axis_squared = dx * dx + dy * dy;
+        if axis_squared <= 0.0 {
+            return false;
+        }
+        let t = ((i128::from(point.x) - i128::from(wall.start.x)) as f64 * dx
+            + (i128::from(point.y) - i128::from(wall.start.y)) as f64 * dy)
+            / axis_squared;
+        if !(0.0 < t && t < 1.0) {
+            return false;
+        }
+        let top = wall.top_start as f64
+            + (i128::from(wall.top_end) - i128::from(wall.top_start)) as f64 * t;
+        let tolerance = profile.coordinate_tolerance_centimm as f64 + 1e-7;
+        top >= course.z as f64 - tolerance && top < (course.z + profile.index_centimm) as f64 - 1e-7
+    })
 }
 
 fn first_offgrid_joint(start: i64, pieces: &[(i64, bool)], residue: i64) -> Option<i64> {
@@ -2542,9 +2592,27 @@ pub fn calculate_candidate(
                 let run_geometry = course.runs.iter().find(|item| item.id == edge.edge_id);
                 let residue =
                     run_geometry.and_then(|item| ordinary_residue(item, course.index, profile));
-                let Some(pieces) =
-                    choose_pieces_on_span(run.start, run.end, profile, phase, residue)
-                else {
+                let roof_start = run_geometry.is_some_and(|geometry| {
+                    roof_clips_end(
+                        topology,
+                        course,
+                        geometry,
+                        point_at(edge, run.start, length),
+                        profile,
+                    )
+                });
+                let roof_end = run_geometry.is_some_and(|geometry| {
+                    roof_clips_end(
+                        topology,
+                        course,
+                        geometry,
+                        point_at(edge, run.end, length),
+                        profile,
+                    )
+                });
+                let Some(pieces) = choose_pieces_with_roof_ends(
+                    run.start, run.end, profile, phase, residue, roof_start, roof_end,
+                ) else {
                     let loose = choose_pieces(run.len(), profile, phase);
                     let conflicting_joint = residue.and_then(|value| {
                         loose
@@ -2626,6 +2694,12 @@ pub fn calculate_candidate(
                         cuts,
                         Vec::new(),
                     );
+                    if roof_start && piece_index == 0 {
+                        item.hide_spikes_left = false;
+                    }
+                    if roof_end && piece_index + 1 == piece_count {
+                        item.hide_spikes_right = false;
+                    }
                     if profile.world_joint_policy.is_none() {
                         item.catalog_status = "length_only_grid_unverified".into();
                     }
@@ -3247,6 +3321,103 @@ mod tests {
             202_600
         );
     }
+    #[test]
+    fn roof_tail_keeps_tiny_piece_and_spikes_while_lower_courses_keep_merge() {
+        let mut p = profile();
+        p.world_joint_policy = Some("affine_checkerboard_v1".into());
+        p.maximum_special_blank_centimm = Some(128_000);
+        p.max_ordinary_cuts_per_free_span = 2;
+        let mut t = topology(vec![edge("run", "wall", (0, 0), (192_015, 0))], 1);
+        t.walls.push(crate::domain::NormalizedWall {
+            id: "wall".into(),
+            start: Point { x: 0, y: 0 },
+            end: Point { x: 256_000, y: 0 },
+            bottom_start: -100_000,
+            bottom_end: -100_000,
+            top_start: 198_315,
+            top_end: -57_685,
+            thickness: 20_000,
+        });
+        let mut roof = calculate(&t, &Constraints::default(), &p).unwrap();
+        roof.blocks.sort_by_key(|b| b.start.x);
+        assert_eq!(
+            roof.blocks
+                .iter()
+                .map(|b| b.length_centimm)
+                .collect::<Vec<_>>(),
+            vec![64_000, 64_000, 64_000, 15]
+        );
+        let tiny = roof.blocks.last().unwrap();
+        assert!(!tiny.hide_spikes_left && !tiny.hide_spikes_right);
+        assert_eq!(tiny.catalog_nominal_centimm, Some(32_000));
+        assert!(tiny.cuts.iter().any(|cut| cut == "right"));
+
+        // Та же стена в нижнем венце: верх не подрезает текущий материал.
+        t.courses[0].z = 0;
+        let mut lower = calculate(&t, &Constraints::default(), &p).unwrap();
+        lower.blocks.sort_by_key(|b| b.start.x);
+        assert_eq!(
+            lower
+                .blocks
+                .iter()
+                .map(|b| b.length_centimm)
+                .collect::<Vec<_>>(),
+            vec![64_000, 64_000, 64_015]
+        );
+        assert!(lower.blocks.last().unwrap().hide_spikes_right);
+
+        // Независимая короткая торцевая деталь продолжает снимать правый шип.
+        let plain = topology(vec![edge("run", "wall", (0, 0), (15, 0))], 1);
+        let ordinary = calculate(&plain, &Constraints::default(), &p).unwrap();
+        assert_eq!(ordinary.blocks[0].length_centimm, 15);
+        assert!(ordinary.blocks[0].hide_spikes_right);
+    }
+
+    #[test]
+    fn roof_start_keeps_short_fragment_without_absorbing_next_module() {
+        let mut p = profile();
+        p.world_joint_policy = Some("affine_checkerboard_v1".into());
+        p.maximum_special_blank_centimm = Some(128_000);
+        p.max_ordinary_cuts_per_free_span = 2;
+        let mut t = topology(vec![edge("run", "wall", (0, 31_985), (192_015, 31_985))], 0);
+        t.walls.push(crate::domain::NormalizedWall {
+            id: "wall".into(),
+            start: Point {
+                x: -64_000,
+                y: 31_985,
+            },
+            end: Point {
+                x: 256_000,
+                y: 31_985,
+            },
+            bottom_start: -100_000,
+            bottom_end: -100_000,
+            top_start: -64_000,
+            top_end: 256_000,
+            thickness: 20_000,
+        });
+        let roof = calculate(&t, &Constraints::default(), &p).unwrap();
+        assert_eq!(
+            roof.blocks
+                .iter()
+                .map(|b| b.length_centimm)
+                .collect::<Vec<_>>(),
+            vec![15, 64_000, 64_000, 64_000]
+        );
+        assert!(!roof.blocks[0].hide_spikes_left && !roof.blocks[0].hide_spikes_right);
+        t.walls[0].top_start = 300_000;
+        t.walls[0].top_end = 300_000;
+        let flat = calculate(&t, &Constraints::default(), &p).unwrap();
+        assert_eq!(
+            flat.blocks
+                .iter()
+                .map(|b| b.length_centimm)
+                .collect::<Vec<_>>(),
+            vec![64_015, 64_000, 64_000]
+        );
+        assert!(flat.blocks[0].hide_spikes_left);
+    }
+
     #[test]
     fn catalog_blank_absorbs_sub_minimum_grid_residuals() {
         let mut p = profile();
