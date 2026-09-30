@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:forestbrick:layout:data:1",
+  "title": "Стандарт данных FB Layout, версия 1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "kind", "request_id", "snapshot_hash", "coordinate_system", "profile", "catalog", "scope"],
+  "properties": {
+    "format": {"const": "fb-layout/1"},
+    "kind": {"enum": ["layout_request", "layout_result"]},
+    "request_id": {"$ref": "#/$defs/id"},
+    "snapshot_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "coordinate_system": {"$ref": "#/$defs/coordinateSystem"},
+    "profile": {"$ref": "#/$defs/versionedRef"},
+    "catalog": {"$ref": "#/$defs/versionedRef"},
+    "scope": {"$ref": "#/$defs/scope"},
+    "model": {"$ref": "#/$defs/model"},
+    "status": {"enum": ["success", "failure"]},
+    "blocks": {"type": "array", "items": {"$ref": "#/$defs/block"}},
+    "beam_adjustments": {"type": "array", "items": {"$ref": "#/$defs/beamAdjustment"}},
+    "diagnostics": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/diagnostic"}}
+  },
+  "oneOf": [
+    {
+      "properties": {"kind": {"const": "layout_request"}},
+      "required": ["model"],
+      "not": {"anyOf": [{"required": ["status"]}, {"required": ["blocks"]}, {"required": ["beam_adjustments"]}, {"required": ["diagnostics"]}]}
+    },
+    {
+      "properties": {"kind": {"const": "layout_result"}, "status": {"const": "success"}},
+      "required": ["status", "blocks", "beam_adjustments"],
+      "not": {"anyOf": [{"required": ["model"]}, {"required": ["diagnostics"]}]}
+    },
+    {
+      "properties": {"kind": {"const": "layout_result"}, "status": {"const": "failure"}},
+      "required": ["status", "diagnostics"],
+      "not": {"anyOf": [{"required": ["model"]}, {"required": ["blocks"]}, {"required": ["beam_adjustments"]}]}
+    }
+  ],
+  "$defs": {
+    "id": {"type": "string", "minLength": 1},
+    "ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "versionedRef": {
+      "type": "object", "additionalProperties": false, "required": ["id", "revision"],
+      "properties": {"id": {"$ref": "#/$defs/id"}, "revision": {"$ref": "#/$defs/id"}}
+    },
+    "scope": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["mode"], "properties": {"mode": {"const": "full"}}},
+        {"type": "object", "additionalProperties": false, "required": ["mode", "wall_ids"], "properties": {"mode": {"const": "selected"}, "wall_ids": {"$ref": "#/$defs/ids"}}}
+      ]
+    },
+    "vec2": {
+      "type": "array", "minItems": 2, "maxItems": 2,
+      "items": {"type": "number"}
+    },
+    "vec3": {
+      "type": "array", "minItems": 3, "maxItems": 3,
+      "items": {"type": "number"}
+    },
+    "size3": {
+      "type": "array", "minItems": 3, "maxItems": 3,
+      "items": {"type": "number", "exclusiveMinimum": 0}
+    },
+    "coordinateSystem": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "units", "coordinate_quantum_mm", "z0_mm"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "units": {"const": "mm"},
+        "coordinate_quantum_mm": {"const": 0.01}, "z0_mm": {"type": "number"}
+      }
+    },
+    "frame": {
+      "type": "object", "additionalProperties": false,
+      "required": ["origin_mm", "x_axis", "y_axis", "z_axis"],
+      "properties": {
+        "origin_mm": {"$ref": "#/$defs/vec3"}, "x_axis": {"$ref": "#/$defs/vec3"},
+        "y_axis": {"$ref": "#/$defs/vec3"}, "z_axis": {"$ref": "#/$defs/vec3"}
+      }
+    },
+    "axisPrism": {
+      "type": "object", "additionalProperties": false,
+      "required": ["start_xy_mm", "end_xy_mm", "bottom_start_mm", "bottom_end_mm", "top_start_mm", "top_end_mm", "left_thickness_mm", "right_thickness_mm"],
+      "properties": {
+        "start_xy_mm": {"$ref": "#/$defs/vec2"}, "end_xy_mm": {"$ref": "#/$defs/vec2"},
+        "bottom_start_mm": {"type": "number"}, "bottom_end_mm": {"type": "number"},
+        "top_start_mm": {"type": "number"}, "top_end_mm": {"type": "number"},
+        "left_thickness_mm": {"type": "number", "minimum": 0},
+        "right_thickness_mm": {"type": "number", "minimum": 0}
+      }
+    },
+    "wallVolume": {
+      "type": "object", "additionalProperties": false, "required": ["id", "purpose", "volume"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "purpose": {"enum": ["fb_wall", "context"]},
+        "volume": {"$ref": "#/$defs/axisPrism"}
+      }
+    },
+    "opening": {
+      "type": "object", "additionalProperties": false, "required": ["id", "purpose", "volume"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "purpose": {"enum": ["opening", "console", "wall_trim"]},
+        "wall_ids": {"$ref": "#/$defs/ids"}, "volume": {"$ref": "#/$defs/axisPrism"}
+      }
+    },
+    "beam": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "start_mm", "end_mm", "width_mm", "height_mm", "height_direction"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "start_mm": {"$ref": "#/$defs/vec3"}, "end_mm": {"$ref": "#/$defs/vec3"},
+        "width_mm": {"type": "number", "exclusiveMinimum": 0}, "height_mm": {"type": "number", "exclusiveMinimum": 0},
+        "height_direction": {"$ref": "#/$defs/vec3"}
+      }
+    },
+    "model": {
+      "type": "object", "additionalProperties": false, "required": ["wall_volumes", "openings", "beams"],
+      "properties": {
+        "wall_volumes": {"type": "array", "items": {"$ref": "#/$defs/wallVolume"}},
+        "openings": {"type": "array", "items": {"$ref": "#/$defs/opening"}},
+        "beams": {"type": "array", "items": {"$ref": "#/$defs/beam"}}
+      }
+    },
+    "shape": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "reference"],
+          "properties": {"kind": {"const": "catalog"}, "reference": {"$ref": "#/$defs/versionedRef"}}
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "size_mm"],
+          "properties": {"kind": {"const": "box"}, "size_mm": {"$ref": "#/$defs/size3"}}
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "vertices_mm", "faces"],
+          "properties": {
+            "kind": {"const": "mesh"},
+            "vertices_mm": {"type": "array", "minItems": 4, "items": {"$ref": "#/$defs/vec3"}},
+            "faces": {"type": "array", "minItems": 4, "items": {
+              "type": "array", "minItems": 3, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}
+            }}
+          }
+        }
+      ]
+    },
+    "cut": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "point_local_mm", "normal_local", "keep_side", "source_ids"],
+          "properties": {
+            "kind": {"const": "plane_cut"}, "point_local_mm": {"$ref": "#/$defs/vec3"},
+            "normal_local": {"$ref": "#/$defs/vec3"}, "keep_side": {"enum": ["negative", "positive"]},
+            "source_ids": {"$ref": "#/$defs/ids"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "frame_local", "size_mm", "source_ids"],
+          "properties": {
+            "kind": {"const": "box_cut"}, "frame_local": {"$ref": "#/$defs/frame"},
+            "size_mm": {"$ref": "#/$defs/size3"}, "source_ids": {"$ref": "#/$defs/ids"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "reference", "source_ids"],
+          "properties": {
+            "kind": {"const": "catalog_cut"}, "reference": {"$ref": "#/$defs/versionedRef"},
+            "source_ids": {"$ref": "#/$defs/ids"}
+          }
+        }
+      ]
+    },
+    "product": {
+      "type": "object", "additionalProperties": false, "required": ["category", "type_id", "code", "nominal_size_mm"],
+      "properties": {
+        "category": {"enum": ["standard", "special", "lintel"]},
+        "type_id": {"$ref": "#/$defs/id"}, "code": {"$ref": "#/$defs/id"},
+        "secondary_code": {"$ref": "#/$defs/id"}, "nominal_size_mm": {"$ref": "#/$defs/size3"}
+      }
+    },
+    "specialOrigin": {
+      "type": "object", "additionalProperties": false, "required": ["rule_id", "component_ids"],
+      "properties": {"rule_id": {"$ref": "#/$defs/id"}, "component_ids": {"$ref": "#/$defs/ids"}}
+    },
+    "block": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "source_ids", "wall_ids", "course_index", "product", "placement", "stock_shape", "cuts", "spikes_removed"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "source_ids": {"$ref": "#/$defs/ids"}, "wall_ids": {"$ref": "#/$defs/ids"},
+        "course_index": {"type": "integer"}, "product": {"$ref": "#/$defs/product"}, "placement": {"$ref": "#/$defs/frame"},
+        "stock_shape": {"$ref": "#/$defs/shape"}, "cuts": {"type": "array", "items": {"$ref": "#/$defs/cut"}},
+        "special_origin": {"$ref": "#/$defs/specialOrigin"}, "insu": {"type": "boolean"},
+        "spikes_removed": {
+          "type": "object", "additionalProperties": false, "required": ["left", "right"],
+          "properties": {"left": {"type": "boolean"}, "right": {"type": "boolean"}}
+        }
+      },
+      "allOf": [{
+        "if": {"properties": {"product": {"properties": {"category": {"const": "special"}}}}},
+        "then": {"required": ["special_origin"]},
+        "else": {"not": {"required": ["special_origin"]}}
+      }]
+    },
+    "beamAdjustment": {
+      "type": "object", "additionalProperties": false, "required": ["beam_id", "side", "amount_mm", "rule_id", "source_ids"],
+      "properties": {
+        "beam_id": {"$ref": "#/$defs/id"},
+        "side": {"enum": ["start", "end", "width_negative", "width_positive", "height_negative", "height_positive"]},
+        "amount_mm": {"type": "number", "exclusiveMinimum": 0},
+        "rule_id": {"$ref": "#/$defs/id"}, "source_ids": {"$ref": "#/$defs/ids"}
+      }
+    },
+    "diagnostic": {
+      "type": "object", "additionalProperties": false, "required": ["code", "message", "source_ids"],
+      "properties": {
+        "code": {"$ref": "#/$defs/id"}, "message": {"$ref": "#/$defs/id"},
+        "source_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "course_index": {"type": "integer"}, "location_mm": {"$ref": "#/$defs/vec3"}
+      }
+    }
+  }
+}

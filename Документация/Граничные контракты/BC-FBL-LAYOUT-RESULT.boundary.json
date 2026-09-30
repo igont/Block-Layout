@@ -81,7 +81,7 @@
       "authority": {
         "kind": "DERIVED",
         "source_ref": "../TDR/TDR-FBL-1 - Аналитический контур раскладки.md",
-        "sha256": "84451bf74c23e0279d02d67c5e68415e8a0df84e6bbe9a2e5bb0206f39288134"
+        "sha256": "c39d518351814111ed215cc262d29cdd45cffe06c1dcab36619a2f606d835d10"
       },
       "format": "ПланПроизводственныхБлоков",
       "schema_ref": "../TDR/TDR-FBL-1 - Аналитический контур раскладки.md",
@@ -100,7 +100,7 @@
       "authority": {
         "kind": "DERIVED",
         "source_ref": "../TDR/TDR-FBL-1 - Аналитический контур раскладки.md",
-        "sha256": "84451bf74c23e0279d02d67c5e68415e8a0df84e6bbe9a2e5bb0206f39288134"
+        "sha256": "c39d518351814111ed215cc262d29cdd45cffe06c1dcab36619a2f606d835d10"
       },
       "format": "ТипизированнаяДиагностика",
       "schema_ref": "BLOCKED: общий словарь диагностики должен быть проверен на интеграционном этапе",

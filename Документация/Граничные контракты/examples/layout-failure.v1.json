@@ -1,0 +1,8 @@
+{
+  "format": "fb-layout/1", "kind": "layout_result", "request_id": "example-beam-pocket",
+  "snapshot_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+  "coordinate_system": {"id": "example-world", "units": "mm", "coordinate_quantum_mm": 0.01, "z0_mm": -252},
+  "profile": {"id": "example-profile", "revision": "1"}, "catalog": {"id": "example-catalog", "revision": "1"},
+  "scope": {"mode": "full"}, "status": "failure",
+  "diagnostics": [{"code": "EXAMPLE_UNSUPPORTED_POCKET", "message": "Пример отказа: профиль обработки кармана не подтверждён", "source_ids": ["wall-example", "beam-example"], "course_index": 43, "location_mm": [3200, 76.5, 2457]}]
+}

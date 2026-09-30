@@ -1,0 +1,34 @@
+{
+  "format": "fb-layout/1",
+  "kind": "layout_request",
+  "request_id": "example-beam-pocket",
+  "snapshot_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+  "coordinate_system": {"id": "example-world", "units": "mm", "coordinate_quantum_mm": 0.01, "z0_mm": -252},
+  "profile": {"id": "example-profile", "revision": "1"},
+  "catalog": {"id": "example-catalog", "revision": "1"},
+  "scope": {"mode": "full"},
+  "model": {
+    "wall_volumes": [{
+      "id": "wall-example", "purpose": "fb_wall",
+      "volume": {
+        "start_xy_mm": [0, 0], "end_xy_mm": [6400, 0],
+        "bottom_start_mm": -252, "bottom_end_mm": -252,
+        "top_start_mm": 3717, "top_end_mm": 3717,
+        "left_thickness_mm": 96.5, "right_thickness_mm": 96.5
+      }
+    }],
+    "openings": [{
+      "id": "opening-example", "purpose": "opening", "wall_ids": ["wall-example"],
+      "volume": {
+        "start_xy_mm": [1600, 0], "end_xy_mm": [2560, 0],
+        "bottom_start_mm": 0, "bottom_end_mm": 0,
+        "top_start_mm": 2016, "top_end_mm": 2016,
+        "left_thickness_mm": 96.5, "right_thickness_mm": 96.5
+      }
+    }],
+    "beams": [{
+      "id": "beam-example", "start_mm": [3200, -800, 2457], "end_mm": [3200, 76.5, 2457],
+      "width_mm": 160, "height_mm": 320, "height_direction": [0, 0, 1]
+    }]
+  }
+}
