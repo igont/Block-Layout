@@ -757,6 +757,15 @@ impl ConstraintEvidence {
 }
 
 impl Constraints {
+    pub(crate) fn opening_axis(&self, id: &str) -> Option<(RawPoint, RawPoint)> {
+        self.evidence.iter().find_map(|e| match &e.geometry {
+            EvidenceGeometry::Opening { opening, .. } if opening.id == id => {
+                Some((opening.start, opening.end))
+            }
+            _ => None,
+        })
+    }
+
     /// Возвращает физические вычеты прямоугольных балок без расширения до венца.
     /// Наклонная призма не подменяется своим ограничивающим параллелепипедом.
     pub fn beam_box_cuts(
@@ -1226,8 +1235,23 @@ pub fn build_constraints_with_policy(
                     .iter()
                     .map(|point| z_at(opening.top_start_mm, opening.top_end_mm, point.t))
                     .fold(f64::NEG_INFINITY, f64::max);
+                // Ряды перемычек чередуются через венец: 1/3/5 для
+                // проёма до метра, 1/3/5/7/9 для более широкого проёма.
+                let row = ((course.z as f64 - max_top) / course_height as f64).floor();
+                let opening_width = (opening.end.x_mm - opening.start.x_mm)
+                    .hypot(opening.end.y_mm - opening.start.y_mm)
+                    * SCALE;
+                let row_count = if opening_width <= 100_000.0 + EPS {
+                    3
+                } else {
+                    5
+                };
+                let flat_top = (opening.top_start_mm - opening.top_end_mm).abs() <= EPS;
                 if course.z as f64 + EPS >= max_top
-                    && course.z as f64 - max_top < course_height as f64
+                    && opening_width <= 150_000.0 + EPS
+                    && row >= 0.0
+                    && ((flat_top && row < (row_count * 2) as f64 && row as i64 % 2 == 0)
+                        || (!flat_top && row == 0.0))
                 {
                     if let Some(span) = interval(lo, hi, frame.length) {
                         let left_support = (lo + EPS >= support as f64)
@@ -1448,6 +1472,31 @@ pub fn build_constraints_with_policy(
     }
     for ((opening_id, course_index), runs) in opening_runs {
         if runs.len() > 1 {
+            let collinear = topology
+                .courses
+                .iter()
+                .find(|c| c.index == course_index)
+                .is_some_and(|course| {
+                    let selected: Vec<_> = course
+                        .runs
+                        .iter()
+                        .filter(|r| runs.contains(r.id.as_str()))
+                        .collect();
+                    let Some(first) = selected.first() else {
+                        return false;
+                    };
+                    let dx = i128::from(first.end.x) - i128::from(first.start.x);
+                    let dy = i128::from(first.end.y) - i128::from(first.start.y);
+                    selected.iter().all(|r| {
+                        [r.start, r.end].iter().all(|p| {
+                            (i128::from(p.x) - i128::from(first.start.x)) * dy
+                                == (i128::from(p.y) - i128::from(first.start.y)) * dx
+                        })
+                    })
+                });
+            if collinear {
+                continue;
+            }
             errors.push(ConstraintError {
                 source_id: opening_id.into(),
                 kind: ConstraintErrorKind::AmbiguousOpeningRun,
@@ -1663,9 +1712,10 @@ mod tests {
     }
 
     #[test]
-    fn opening_provides_lintel_support_on_first_course_above_top() {
+    fn opening_provides_lintel_support_on_alternating_courses_above_top() {
         let result = build_constraints(&topology(), &[opening()], &[], 200.0, 300.0).unwrap();
-        assert_eq!(result.lintel_candidates.len(), 1);
+        assert_eq!(result.lintel_candidates.len(), 2);
+        assert_eq!(result.lintel_candidates[1].course_index, 3);
         let candidate = &result.lintel_candidates[0];
         assert_eq!(candidate.course_index, 1);
         assert_eq!(
@@ -1914,7 +1964,7 @@ mod tests {
         let crossing_beam = beam(raw(2000.0, -200.0), raw(2000.0, 200.0), 300.0);
         let result =
             build_constraints(&topology, &[opening], &[crossing_beam], 200.0, 300.0).unwrap();
-        assert_eq!(result.lintel_candidates.len(), 1);
+        assert_eq!(result.lintel_candidates.len(), 2);
         assert_eq!(
             result.lintel_candidates[0].span,
             Interval {
@@ -1950,7 +2000,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_through_real_run_boundary_is_ambiguous() {
+    fn opening_through_collinear_runs_preserves_both_volume_masks() {
         let mut topology = topology();
         for course in &mut topology.courses {
             course.runs = vec![
@@ -1987,9 +2037,42 @@ mod tests {
         let mut opening = opening();
         opening.start = raw(1500.0, 0.0);
         opening.end = raw(2500.0, 0.0);
-        let errors = build_constraints(&topology, &[opening], &[], 200.0, 300.0).unwrap_err();
-        assert!(errors.iter().any(|error| error.source_id == "opening"
-            && error.kind == ConstraintErrorKind::AmbiguousOpeningRun));
+        let result = build_constraints(&topology, &[opening], &[], 200.0, 300.0).unwrap();
+        assert!(result.masks.iter().any(|m| m.run_id == "left"));
+        assert!(result.masks.iter().any(|m| m.run_id == "right"));
+    }
+
+    #[test]
+    fn opening_width_selects_three_or_five_lintel_rows() {
+        let mut t = topology();
+        let template = t.courses[0].clone();
+        t.courses = (0..12)
+            .map(|index| {
+                let mut course = template.clone();
+                course.index = index;
+                course.z = index * 20_000;
+                course
+            })
+            .collect();
+        let narrow = build_constraints(&t, &[opening()], &[], 200.0, 200.0).unwrap();
+        assert_eq!(
+            narrow
+                .lintel_candidates
+                .iter()
+                .map(|l| l.course_index)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+        let mut wide = opening();
+        wide.end = raw(2500.0, 0.0);
+        let wide = build_constraints(&t, &[wide], &[], 200.0, 200.0).unwrap();
+        assert_eq!(
+            wide.lintel_candidates
+                .iter()
+                .map(|l| l.course_index)
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5, 7, 9]
+        );
     }
 
     #[test]

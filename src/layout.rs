@@ -1,7 +1,9 @@
 //! Детерминированная раскладка по курсовым ребрам; координаты в 0,01 мм.
 
 use crate::choice::{self, BinaryConstraint, Problem, SolveError, UnaryConstraint, Variable};
-use crate::constraints::{Constraints, Exclusion, Interval, MaskCoverage, MaskSource, SolidBox};
+use crate::constraints::{
+    Constraints, Exclusion, Interval, LintelCandidate, MaskCoverage, MaskSource, SolidBox,
+};
 use crate::domain::{CourseEdge, Point, Topology};
 use crate::grid::joint_residue;
 use crate::node_assembly::{assemble_node, NodeKind};
@@ -1937,6 +1939,449 @@ fn block(
     }
 }
 
+/// Узкий простенок включается в общую перемычку. Разрез разрешён только
+/// в центре достаточно широкого простенка и вдали от шва нижнего венца.
+fn lintel_groups<'a>(
+    constraints: &'a Constraints,
+    run: &str,
+    course: i64,
+) -> Vec<Vec<&'a LintelCandidate>> {
+    let mut candidates: Vec<_> = constraints
+        .lintel_candidates
+        .iter()
+        .filter(|v| v.course_index == course && v.run_id == run)
+        .collect();
+    candidates.sort_by_key(|v| (v.span.start, v.span.end));
+    let mut groups: Vec<Vec<&LintelCandidate>> = Vec::new();
+    for candidate in candidates {
+        if let Some(group) = groups.last_mut() {
+            if candidate.span.start - group.last().unwrap().span.end <= 64_000 {
+                group.push(candidate);
+                continue;
+            }
+        }
+        groups.push(vec![candidate]);
+    }
+    groups
+}
+
+fn lintel_segments(
+    group: &[&LintelCandidate],
+    bridge: Span,
+    maximum: i64,
+    below: &[Block],
+    edge: &CourseEdge,
+    course: i64,
+) -> Option<Vec<Span>> {
+    let mut joints = Vec::new();
+    for pair in group.windows(2) {
+        let center = pair[0].span.end + (pair[1].span.start - pair[0].span.end) / 2;
+        let (Some(left), Some(right)) = (pair[0].right_support, pair[1].left_support) else {
+            continue;
+        };
+        if center < left.end || center > right.start {
+            continue;
+        }
+        let point = point_at(edge, center, edge_length(edge, 1).ok()?);
+        let supported = below
+            .iter()
+            .filter(|b| b.course_index == course - 1 && b.edge_id == edge.edge_id)
+            .any(|b| {
+                let distance = |a: Point| ((a.x - point.x) as f64).hypot((a.y - point.y) as f64);
+                distance(b.start) > 15_000.0
+                    && distance(b.end) > 15_000.0
+                    && (distance(b.start) + distance(b.end) - b.length_centimm as f64).abs() < 2.0
+            });
+        if supported {
+            joints.push(center);
+        }
+    }
+    let mut result = Vec::new();
+    let mut start = bridge.start;
+    while bridge.end - start > maximum {
+        let end = joints
+            .iter()
+            .copied()
+            .filter(|v| *v > start && *v - start <= maximum)
+            .max()?;
+        result.push(Span { start, end });
+        start = end;
+    }
+    result.push(Span {
+        start,
+        end: bridge.end,
+    });
+    Some(result)
+}
+
+/// Перемычка заменяет продольные детали, сохраняя врезки и поперечные
+/// части узлов. Крайние рядовые детали делятся по минимальному опиранию.
+fn merge_t_lintels(
+    blocks: &mut Vec<Block>,
+    constraints: &Constraints,
+    profile: &Profile,
+) -> BTreeSet<(i64, String)> {
+    let mut completed = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let maximum = profile
+        .bridge_nominal_lengths_centimm
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    for candidate in &constraints.lintel_candidates {
+        if !visited.insert((candidate.course_index, candidate.opening_id.clone())) {
+            continue;
+        }
+        let Some((a, b)) = constraints.opening_axis(&candidate.opening_id) else {
+            continue;
+        };
+        let dx = b.x_mm - a.x_mm;
+        let dy = b.y_mm - a.y_mm;
+        let width = dx.hypot(dy);
+        if width <= 0.0 {
+            continue;
+        }
+        let (ux, uy) = (dx / width, dy / width);
+        let project = |p: Point| {
+            ((p.x as f64 - a.x_mm * 100.0) * ux + (p.y as f64 - a.y_mm * 100.0) * uy).round() as i64
+        };
+        let on_axis = |p: Point| {
+            ((p.x as f64 - a.x_mm * 100.0) * uy - (p.y as f64 - a.y_mm * 100.0) * ux).abs() <= 1.0
+        };
+        let required = Span {
+            start: -(profile.lintel_support_mm * 100.0).round() as i64,
+            end: ((width + profile.lintel_support_mm) * 100.0).round() as i64,
+        };
+        if required.len() > maximum
+            || blocks.iter().any(|part| {
+                part.course_index == candidate.course_index
+                    && part.is_bridge
+                    && part.source_ids.contains(&candidate.opening_id)
+            })
+        {
+            continue;
+        }
+        let mut placement = None;
+        for offset in 0..=1 {
+            let course = candidate.course_index + offset;
+            let mut coverage = Vec::new();
+            for (index, part) in blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.course_index == course)
+            {
+                let points: Vec<_> = if part.arms.is_empty() {
+                    vec![part.start, part.end]
+                } else {
+                    part.arms
+                        .iter()
+                        .flat_map(|arm| [arm.start, arm.end])
+                        .collect()
+                };
+                if points.iter().all(|p| on_axis(*p)) {
+                    let start = points.iter().map(|p| project(*p)).min().unwrap_or(0);
+                    let end = points.iter().map(|p| project(*p)).max().unwrap_or(0);
+                    if end > start {
+                        coverage.push((index, Span { start, end }));
+                    }
+                }
+            }
+            let span = required;
+            if span.len() > maximum {
+                continue;
+            }
+            let transverse_blocked = blocks
+                .iter()
+                .filter(|part| part.course_index == course && part.kind == "node_T")
+                .any(|part| {
+                    part.arms
+                        .iter()
+                        .any(|arm| !on_axis(arm.start) || !on_axis(arm.end))
+                        && part
+                            .arms
+                            .iter()
+                            .flat_map(|arm| [arm.start, arm.end])
+                            .any(|p| on_axis(p) && project(p) > span.start && project(p) < span.end)
+                        && part.product_key.as_deref() != Some("Type5_1")
+                });
+            if transverse_blocked {
+                continue;
+            }
+            let mut selected: Vec<_> = coverage
+                .into_iter()
+                .filter(|(_, part_span)| part_span.intersects(span))
+                .map(|(index, part_span)| {
+                    (
+                        index,
+                        Span {
+                            start: part_span.start.max(span.start),
+                            end: part_span.end.min(span.end),
+                        },
+                    )
+                })
+                .collect();
+            selected.sort_by_key(|(_, part_span)| part_span.start);
+            if selected
+                .first()
+                .is_none_or(|(_, first)| first.start != span.start)
+                || selected.last().is_none_or(|(_, last)| last.end != span.end)
+                || selected
+                    .windows(2)
+                    .any(|pair| pair[0].1.end != pair[1].1.start)
+                || selected.iter().any(|(i, _)| blocks[*i].is_bridge)
+            {
+                continue;
+            }
+            placement = Some((course, selected, span));
+            break;
+        }
+        let Some((course, selected, span)) = placement else {
+            continue;
+        };
+        let point = |u: i64| Point {
+            x: (a.x_mm * 100.0 + u as f64 * ux).round() as i64,
+            y: (a.y_mm * 100.0 + u as f64 * uy).round() as i64,
+        };
+        let first_block = &blocks[selected[0].0];
+        let mut merged = block(
+            &CourseEdge {
+                edge_id: first_block.edge_id.clone(),
+                wall_id: first_block.wall_id.clone(),
+                start: point(span.start),
+                end: point(span.end),
+            },
+            course,
+            first_block.z_centimm,
+            Span {
+                start: 0,
+                end: span.len(),
+            },
+            span.len(),
+            "bridge",
+            true,
+            Vec::new(),
+            vec![candidate.opening_id.clone()],
+        );
+        merged.id = format!(
+            "c{course}:lintel:{}:{}-{}",
+            candidate.opening_id, span.start, span.end
+        );
+        let mut cuts_valid = true;
+        for (i, used) in &selected {
+            let part = &blocks[*i];
+            merged.source_ids.extend(part.source_ids.iter().cloned());
+            for cut in &part.cuts {
+                if !cut.starts_with("Type") {
+                    if cut.starts_with("opening_volume:") || cut.starts_with("beam_volume:") {
+                        merged.cuts.push(cut.clone());
+                    }
+                    continue;
+                }
+                let fields: Vec<_> = cut.splitn(4, ':').collect();
+                let Some(local_position) = fields.get(1).and_then(|s| {
+                    s.strip_prefix('x')
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .map(|x| (x - 1) * 32_000)
+                        .or_else(|| s.strip_prefix('p').and_then(|s| s.parse::<i64>().ok()))
+                }) else {
+                    cuts_valid = false;
+                    break;
+                };
+                let rotation = f64::from(part.rotation_deg).to_radians();
+                let cut_point = Point {
+                    x: (part.start.x as f64 + local_position as f64 * rotation.cos()).round()
+                        as i64,
+                    y: (part.start.y as f64 + local_position as f64 * rotation.sin()).round()
+                        as i64,
+                };
+                if project(cut_point) < used.start || project(cut_point) > used.end {
+                    continue;
+                }
+                let position = project(cut_point) - span.start;
+                if fields.len() != 4 || position < 0 || position > span.len() {
+                    cuts_valid = false;
+                    break;
+                }
+                let coordinate = if position % 32_000 == 0 {
+                    format!("x{}", position / 32_000 + 1)
+                } else {
+                    format!("p{position}")
+                };
+                let Some(mut face) = fields[2]
+                    .strip_prefix('y')
+                    .and_then(|v| v.parse::<u8>().ok())
+                    .filter(|v| (1..=3).contains(v))
+                else {
+                    cuts_valid = false;
+                    break;
+                };
+                // Разворот оси детали зеркалит и координату, и грань врезки.
+                if rotation.cos() * ux + rotation.sin() * uy < 0.0 {
+                    face = 4 - face;
+                }
+                merged.cuts.push(format!(
+                    "{}:{}:y{}:{}",
+                    fields[0], coordinate, face, fields[3]
+                ));
+            }
+        }
+        if !cuts_valid {
+            continue;
+        }
+        merged.cuts.sort();
+        merged.cuts.dedup();
+        merged.source_ids.sort();
+        merged.source_ids.dedup();
+        merged.catalog_nominal_centimm = profile
+            .bridge_nominal_lengths_centimm
+            .iter()
+            .copied()
+            .filter(|n| *n >= span.len())
+            .min();
+        let mut residuals = Vec::new();
+        for (index, used) in &selected {
+            let part = &blocks[*index];
+            let points: Vec<_> = if part.arms.is_empty() {
+                vec![part.start, part.end]
+            } else {
+                part.arms
+                    .iter()
+                    .flat_map(|arm| [arm.start, arm.end])
+                    .collect()
+            };
+            let original = Span {
+                start: points.iter().map(|p| project(*p)).min().unwrap_or(0),
+                end: points.iter().map(|p| project(*p)).max().unwrap_or(0),
+            };
+            for (side, remainder) in [
+                (
+                    "left",
+                    Span {
+                        start: original.start,
+                        end: used.start,
+                    },
+                ),
+                (
+                    "right",
+                    Span {
+                        start: used.end,
+                        end: original.end,
+                    },
+                ),
+            ] {
+                if remainder.len() <= 0 {
+                    continue;
+                }
+                let mut residual = part.clone();
+                residual.id = format!("{}:lintel-{side}-{}", part.id, candidate.opening_id);
+                residual.start = point(remainder.start);
+                residual.end = point(remainder.end);
+                residual.length_centimm = remainder.len();
+                residual.rotation_deg = merged.rotation_deg;
+                residual.cuts.retain(|cut| cut != "left" && cut != "right");
+                if !part.arms.is_empty() {
+                    let rotation = f64::from(part.rotation_deg).to_radians();
+                    let forward = rotation.cos() * ux + rotation.sin() * uy >= 0.0;
+                    let origin = if forward {
+                        remainder.start
+                    } else {
+                        remainder.end
+                    };
+                    residual.start = point(origin);
+                    residual.end = residual.start;
+                    residual.rotation_deg = part.rotation_deg;
+                    residual.arms = part
+                        .arms
+                        .iter()
+                        .filter_map(|arm| {
+                            let start = project(arm.start)
+                                .min(project(arm.end))
+                                .max(remainder.start);
+                            let end = project(arm.start).max(project(arm.end)).min(remainder.end);
+                            if end <= start {
+                                return None;
+                            }
+                            let mut clipped = arm.clone();
+                            clipped.start = point(start);
+                            clipped.end = point(end);
+                            clipped.length_centimm = end - start;
+                            Some(clipped)
+                        })
+                        .collect();
+                    residual.cuts.clear();
+                    for cut in &part.cuts {
+                        if !cut.starts_with("Type") {
+                            if cut.starts_with("opening_volume:") || cut.starts_with("beam_volume:")
+                            {
+                                residual.cuts.push(cut.clone());
+                            }
+                            continue;
+                        }
+                        let fields: Vec<_> = cut.splitn(4, ':').collect();
+                        let Some(at) = fields.get(1).and_then(|s| {
+                            s.strip_prefix('x')
+                                .and_then(|s| s.parse::<i64>().ok())
+                                .map(|x| (x - 1) * 32_000)
+                                .or_else(|| s.strip_prefix('p').and_then(|s| s.parse::<i64>().ok()))
+                        }) else {
+                            continue;
+                        };
+                        if fields.len() != 4 {
+                            continue;
+                        }
+                        let old_origin = project(part.start);
+                        let world_at = old_origin + if forward { at } else { -at };
+                        if world_at < remainder.start || world_at > remainder.end {
+                            continue;
+                        }
+                        let position = (world_at - origin).abs();
+                        let coordinate = if position % 32_000 == 0 {
+                            format!("x{}", position / 32_000 + 1)
+                        } else {
+                            format!("p{position}")
+                        };
+                        residual.cuts.push(format!(
+                            "{}:{}:{}:{}",
+                            fields[0], coordinate, fields[2], fields[3]
+                        ));
+                    }
+                    if !residual.cuts.iter().any(|cut| cut.starts_with("Type")) {
+                        residual.kind = "ordinary".into();
+                        residual.product_key = None;
+                        residual.start = point(remainder.start);
+                        residual.end = point(remainder.end);
+                        residual.rotation_deg = merged.rotation_deg;
+                        residual.arms.clear();
+                        residual.local_origin = None;
+                        residual.local_rotation_deg = None;
+                    }
+                }
+                residual
+                    .cuts
+                    .push(if side == "left" { "right" } else { "left" }.into());
+                if side == "left" {
+                    residual.hide_spikes_right = true;
+                } else {
+                    residual.hide_spikes_left = true;
+                }
+                residuals.push(residual);
+            }
+        }
+        let removed: BTreeSet<_> = selected.iter().map(|(index, _)| *index).collect();
+        let mut index = 0;
+        blocks.retain(|_| {
+            let keep = !removed.contains(&index);
+            index += 1;
+            keep
+        });
+        blocks.push(merged);
+        blocks.extend(residuals);
+        completed.insert((candidate.course_index, candidate.opening_id.clone()));
+    }
+    completed
+}
+
 /// Производственный расчёт: любая диагностика кандидата запрещает выпуск.
 pub fn calculate(
     topology: &Topology,
@@ -2433,12 +2878,10 @@ pub fn calculate_candidate(
             }
             let expected_solid = solid.clone();
             let mut placed = Vec::new();
-            for lintel in constraints
-                .lintel_candidates
-                .iter()
-                .filter(|v| v.course_index == course.index && v.run_id == edge.edge_id)
-            {
-                let Some(left) = lintel.left_support else {
+            for group in lintel_groups(constraints, &edge.edge_id, course.index) {
+                let first = group[0];
+                let last = group[group.len() - 1];
+                let Some(left) = first.left_support else {
                     errors.push(diagnostic(
                         DiagnosticCode::InvalidSupport,
                         "Нет левой опоры перемычки",
@@ -2447,7 +2890,7 @@ pub fn calculate_candidate(
                     ));
                     continue;
                 };
-                let Some(right) = lintel.right_support else {
+                let Some(right) = last.right_support else {
                     errors.push(diagnostic(
                         DiagnosticCode::InvalidSupport,
                         "Нет правой опоры перемычки",
@@ -2460,8 +2903,8 @@ pub fn calculate_candidate(
                     start: left.start,
                     end: right.end,
                 };
-                if left.end != lintel.span.start
-                    || right.start != lintel.span.end
+                if left.end != first.span.start
+                    || right.start != last.span.end
                     || bridge.start < start_arm
                     || bridge.end > length - end_arm
                     || bridge.len() <= 0
@@ -2475,16 +2918,19 @@ pub fn calculate_candidate(
                     ));
                     continue;
                 }
-                let nominal = profile
+                let maximum = profile
                     .bridge_nominal_lengths_centimm
                     .iter()
                     .copied()
-                    .filter(|v| *v >= bridge.len())
-                    .min();
-                let Some(nominal) = nominal else {
+                    .max()
+                    .unwrap_or(0);
+                let Some(segments) = (maximum > 0)
+                    .then(|| lintel_segments(&group, bridge, maximum, &blocks, edge, course.index))
+                    .flatten()
+                else {
                     errors.push(diagnostic(
-                        DiagnosticCode::UnsupportedCatalog,
-                        "Длина перемычки превышает подтверждённый каталожный номинал",
+                        DiagnosticCode::InvalidSupport,
+                        "Нет допустимых стыков на простенках в пределах максимальной длины перемычки",
                         Some(edge),
                         Some(course.index),
                     ));
@@ -2521,24 +2967,33 @@ pub fn calculate_candidate(
                 }
                 solid = subtract(solid, bridge);
                 placed.push(bridge);
-                let cuts = if nominal > bridge.len() {
-                    vec!["right".into()]
-                } else {
-                    Vec::new()
-                };
-                let mut item = block(
-                    edge,
-                    course.index,
-                    course.z,
-                    bridge,
-                    length,
-                    "bridge",
-                    true,
-                    cuts,
-                    vec![lintel.opening_id.clone()],
-                );
-                item.catalog_nominal_centimm = Some(nominal);
-                blocks.push(item);
+                for bridge in segments {
+                    let nominal = profile
+                        .bridge_nominal_lengths_centimm
+                        .iter()
+                        .copied()
+                        .filter(|v| *v >= bridge.len())
+                        .min()
+                        .unwrap_or(maximum);
+                    let cuts = if nominal > bridge.len() {
+                        vec!["right".into()]
+                    } else {
+                        Vec::new()
+                    };
+                    let mut item = block(
+                        edge,
+                        course.index,
+                        course.z,
+                        bridge,
+                        length,
+                        "bridge",
+                        true,
+                        cuts,
+                        group.iter().map(|v| v.opening_id.clone()).collect(),
+                    );
+                    item.catalog_nominal_centimm = Some(nominal);
+                    blocks.push(item);
+                }
             }
             for node_span in [
                 Span {
@@ -2651,10 +3106,11 @@ pub fn calculate_candidate(
                         start: cursor,
                         end: cursor + piece,
                     };
+                    let mut volume_sources = Vec::new();
                     match classify_candidate(topology, constraints, course, edge, current, profile)
                     {
                         Ok(Exclusion::None) => {}
-                        Ok(Exclusion::Partial { .. }) => {}
+                        Ok(Exclusion::Partial { source_ids }) => volume_sources = source_ids,
                         Ok(Exclusion::FullVoid { source_ids }) => {
                             errors.push(diagnostic(
                                 DiagnosticCode::UnsupportedGeometry,
@@ -2694,6 +3150,31 @@ pub fn calculate_candidate(
                         cuts,
                         Vec::new(),
                     );
+                    for source in volume_sources {
+                        if let Some(id) = source.strip_prefix("opening:") {
+                            item.cuts.push(format!("opening_volume:{id}"));
+                            item.source_ids.push(source);
+                        } else if let Some(id) = source.strip_prefix("beam:") {
+                            item.cuts.push(format!("beam_volume:{id}"));
+                            item.source_ids.push(source);
+                        }
+                    }
+                    // Даже каталожный блок у точной грани проёма имеет
+                    // спиленные шипы: наличие продольной подрезки не требуется.
+                    for mask in constraints.masks.iter().filter(|m| {
+                        m.course_index == course.index
+                            && m.run_id == edge.edge_id
+                            && matches!(m.source, MaskSource::Opening(_))
+                    }) {
+                        if current.start == mask.interval.end {
+                            item.hide_spikes_left = true;
+                            item.source_ids.push(mask_source(&mask.source));
+                        }
+                        if current.end == mask.interval.start {
+                            item.hide_spikes_right = true;
+                            item.source_ids.push(mask_source(&mask.source));
+                        }
+                    }
                     if roof_start && piece_index == 0 {
                         item.hide_spikes_left = false;
                     }
@@ -2764,12 +3245,35 @@ pub fn calculate_candidate(
             }
             item.source_ids.sort();
             item.source_ids.dedup();
+            if !item.arms.is_empty() {
+                for source in &item.source_ids {
+                    if let Some(id) = source.strip_prefix("beam:") {
+                        let cut = format!("beam_volume:{id}");
+                        if !item.cuts.contains(&cut) {
+                            item.cuts.push(cut);
+                        }
+                    }
+                }
+            }
         }
     }
+    let completed_t = merge_t_lintels(&mut blocks, constraints, profile);
     let mut support_warnings = Vec::new();
     errors.retain(|issue| {
         if issue.code==DiagnosticCode::InvalidSupport {
+            let affected: Vec<_> = constraints.lintel_candidates.iter().filter(|l|
+                Some(l.course_index) == issue.course_index && Some(&l.run_id) == issue.edge_id.as_ref()).collect();
+            if !affected.is_empty() && affected.iter().all(|l| completed_t.contains(&(l.course_index, l.opening_id.clone()))) {
+                return false;
+            }
             let mut warning=issue.clone();
+            warning.source_ids.extend(affected.iter().map(|l| format!("opening:{}", l.opening_id)));
+            if let Some(run) = topology.courses.iter().find(|c| Some(c.index) == issue.course_index)
+                .and_then(|c| c.runs.iter().find(|r| Some(&r.id) == issue.edge_id.as_ref())) {
+                warning.source_ids.push(run.id.clone());
+                warning.source_ids.extend(run.sources.iter().map(|s| format!("wall:{}", s.wall_id)));
+            }
+            warning.source_ids.sort(); warning.source_ids.dedup();
             warning.message=format!("Перемычка требует уточнения: {}. В просмотре сохранён материал ряда обычными деталями",warning.message);
             support_warnings.push(warning);false
         } else {true}
@@ -3980,6 +4484,208 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.iter().any(|d| d.code == DiagnosticCode::InvalidSupport));
+    }
+
+    #[test]
+    fn t_lintel_replaces_longitudinal_parts_and_shifts_away_from_type10_1() {
+        use crate::constraints::{build_constraints, RawOpening};
+        use crate::domain::{NormalizedWall, RawPoint};
+        let e = edge("e", "wall", (0, 0), (320_000, 0));
+        let mut t = topology(vec![e.clone()], 0);
+        t.walls.push(NormalizedWall {
+            id: "wall".into(),
+            start: e.start,
+            end: e.end,
+            bottom_start: 0,
+            bottom_end: 0,
+            top_start: 25_200,
+            top_end: 25_200,
+            thickness: 19_300,
+        });
+        let template = t.courses[0].clone();
+        t.courses = (0..4)
+            .map(|index| {
+                let mut c = template.clone();
+                c.index = index;
+                c.z = index * 6_300;
+                c
+            })
+            .collect();
+        let c = build_constraints(
+            &t,
+            &[RawOpening {
+                id: "o".into(),
+                start: RawPoint {
+                    x_mm: 1200.0,
+                    y_mm: 0.0,
+                },
+                end: RawPoint {
+                    x_mm: 2000.0,
+                    y_mm: 0.0,
+                },
+                bottom_start_mm: 0.0,
+                bottom_end_mm: 0.0,
+                top_start_mm: 63.0,
+                top_end_mm: 63.0,
+            }],
+            &[],
+            63.0,
+            200.0,
+        )
+        .unwrap();
+        let mut p = profile();
+        p.lintel_support_mm = 200.0;
+        p.bridge_nominal_lengths_centimm = vec![128_000];
+        let parts = |course, stem: &str| {
+            let mut parts = Vec::new();
+            for (index, (start, end)) in [
+                (96_000, 128_000),
+                (128_000, 160_000),
+                (160_000, 192_000),
+                (192_000, 224_000),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut part = block(
+                    &e,
+                    course,
+                    course * 6_300,
+                    Span { start, end },
+                    320_000,
+                    "ordinary",
+                    false,
+                    Vec::new(),
+                    vec![format!("source-{index}")],
+                );
+                if index == 1 || index == 2 {
+                    part.kind = "node_T".into();
+                    part.product_key = Some("Type6".into());
+                    part.arms.push(BlockArm {
+                        edge_id: "e".into(),
+                        wall_id: "wall".into(),
+                        start: part.start,
+                        end: part.end,
+                        length_centimm: end - start,
+                    });
+                    part.cuts.push(format!(
+                        "Type6:x{}:y{}:e",
+                        if index == 1 { 2 } else { 1 },
+                        if index == 1 { 1 } else { 3 }
+                    ));
+                }
+                parts.push(part);
+            }
+            let mut stem_part = block(
+                &e,
+                course,
+                course * 6_300,
+                Span {
+                    start: 160_000,
+                    end: 192_000,
+                },
+                320_000,
+                "node_T",
+                false,
+                Vec::new(),
+                vec!["stem-source".into()],
+            );
+            stem_part.product_key = Some(stem.into());
+            stem_part.start = Point { x: 160_000, y: 0 };
+            stem_part.end = stem_part.start;
+            stem_part.arms.push(BlockArm {
+                edge_id: "stem".into(),
+                wall_id: "stem".into(),
+                start: stem_part.start,
+                end: Point {
+                    x: 160_000,
+                    y: 32_000,
+                },
+                length_centimm: 32_000,
+            });
+            parts.push(stem_part);
+            parts
+        };
+        let mut blocked = parts(1, "Type10_1");
+        assert!(merge_t_lintels(&mut blocked, &c, &p).is_empty());
+        assert!(blocked.iter().all(|b| !b.is_bridge));
+        for offset in [0, 1] {
+            let mut blocks = if offset == 0 {
+                parts(1, "Type5_1")
+            } else {
+                let mut blocks = parts(1, "Type10_1");
+                blocks.extend(parts(2, "Type5_1"));
+                blocks
+            };
+            let completed = merge_t_lintels(&mut blocks, &c, &p);
+            assert!(completed.contains(&(1, "o".into())));
+            let bridge = blocks.iter().find(|b| b.is_bridge).unwrap();
+            assert_eq!(bridge.course_index, 1 + offset);
+            assert_eq!(
+                (bridge.start.x, bridge.end.x, bridge.length_centimm),
+                (100_000, 220_000, 120_000)
+            );
+            assert!(bridge.cuts.contains(&"Type6:p60000:y1:e".into()));
+            assert!(bridge.cuts.contains(&"Type6:p60000:y3:e".into()));
+            assert_eq!(bridge.source_ids.len(), 5);
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|b| b.course_index == bridge.course_index)
+                    .count(),
+                4
+            );
+            assert!(blocks.iter().any(|b| b.course_index == bridge.course_index
+                && b.product_key.as_deref() == Some("Type5_1")));
+            if offset == 1 {
+                assert_eq!(blocks.iter().filter(|b| b.course_index == 1).count(), 5);
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_pier_is_included_once_and_unavailable_maximum_is_a_warning() {
+        let t = topology(vec![edge("e", "wall", (0, 0), (140_000, 0))], 0);
+        let candidate = |id: &str, start, end| LintelCandidate {
+            opening_id: id.into(),
+            run_id: "e".into(),
+            course_index: 0,
+            span: Interval { start, end },
+            left_support: Some(Interval {
+                start: start - 5_000,
+                end: start,
+            }),
+            right_support: Some(Interval {
+                start: end,
+                end: end + 5_000,
+            }),
+        };
+        let c = Constraints {
+            lintel_candidates: vec![
+                candidate("a", 40_000, 60_000),
+                candidate("b", 80_000, 100_000),
+            ],
+            ..Default::default()
+        };
+        let mut p = profile();
+        p.bridge_nominal_lengths_centimm = vec![128_000];
+        let result = calculate(&t, &c, &p).unwrap();
+        let bridges: Vec<_> = result.blocks.iter().filter(|b| b.is_bridge).collect();
+        assert_eq!(bridges.len(), 1);
+        assert_eq!(bridges[0].length_centimm, 70_000);
+        assert!(
+            bridges[0].source_ids.contains(&"a".into())
+                && bridges[0].source_ids.contains(&"b".into())
+        );
+        assert_eq!(covered(&result.blocks, "e"), 140_000);
+        p.bridge_nominal_lengths_centimm = vec![30_000];
+        let fallback = calculate_candidate(&t, &c, &p).unwrap();
+        assert!(fallback.layout.blocks.iter().all(|b| !b.is_bridge));
+        assert_eq!(covered(&fallback.layout.blocks, "e"), 140_000);
+        assert!(fallback
+            .diagnostics
+            .iter()
+            .any(|d| d.code == DiagnosticCode::InvalidSupport));
     }
     #[test]
     fn canonical_l_catalog_rotates_with_geometry() {

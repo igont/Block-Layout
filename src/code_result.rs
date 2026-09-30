@@ -64,12 +64,24 @@ fn export_block(
             let mut fields = cut.splitn(4, ':');
             let key = fields.next().unwrap_or("");
             let product = type_number(key).ok_or_else(|| issue(block, "Неизвестный тип врезки"))?;
-            let x: u8 = fields
-                .next()
-                .and_then(|s| s.strip_prefix('x'))
-                .and_then(|s| s.parse().ok())
-                .filter(|x| (1..=3).contains(x))
-                .ok_or_else(|| issue(block, "Некорректная позиция x врезки"))?;
+            let location = fields.next().unwrap_or("");
+            let (x, position) = if let Some(slot) = location.strip_prefix('x') {
+                let x: i64 = slot
+                    .parse()
+                    .ok()
+                    .filter(|x| *x > 0 && *x <= 3126)
+                    .ok_or_else(|| issue(block, "Некорректная позиция x врезки"))?;
+                (Some(x), (x - 1) * 32_000)
+            } else if let Some(offset) = location.strip_prefix('p') {
+                let position: i64 = offset
+                    .parse()
+                    .ok()
+                    .filter(|p| *p >= 0 && *p <= block.length_centimm)
+                    .ok_or_else(|| issue(block, "Некорректная координата врезки"))?;
+                (None, position)
+            } else {
+                return Err(issue(block, "Некорректная позиция врезки"));
+            };
             let y: u8 = fields
                 .next()
                 .and_then(|s| s.strip_prefix('y'))
@@ -86,11 +98,31 @@ fn export_block(
             } else {
                 y
             };
-            let position = ((i64::from(x) - 1) * 32_000).min(block.length_centimm);
+            if position > block.length_centimm {
+                return Err(issue(block, "Врезка за пределами детали"));
+            }
             tokens.push((position, canonical_y, product));
-            node_cuts.push(json!({"product_type":format!("Тип {}",key.trim_start_matches("Type").replace('_',".")),
-                "x":x,"y":canonical_y,"position_mm":mm(position),"face":match canonical_y {1=>"Н",2=>"С",_=>"В"},
-                "source_run_ids":sources.split(',').collect::<Vec<_>>()}));
+            let mut node_cut = json!({"product_type":format!("Тип {}",key.trim_start_matches("Type").replace('_',".")),
+                "y":canonical_y,"position_mm":mm(position),"face":match canonical_y {1=>"Н",2=>"С",_=>"В"},
+                "source_run_ids":sources.split(',').collect::<Vec<_>>()});
+            if let Some(x) = x {
+                node_cut["x"] = json!(x);
+            }
+            node_cuts.push(node_cut);
+        } else if let Some(source) = cut.strip_prefix("opening_volume:") {
+            if !request
+                .opening_volumes
+                .iter()
+                .any(|opening| opening.guid == source)
+            {
+                return Err(issue(block, "Не найден исходный объём проёма"));
+            }
+            trims.push(json!({"kind":"opening_volume","source_opening_id":source}));
+        } else if let Some(source) = cut.strip_prefix("beam_volume:") {
+            if !request.beams.iter().any(|beam| beam.guid == source) {
+                return Err(issue(block, "Не найден исходный объём балки"));
+            }
+            trims.push(json!({"kind":"beam_volume","source_beam_id":source}));
         } else {
             let mut trim = json!({"description":cut});
             if cut == "left" || cut == "right" {
@@ -208,10 +240,10 @@ fn export_block(
     let physical_length =
         mm(block.length_centimm) + begin_extension + l_extension(block.length_centimm);
     let product_type = match block.product_key.as_deref() {
+        _ if block.is_bridge => "Перемычка".into(),
         Some(key) if key.starts_with("Type") => {
             format!("Тип {}", key.trim_start_matches("Type").replace('_', "."))
         }
-        _ if block.is_bridge => "Перемычка".into(),
         _ if block.kind == "special_ordinary" => "Специальный".into(),
         _ => "Рядовой".into(),
     };
@@ -261,6 +293,81 @@ mod tests {
             "rotation_deg":0,"local_origin":null,"local_rotation_deg":null,"is_bridge":false,
             "hide_spikes_left":false,"hide_spikes_right":false,"cuts":cuts,
             "source_ids":["wall:wall-example","edge:wall-example:0"],"catalog_nominal_centimm":64000,"arms":[]})).unwrap()
+    }
+
+    #[test]
+    fn bridge_preserves_long_cut_positions_and_opening_trim_sources() {
+        let standard = parse_request(include_str!(
+            "../Документация/Граничные контракты/examples/layout-request.v1.json"
+        ))
+        .unwrap();
+        let mut request = standard.to_layout_request().unwrap();
+        let mut opening = request.wall_volumes[0].clone();
+        opening.guid = "opening-example".into();
+        request.opening_volumes.push(opening);
+        request.beams.push(serde_json::from_value(json!({"guid":"beam-example",
+            "startXmm":0,"startYmm":0,"startZmm":-252,"endXmm":1920,"endYmm":0,"endZmm":-252,
+            "geometry":{"widthMm":160,"heightMm":315,"heightDirectionX":0,"heightDirectionY":0,"heightDirectionZ":1}})).unwrap());
+        let profile: Profile =
+            serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
+        let mut bridge = block(
+            "bridge",
+            "lintel",
+            Some("Type7_1"),
+            vec!["Type6:x5:y1:run-example", "Type6:x5:y3:run-example"],
+        );
+        bridge.length_centimm = 192000;
+        bridge.is_bridge = true;
+        bridge.catalog_nominal_centimm = Some(192000);
+        bridge.cuts.push("opening_volume:opening-example".into());
+        bridge.source_ids.push("opening:opening-example".into());
+        let result = export_block(&request, &profile, &bridge).unwrap();
+        assert_eq!(result["product_type"], "Перемычка");
+        assert_eq!(result["code1"], "П1920 [Н-1280-Тип 6] [В-1280-Тип 6]");
+        assert_eq!(result["code2"], "П1920 [Н-640-Тип 6] [В-640-Тип 6]");
+        assert_eq!(result["node_cuts"][0]["position_mm"], 1280.0);
+        assert_eq!(result["nominal_length_mm"], 1920.0);
+        assert_eq!(
+            result["source_ids"],
+            json!(["opening-example", "wall-example"])
+        );
+        assert!(result["trims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|trim| trim["kind"] == "opening_volume"
+                && trim["source_opening_id"] == "opening-example"));
+        bridge.cuts = vec![
+            "Type6:p128012:y1:run-example".into(),
+            "Type6:p128012:y3:run-example".into(),
+        ];
+        let arbitrary = export_block(&request, &profile, &bridge).unwrap();
+        assert_eq!(
+            arbitrary["code1"],
+            "П1920 [Н-1280.12-Тип 6] [В-1280.12-Тип 6]"
+        );
+        assert_eq!(
+            arbitrary["code2"],
+            "П1920 [Н-639.88-Тип 6] [В-639.88-Тип 6]"
+        );
+        assert_eq!(arbitrary["node_cuts"][0]["position_mm"], 1280.12);
+        assert!(arbitrary["node_cuts"][0].get("x").is_none());
+        bridge.cuts = vec!["beam_volume:beam-example".into()];
+        bridge.source_ids.push("beam:beam-example".into());
+        let supported = export_block(&request, &profile, &bridge).unwrap();
+        assert!(supported["trims"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|trim| trim["kind"] == "beam_volume" && trim["source_beam_id"] == "beam-example"));
+        assert!(supported["source_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("beam-example")));
+        bridge.cuts = vec!["beam_volume:missing".into()];
+        assert!(export_block(&request, &profile, &bridge).is_err());
+        bridge.cuts = vec!["opening_volume:missing".into()];
+        assert!(export_block(&request, &profile, &bridge).is_err());
     }
 
     #[test]

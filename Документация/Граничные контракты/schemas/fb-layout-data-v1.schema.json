@@ -100,7 +100,7 @@
     "opening": {
       "type": "object", "additionalProperties": false, "required": ["id", "purpose", "volume"],
       "properties": {
-        "id": {"$ref": "#/$defs/id"}, "purpose": {"enum": ["opening", "console", "wall_trim"]},
+        "id": {"$ref": "#/$defs/id"}, "purpose": {"enum": ["opening", "window", "door", "partition_opening", "console", "wall_trim"]},
         "wall_ids": {"$ref": "#/$defs/ids"}, "volume": {"$ref": "#/$defs/axisPrism"}
       }
     },

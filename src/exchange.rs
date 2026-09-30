@@ -262,6 +262,9 @@ impl ExchangeRequest {
             }
             let purpose = match opening.purpose.as_str() {
                 "opening" => "OPENING",
+                "window" => "WINDOW",
+                "door" => "DOOR",
+                "partition_opening" => "PARTITION_OPENING",
                 "console" => "CONSOLE",
                 "wall_trim" => {
                     return Err(error(
@@ -394,6 +397,9 @@ pub fn from_layout_request(
                 id: o.guid.clone(),
                 purpose: match o.opening_type.as_str() {
                     "OPENING" => "opening",
+                    "WINDOW" => "window",
+                    "DOOR" => "door",
+                    "PARTITION_OPENING" => "partition_opening",
                     "CONSOLE" => "console",
                     _ => {
                         return Err(error(

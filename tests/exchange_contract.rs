@@ -18,6 +18,50 @@ fn mutated(change: impl FnOnce(&mut Value)) -> String {
 }
 
 #[test]
+fn opening_kinds_and_every_source_volume_survive_neutral_conversion() {
+    let input = mutated(|value| {
+        let volume = value["model"]["wall_volumes"][0]["volume"].clone();
+        value["model"]["openings"] =
+            json!(
+                ["opening", "window", "door", "console", "partition_opening"]
+                    .iter()
+                    .map(|purpose| json!({"id":purpose,"purpose":purpose,"volume":volume}))
+                    .collect::<Vec<_>>()
+            );
+    });
+    let neutral = parse_request(&input).unwrap();
+    let internal = neutral.to_layout_request().unwrap();
+    assert_eq!(internal.opening_volumes.len(), 5);
+    for (opening, expected) in internal.opening_volumes.iter().zip([
+        "OPENING",
+        "WINDOW",
+        "DOOR",
+        "CONSOLE",
+        "PARTITION_OPENING",
+    ]) {
+        assert_eq!(opening.opening_type, expected);
+        assert_eq!(opening.guid, expected.to_lowercase());
+        assert_eq!(opening.start_xmm, internal.wall_volumes[0].start_xmm);
+        assert_eq!(opening.end_xmm, internal.wall_volumes[0].end_xmm);
+        assert_eq!(
+            opening.start_bottom_zmm,
+            internal.wall_volumes[0].start_bottom_zmm
+        );
+        assert_eq!(opening.end_top_zmm, internal.wall_volumes[0].end_top_zmm);
+        assert_eq!(opening.thickness_mm, 193.0);
+    }
+    let back = from_layout_request(
+        &internal,
+        &serde_json::from_str::<Profile>(include_str!("../profiles/banya-prototype.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(back.model.openings).unwrap(),
+        serde_json::to_value(neutral.model.openings).unwrap()
+    );
+}
+
+#[test]
 fn neutral_input_preserves_source_geometry_without_application_metadata() {
     let request = parse_request(REQUEST).unwrap();
     let internal = request.to_layout_request().unwrap();

@@ -54,7 +54,12 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
     let openings: Vec<RawOpening> = request
         .opening_volumes
         .iter()
-        .filter(|o| o.opening_type == "OPENING" || o.opening_type == "CONSOLE")
+        .filter(|o| {
+            matches!(
+                o.opening_type.as_str(),
+                "OPENING" | "CONSOLE" | "WINDOW" | "DOOR"
+            )
+        })
         .map(|o| RawOpening {
             id: o.guid.clone(),
             start: RawPoint {
@@ -229,6 +234,81 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
     };
     let mut diagnostics: Vec<ApiFailure> =
         layout.diagnostics.into_iter().map(layout_failure).collect();
+    for opening in &openings {
+        let width =
+            (opening.end.x_mm - opening.start.x_mm).hypot(opening.end.y_mm - opening.start.y_mm);
+        if width > 1500.0 || (opening.top_start_mm - opening.top_end_mm).abs() > 0.01 {
+            continue;
+        }
+        let required = if width <= 1000.0 { 3 } else { 5 };
+        let available = constraints
+            .lintel_candidates
+            .iter()
+            .filter(|l| l.opening_id == opening.id)
+            .map(|l| l.course_index)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        if available < required {
+            let top_row = opening.top_start_mm
+                + ((required - 1) * 2) as f64 * profile.index_centimm as f64 / 100.0;
+            let mut note = ApiFailure::new("LINTEL_ROWS_INCOMPLETE",format!("Для проёма имеется {available} из {required} требуемых рядов перемычек; верхний требуемый ряд {top_row} мм отсутствует в материале стены"),Some(opening.id.clone()));
+            note.source_ids.push(opening.id.clone());
+            diagnostics.push(note);
+        }
+    }
+    let excluded: Vec<_> = request
+        .opening_volumes
+        .iter()
+        .filter(|o| {
+            !matches!(
+                o.opening_type.as_str(),
+                "OPENING" | "CONSOLE" | "WINDOW" | "DOOR"
+            )
+        })
+        .map(|o| o.guid.clone())
+        .collect();
+    if !excluded.is_empty() {
+        let mut note = ApiFailure::new(
+            "OPENING_PURPOSE_EXCLUDED",
+            "Проёмы исключённых типов сохранены во входе и не применяются к несущим стенам",
+            None,
+        );
+        note.source_ids = excluded;
+        diagnostics.push(note);
+    }
+    let wide: Vec<_> = openings
+        .iter()
+        .filter(|o| {
+            let dx = o.end.x_mm - o.start.x_mm;
+            let dy = o.end.y_mm - o.start.y_mm;
+            let width = dx.hypot(dy);
+            if width <= 1500.0 {
+                return false;
+            }
+            let (ux, uy) = (dx / width, dy / width);
+            let top = o.top_start_mm.max(o.top_end_mm);
+            !beams.iter().any(|b| {
+                let start = (b.start.x_mm - o.start.x_mm) * ux + (b.start.y_mm - o.start.y_mm) * uy;
+                let end = (b.end.x_mm - o.start.x_mm) * ux + (b.end.y_mm - o.start.y_mm) * uy;
+                let collinear = [b.start, b.end].iter().all(|p| {
+                    ((p.x_mm - o.start.x_mm) * uy - (p.y_mm - o.start.y_mm) * ux).abs() < 0.01
+                });
+                (b.height_mm - 315.0).abs() < 0.01
+                    && (b.bottom_start_mm - top).abs() < 0.01
+                    && (b.bottom_end_mm - top).abs() < 0.01
+                    && collinear
+                    && start.min(end) <= -profile.lintel_support_mm + 0.01
+                    && start.max(end) >= width + profile.lintel_support_mm - 0.01
+            })
+        })
+        .map(|o| o.id.clone())
+        .collect();
+    if !wide.is_empty() {
+        let mut note = ApiFailure::new("OPENING_SUPPORT_BEAM_REQUIRED",
+            "Для проёма шире 1500 мм нужна переданная балка высотой 315 мм с опиранием; вычет проёма сохранён", None);
+        note.source_ids = wide;
+        diagnostics.push(note);
+    }
     let special: Vec<String> = layout
         .layout
         .blocks
@@ -273,6 +353,245 @@ fn layout_failure(e: layout::Diagnostic) -> ApiFailure {
     item.course_index = e.course_index;
     item.occurrences = e.occurrences;
     item
+}
+
+#[cfg(test)]
+mod opening_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn request(bottom: f64) -> LayoutRequest {
+        serde_json::from_value(json!({"schema_version":1,"request_id":"opening-volume","snapshot_hash":"a".repeat(64),"z0_mm":0,
+            "wall_volumes":[{"guid":"wall","startXmm":0,"startYmm":0,"endXmm":1280,"endYmm":0,
+                "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":63,"endTopZmm":63,"thicknessMm":193,"purposeType":1}],
+            "opening_volumes":[{"guid":"opening","startXmm":640,"startYmm":0,"endXmm":960,"endYmm":0,
+                "startBottomZmm":bottom,"endBottomZmm":bottom,"startTopZmm":63,"endTopZmm":63,"openingType":"WINDOW"}],"beams":[]})).unwrap()
+    }
+
+    #[test]
+    fn full_volume_leaves_exact_material_and_cuts_spikes_at_both_faces() {
+        let profile: Profile =
+            serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
+        let result = inspect_request(&request(0.0), &profile);
+        assert!(!result.blocks.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(
+            result.blocks.iter().map(|b| b.length_centimm).sum::<i64>(),
+            96_000
+        );
+        let left = result.blocks.iter().find(|b| b.end.x == 64_000).unwrap();
+        let right = result.blocks.iter().find(|b| b.start.x == 96_000).unwrap();
+        assert!(left.hide_spikes_right && right.hide_spikes_left);
+        assert!(result
+            .blocks
+            .iter()
+            .all(|b| b.end.x <= 64_000 || b.start.x >= 96_000));
+    }
+
+    #[test]
+    fn partial_height_preserves_block_and_declares_original_volume_for_sup() {
+        let profile: Profile =
+            serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
+        let result = inspect_request(&request(20.0), &profile);
+        assert!(!result.blocks.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(
+            result.blocks.iter().map(|b| b.length_centimm).sum::<i64>(),
+            128_000
+        );
+        assert!(result
+            .blocks
+            .iter()
+            .any(|b| b.cuts.contains(&"opening_volume:opening".into())));
+        assert!(result
+            .blocks
+            .iter()
+            .any(|b| b.source_ids.contains(&"opening:opening".into())));
+    }
+
+    #[test]
+    fn wide_opening_requires_actual_315_beam_and_keeps_its_partial_cut() {
+        let profile: Profile =
+            serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
+        let mut r = request(0.0);
+        r.wall_volumes[0].end_xmm = 3200.0;
+        r.wall_volumes[0].start_top_zmm = 378.0;
+        r.wall_volumes[0].end_top_zmm = 378.0;
+        r.opening_volumes[0].end_xmm = 2240.0;
+        let missing = inspect_request(&r, &profile);
+        assert!(missing.blocks.iter().all(|b| !b.is_bridge));
+        assert!(missing
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "OPENING_SUPPORT_BEAM_REQUIRED"
+                && d.source_ids.contains(&"opening".into())));
+        r.beams.push(
+            serde_json::from_value(
+                json!({"guid":"wide-beam","startXmm":320,"startYmm":0,"startZmm":63,
+            "endXmm":2560,"endYmm":0,"endZmm":63,"geometry":{"widthMm":160,"heightMm":315,
+            "heightDirectionX":0,"heightDirectionY":0,"heightDirectionZ":1}}),
+            )
+            .unwrap(),
+        );
+        let present = inspect_request(&r, &profile);
+        assert!(present.blocks.iter().all(|b| !b.is_bridge));
+        assert!(!present
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "OPENING_SUPPORT_BEAM_REQUIRED"));
+        assert!(present
+            .blocks
+            .iter()
+            .any(|b| b.cuts.contains(&"beam_volume:wide-beam".into())));
+        let mut stem = r.wall_volumes[0].clone();
+        stem.guid = "stem".into();
+        stem.start_xmm = 1600.0;
+        stem.end_xmm = 1600.0;
+        stem.end_ymm = 1280.0;
+        r.wall_volumes.push(stem);
+        // Частичное пересечение по высоте сохраняет узел и требует выреза SUP.
+        r.beams[0].start_zmm = 80.0;
+        r.beams[0].end_zmm = 80.0;
+        let node = inspect_request(&r, &profile);
+        assert!(
+            node.blocks
+                .iter()
+                .any(|b| !b.arms.is_empty() && b.cuts.contains(&"beam_volume:wide-beam".into())),
+            "{:?} nodes={:?}",
+            node.diagnostics,
+            node.blocks
+                .iter()
+                .filter(|b| !b.arms.is_empty())
+                .map(|b| (&b.kind, &b.source_ids, &b.cuts))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn actual_t_end_may_touch_type10_without_offset() {
+        let mut r = request(0.0);
+        r.wall_volumes[0].end_xmm = 3200.0;
+        r.wall_volumes[0].start_top_zmm = 504.0;
+        r.wall_volumes[0].end_top_zmm = 504.0;
+        let mut stem = r.wall_volumes[0].clone();
+        stem.guid = "stem".into();
+        stem.start_xmm = 1600.0;
+        stem.end_xmm = 1600.0;
+        stem.end_ymm = 1280.0;
+        r.wall_volumes.push(stem);
+        r.opening_volumes[0].start_xmm = 600.0;
+        r.opening_volumes[0].end_xmm = 1400.0;
+        let profile: Profile =
+            serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
+        let mut touched = false;
+        for rotation in [0, 90, 180, 270] {
+            for side in [-1.0, 1.0] {
+                let mut oriented = r.clone();
+                oriented.wall_volumes[1].end_ymm = side * 1280.0;
+                let rotate = |x: f64, y: f64| match rotation {
+                    0 => (x, y),
+                    90 => (-y, x),
+                    180 => (-x, -y),
+                    _ => (y, -x),
+                };
+                for volume in oriented
+                    .wall_volumes
+                    .iter_mut()
+                    .chain(oriented.opening_volumes.iter_mut())
+                {
+                    (volume.start_xmm, volume.start_ymm) =
+                        rotate(volume.start_xmm, volume.start_ymm);
+                    (volume.end_xmm, volume.end_ymm) = rotate(volume.end_xmm, volume.end_ymm);
+                }
+                let result = inspect_request(&oriented, &profile);
+                assert!(!result.blocks.is_empty(), "{:?}", result.diagnostics);
+                for bridge in result.blocks.iter().filter(|b| b.is_bridge) {
+                    touched |= result.blocks.iter().any(|b| {
+                        b.course_index == bridge.course_index
+                            && b.product_key.as_deref() == Some("Type10_1")
+                            && b.start == bridge.end
+                    });
+                }
+            }
+        }
+        assert!(
+            touched,
+            "Type10.1 на точном конце должен сохранить исходный венец перемычки"
+        );
+    }
+    #[test]
+    fn actual_t_catalog_cut_survives_in_long_bridge_and_stem_is_kept() {
+        let mut r = request(0.0);
+        r.wall_volumes[0].end_xmm = 3200.0;
+        r.wall_volumes[0].start_top_zmm = 504.0;
+        r.wall_volumes[0].end_top_zmm = 504.0;
+        let mut stem = r.wall_volumes[0].clone();
+        stem.guid = "stem".into();
+        stem.start_xmm = 1600.0;
+        stem.end_xmm = 1600.0;
+        stem.end_ymm = 1280.0;
+        r.wall_volumes.push(stem);
+        r.opening_volumes[0].start_xmm = 1200.0;
+        r.opening_volumes[0].end_xmm = 2000.0;
+        let profile: Profile =
+            serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
+        for rotation in [0, 90, 180, 270] {
+            for stem_side in [-1.0, 1.0] {
+                let mut oriented = r.clone();
+                oriented.wall_volumes[1].end_ymm = stem_side * 1280.0;
+                let rotate = |x: f64, y: f64| match rotation {
+                    0 => (x, y),
+                    90 => (-y, x),
+                    180 => (-x, -y),
+                    _ => (y, -x),
+                };
+                for volume in oriented
+                    .wall_volumes
+                    .iter_mut()
+                    .chain(oriented.opening_volumes.iter_mut())
+                {
+                    (volume.start_xmm, volume.start_ymm) =
+                        rotate(volume.start_xmm, volume.start_ymm);
+                    (volume.end_xmm, volume.end_ymm) = rotate(volume.end_xmm, volume.end_ymm);
+                }
+                let result = inspect_request(&oriented, &profile);
+                assert!(
+                    !result.blocks.is_empty(),
+                    "rotation={rotation} side={stem_side} {:?}",
+                    result.diagnostics
+                );
+                let bridges: Vec<_> = result.blocks.iter().filter(|b| b.is_bridge).collect();
+                assert_eq!(
+                    bridges.len(),
+                    3,
+                    "rotation={rotation} side={stem_side} {:?}",
+                    result.diagnostics
+                );
+                for bridge in bridges {
+                    let cuts: Vec<_> = bridge
+                        .cuts
+                        .iter()
+                        .filter(|c| c.starts_with("Type6:"))
+                        .collect();
+                    assert_eq!(cuts.len(), 1);
+                    let expected_face = if stem_side > 0.0 { ":y3:" } else { ":y1:" };
+                    assert!(
+                        cuts[0].contains(expected_face),
+                        "rotation={rotation} side={stem_side} {:?}",
+                        bridge.cuts
+                    );
+                    assert!(result
+                        .blocks
+                        .iter()
+                        .any(|b| b.course_index == bridge.course_index
+                            && b.product_key.as_deref() == Some("Type5_1")));
+                    assert!(!result
+                        .blocks
+                        .iter()
+                        .any(|b| b.course_index == bridge.course_index
+                            && b.product_key.as_deref() == Some("Type10_1")));
+                }
+            }
+        }
+    }
 }
 
 /// Строгая проверка остается отдельной от результата для просмотра.
