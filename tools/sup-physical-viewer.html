@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Баня · физические тела · просмотрщик СУП</title>
+  <style>
+    body { margin: 0; font: 14px system-ui; background: #edf1f5; color: #263345; }
+    #viewport { position: absolute; inset: 0; }
+    aside { position: absolute; left: 16px; top: 16px; max-width: 420px; padding: 16px; background: #ffffffed; border-radius: 10px; box-shadow: 0 4px 24px #26334522; }
+    h1 { margin: 0 0 10px; font-size: 18px; }
+    p { margin: 8px 0; } button, select { padding: 6px; margin: 3px; }
+    #details { white-space: pre-wrap; overflow-wrap: anywhere; }
+  </style>
+</head>
+<body>
+  <section id="viewport" aria-label="Физическая модель стен"></section>
+  <aside>
+    <h1>Баня · стены · физические тела</h1>
+    <p>Рендер и управление: просмотрщик СУП</p>
+    <p id="status" role="status">Загрузка…</p>
+    <label>Венец <select id="course"><option value="all">Все венцы</option></select></label>
+    <button id="fit">Показать всё</button>
+    <button id="save-png">Сохранить PNG</button>
+    <p>Мышь: вращение и масштаб. Щелчок: сведения об изделии.</p>
+    <p id="details"></p>
+    <details id="warnings" hidden><summary id="warning-summary"></summary><div id="warning-list"></div></details>
+  </aside>
+  <script type="module">
+    try { await import('/tools/sup-physical-viewer.mjs'); }
+    catch (error) { document.querySelector('#status').textContent = `Ошибка модулей СУП: ${error.message}`; }
+  </script>
+</body>
+</html>

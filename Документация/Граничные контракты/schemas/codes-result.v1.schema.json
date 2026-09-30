@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:forestbrick:layout:codes:1",
+  "title": "Кодовый результат раскладки для SUP",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "kind", "status", "request_id", "snapshot_hash", "coordinate_system", "profile", "catalog", "scope", "blocks"],
+  "properties": {
+    "format": {"const": "fb-layout-codes/1"},
+    "kind": {"const": "layout_result"},
+    "status": {"const": "success"},
+    "request_id": {"$ref": "#/$defs/id"},
+    "snapshot_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "coordinate_system": {"$ref": "#/$defs/coordinateSystem"},
+    "profile": {"$ref": "#/$defs/versionedRef"},
+    "catalog": {"$ref": "#/$defs/versionedRef"},
+    "scope": {"$ref": "#/$defs/scope"},
+    "blocks": {"type": "array", "items": {"$ref": "#/$defs/block"}},
+    "warnings": {"type": "array", "items": {"$ref": "#/$defs/diagnostic"}}
+  },
+  "$defs": {
+    "id": {"type": "string", "minLength": 1},
+    "ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+    "vec3": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}},
+    "positive": {"type": "number", "exclusiveMinimum": 0},
+    "code": {"type": "string", "pattern": "^П[0-9]+(?:\\.[0-9]{1,2})?(?: \\[[НСВ]-(?:НЧ|КН|[0-9]+(?:\\.[0-9]{1,2})?)-Тип (?:1|2|3|4|5\\.1|6|7\\.1|8|8\\.1|10\\.1|11|12|13|14)\\])*$"},
+    "versionedRef": {
+      "type": "object", "additionalProperties": false, "required": ["id", "revision"],
+      "properties": {"id": {"$ref": "#/$defs/id"}, "revision": {"$ref": "#/$defs/id"}}
+    },
+    "coordinateSystem": {
+      "type": "object", "additionalProperties": false, "required": ["id", "units", "coordinate_quantum_mm", "z0_mm"],
+      "properties": {"id": {"$ref": "#/$defs/id"}, "units": {"const": "mm"}, "coordinate_quantum_mm": {"const": 0.01}, "z0_mm": {"type": "number"}}
+    },
+    "scope": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["mode"], "properties": {"mode": {"const": "full"}}},
+        {"type": "object", "additionalProperties": false, "required": ["mode", "wall_ids"], "properties": {"mode": {"const": "selected"}, "wall_ids": {"$ref": "#/$defs/ids"}}}
+      ]
+    },
+    "frame": {
+      "type": "object", "additionalProperties": false, "required": ["origin_mm", "x_axis", "y_axis", "z_axis"],
+      "properties": {"origin_mm": {"$ref": "#/$defs/vec3"}, "x_axis": {"$ref": "#/$defs/vec3"}, "y_axis": {"$ref": "#/$defs/vec3"}, "z_axis": {"$ref": "#/$defs/vec3"}}
+    },
+    "nodeCut": {
+      "type": "object", "additionalProperties": false,
+      "required": ["product_type", "x", "y", "position_mm", "face", "source_run_ids"],
+      "properties": {"product_type": {"$ref": "#/$defs/id"}, "x": {"type": "integer", "minimum": 1, "maximum": 3}, "y": {"type": "integer", "minimum": 1, "maximum": 3}, "position_mm": {"type": "number", "minimum": 0}, "face": {"enum": ["Н", "С", "В"]}, "source_run_ids": {"$ref": "#/$defs/ids"}}
+    },
+    "trim": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["description"], "properties": {"description": {"$ref": "#/$defs/id"}, "side": {"enum": ["left", "right"]}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "source_wall_id"], "properties": {"kind": {"const": "wall_boundary"}, "source_wall_id": {"$ref": "#/$defs/id"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "description", "source_run_id"], "properties": {"kind": {"const": "arm_end_trim"}, "description": {"$ref": "#/$defs/id"}, "source_run_id": {"$ref": "#/$defs/id"}, "start_mm": {"$ref": "#/$defs/vec3"}, "end_mm": {"$ref": "#/$defs/vec3"}, "length_mm": {"$ref": "#/$defs/positive"}}}
+      ]
+    },
+    "block": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "code1", "code2", "product_type", "placement", "length_mm", "nominal_length_mm", "width_mm", "height_mm", "course_index", "source_ids", "wall_ids", "hide_spikes_left", "hide_spikes_right", "node_cuts", "trims"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "code1": {"$ref": "#/$defs/code"}, "code2": {"$ref": "#/$defs/code"}, "product_type": {"$ref": "#/$defs/id"},
+        "placement": {"$ref": "#/$defs/frame"}, "length_mm": {"$ref": "#/$defs/positive"}, "nominal_length_mm": {"$ref": "#/$defs/positive"}, "width_mm": {"$ref": "#/$defs/positive"}, "height_mm": {"$ref": "#/$defs/positive"},
+        "course_index": {"type": "integer"}, "source_ids": {"$ref": "#/$defs/ids"}, "wall_ids": {"$ref": "#/$defs/ids"}, "hide_spikes_left": {"type": "boolean"}, "hide_spikes_right": {"type": "boolean"},
+        "node_cuts": {"type": "array", "items": {"$ref": "#/$defs/nodeCut"}}, "trims": {"type": "array", "items": {"$ref": "#/$defs/trim"}}
+      }
+    },
+    "diagnostic": {
+      "type": "object", "additionalProperties": false, "required": ["code", "message", "source_ids"],
+      "properties": {"code": {"$ref": "#/$defs/id"}, "message": {"$ref": "#/$defs/id"}, "source_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}}, "course_index": {"type": "integer"}, "location_mm": {"$ref": "#/$defs/vec3"}}
+    }
+  }
+}

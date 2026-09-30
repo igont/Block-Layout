@@ -1,0 +1,33 @@
+{
+  "format": "fb-layout/1",
+  "kind": "layout_result",
+  "request_id": "example-slanted-pocket",
+  "snapshot_hash": "3333333333333333333333333333333333333333333333333333333333333333",
+  "coordinate_system": {"id": "example-world", "units": "mm", "coordinate_quantum_mm": 0.01, "z0_mm": -252},
+  "profile": {"id": "example-profile", "revision": "1"},
+  "catalog": {"id": "example-catalog", "revision": "1"},
+  "scope": {"mode": "full"},
+  "status": "success",
+  "blocks": [{
+    "id": "part-example-convex",
+    "source_ids": ["wall-example"], "wall_ids": ["wall-example"], "course_index": 0,
+    "product": {"category": "standard", "type_id": "example-rectangular-p640", "code": "EXAMPLE-P640", "nominal_size_mm": [640, 193, 63]},
+    "placement": {"origin_mm": [0, -96.5, -252], "x_axis": [1, 0, 0], "y_axis": [0, 1, 0], "z_axis": [0, 0, 1]},
+    "stock_shape": {"kind": "box", "size_mm": [640, 193, 63]},
+    "cuts": [{
+      "kind": "convex_cut",
+      "planes_local": [
+        {"normal": [-1, 0, 0], "offset_mm": -100},
+        {"normal": [1, 0, 0], "offset_mm": 200},
+        {"normal": [0, -1, 0], "offset_mm": 0},
+        {"normal": [0, 1, 0], "offset_mm": 193},
+        {"normal": [0, 0, -1], "offset_mm": -20},
+        {"normal": [0, 0, 1], "offset_mm": 63},
+        {"normal": [1, 0, 1], "offset_mm": 240}
+      ],
+      "source_ids": ["beam-example"]
+    }],
+    "spikes_removed": {"left": false, "right": false}
+  }],
+  "beam_adjustments": []
+}

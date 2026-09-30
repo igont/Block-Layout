@@ -18,13 +18,14 @@
     "status": {"enum": ["success", "failure"]},
     "blocks": {"type": "array", "items": {"$ref": "#/$defs/block"}},
     "beam_adjustments": {"type": "array", "items": {"$ref": "#/$defs/beamAdjustment"}},
-    "diagnostics": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/diagnostic"}}
+    "diagnostics": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/diagnostic"}},
+    "warnings": {"type": "array", "items": {"$ref": "#/$defs/diagnostic"}}
   },
   "oneOf": [
     {
       "properties": {"kind": {"const": "layout_request"}},
       "required": ["model"],
-      "not": {"anyOf": [{"required": ["status"]}, {"required": ["blocks"]}, {"required": ["beam_adjustments"]}, {"required": ["diagnostics"]}]}
+      "not": {"anyOf": [{"required": ["status"]}, {"required": ["blocks"]}, {"required": ["beam_adjustments"]}, {"required": ["diagnostics"]}, {"required": ["warnings"]}]}
     },
     {
       "properties": {"kind": {"const": "layout_result"}, "status": {"const": "success"}},
@@ -34,7 +35,7 @@
     {
       "properties": {"kind": {"const": "layout_result"}, "status": {"const": "failure"}},
       "required": ["status", "diagnostics"],
-      "not": {"anyOf": [{"required": ["model"]}, {"required": ["blocks"]}, {"required": ["beam_adjustments"]}]}
+      "not": {"anyOf": [{"required": ["model"]}, {"required": ["blocks"]}, {"required": ["beam_adjustments"]}, {"required": ["warnings"]}]}
     }
   ],
   "$defs": {
@@ -144,6 +145,20 @@
     },
     "cut": {
       "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "planes_local", "source_ids"],
+          "properties": {
+            "kind": {"const": "convex_cut"},
+            "planes_local": {
+              "type": "array", "minItems": 4, "maxItems": 64,
+              "items": {
+                "type": "object", "additionalProperties": false, "required": ["normal", "offset_mm"],
+                "properties": {"normal": {"$ref": "#/$defs/vec3"}, "offset_mm": {"type": "number"}}
+              }
+            },
+            "source_ids": {"$ref": "#/$defs/ids"}
+          }
+        },
         {
           "type": "object", "additionalProperties": false, "required": ["kind", "point_local_mm", "normal_local", "keep_side", "source_ids"],
           "properties": {

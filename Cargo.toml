@@ -1,0 +1,18 @@
+[package]
+name = "fb-layout"
+version = "0.1.0"
+edition = "2021"
+description = "ForestBrick building layout engine"
+
+[lib]
+name = "fb_layout"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fb-layout"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
