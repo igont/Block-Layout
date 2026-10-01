@@ -20,6 +20,21 @@
     "beam_adjustments": {"type": "array", "maxItems": 0}
   },
   "$defs": {
+    "stockInterval": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number", "minimum": 0, "maximum": 640, "multipleOf": 0.01}},
+    "stockPart": {
+      "type": "object", "additionalProperties": false, "required": ["block_id", "interval_mm", "stock_end"],
+      "properties": {"block_id": {"$ref": "#/$defs/id"}, "interval_mm": {"$ref": "#/$defs/stockInterval"}, "stock_end": {"enum": ["left", "right", "none"]}, "reversed": {"type": "boolean"}}
+    },
+    "stockCutPlan": {
+      "type": "object", "additionalProperties": false,
+      "required": ["stock_code", "stock_length_mm", "kerf_mm", "parts", "saw_cuts_mm", "waste_intervals_mm"],
+      "properties": {
+        "stock_code": {"type": "string", "pattern": "^П640(?: \\[.*\\])?$"}, "stock_length_mm": {"const": 640}, "kerf_mm": {"const": 5},
+        "parts": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/stockPart"}},
+        "saw_cuts_mm": {"type": "array", "minItems": 1, "maxItems": 4, "uniqueItems": true, "items": {"$ref": "#/$defs/stockInterval"}},
+        "waste_intervals_mm": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/stockInterval"}}
+      }
+    },
     "id": {"type": "string", "minLength": 1},
     "ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
     "vec3": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number"}},
@@ -106,6 +121,10 @@
         "width_mm": {"$ref": "#/$defs/positive"},
         "height_mm": {"$ref": "#/$defs/positive"},
         "course_index": {"type": "integer"},
+        "is_dobor": {"type": "boolean", "default": false},
+        "cut_from_block_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/id"}]},
+        "cut_zone_ids": {"$ref": "#/$defs/ids"},
+        "stock_cut_plan": {"$ref": "#/$defs/stockCutPlan"},
         "source_ids": {"$ref": "#/$defs/ids"},
         "wall_ids": {"$ref": "#/$defs/ids"},
         "hide_spikes_left": {"type": "boolean"},
@@ -116,6 +135,8 @@
         "natural_end_right": {"type": "boolean", "default": true}
       },
       "allOf": [
+        {"if": {"required": ["is_dobor"], "properties": {"is_dobor": {"const": true}}}, "then": {"required": ["cut_from_block_id", "cut_zone_ids"], "properties": {"cut_from_block_id": {"$ref": "#/$defs/id"}}, "not": {"required": ["stock_cut_plan"]}}, "else": {"properties": {"cut_from_block_id": {"type": "null"}}}},
+        {"if": {"required": ["stock_cut_plan"]}, "then": {"required": ["is_dobor", "cut_from_block_id", "cut_zone_ids"], "properties": {"is_dobor": {"const": false}, "cut_from_block_id": {"type": "null"}}}},
         {"if": {"required": ["natural_end_left"], "properties": {"natural_end_left": {"const": false}}}, "then": {"properties": {"hide_spikes_left": {"const": true}}}},
         {"if": {"required": ["natural_end_right"], "properties": {"natural_end_right": {"const": false}}}, "then": {"properties": {"hide_spikes_right": {"const": true}}}}
       ]

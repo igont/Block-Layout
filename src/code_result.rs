@@ -62,7 +62,7 @@ pub(crate) fn validate_end_states(block: &Block) -> Result<(), ApiFailure> {
     Ok(())
 }
 
-fn export_block(
+pub(crate) fn export_block(
     request: &LayoutRequest,
     profile: &Profile,
     block: &Block,

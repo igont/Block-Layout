@@ -337,6 +337,20 @@ fn triangles(mut polygon: Vec<P>) -> Result<Vec<[P; 3]>, String> {
     Ok(result)
 }
 
+/// Подтверждает прямой остаток вне сохранённой части типовой заготовки.
+pub(crate) fn plain_offcut(block: &Block, kept: (i64, i64)) -> bool {
+    let length = block.length_centimm as f64 / 100.0;
+    let last = ((length / 320.0).round() as usize + 1).max(2);
+    let Ok(cuts) = cuts(block, last) else { return false; };
+    !cuts.is_empty() && cuts.iter().all(|cut| {
+        polygons(cut, last, length).is_ok_and(|polygons| polygons.iter().all(|polygon| {
+            let min = polygon.iter().map(|p| p[0]).fold(f64::INFINITY, f64::min).max(0.0);
+            let max = polygon.iter().map(|p| p[0]).fold(f64::NEG_INFINITY, f64::max).min(length);
+            min >= kept.0 as f64 / 100.0 - 1e-8 && max <= kept.1 as f64 / 100.0 + 1e-8
+        }))
+    })
+}
+
 /// Материализует fixed-node каталог в WORLD мм, сохраняя номинальную ось изделия.
 pub fn node_stock(block: &Block, width_mm: f64, height_mm: f64) -> Result<Vec<Mesh>, String> {
     if !width_mm.is_finite()
