@@ -22,6 +22,49 @@ pub fn node_profile_warning(block: &Block) -> Option<crate::api::ApiFailure> {
     Some(warning)
 }
 
+/// Переносит координаты производственных врезок на ось полученного фрагмента.
+pub(crate) fn relocate_node_cuts(
+    block: &mut Block,
+    from_centimm: i64,
+    to_centimm: i64,
+) -> Result<(), crate::api::ApiFailure> {
+    let issue = |message: &str| crate::api::ApiFailure::new("INVALID_PRODUCT_CODE", message, Some(block.id.clone()));
+    let mut relocated = Vec::new();
+    for cut in &block.cuts {
+        if !cut.starts_with("Type") {
+            relocated.push(cut.clone());
+            continue;
+        }
+        let mut fields = cut.splitn(4, ':');
+        let kind = fields.next().unwrap_or("");
+        let location = fields.next().unwrap_or("");
+        let side = fields.next().ok_or_else(|| issue("Отсутствует сторона врезки"))?;
+        let sources = fields.next().ok_or_else(|| issue("Отсутствуют источники врезки"))?;
+        let position = if let Some(x) = location.strip_prefix('x') {
+            x.parse::<i64>().ok().filter(|x| *x > 0 && *x <= 3126)
+                .map(|x| (x - 1) * 32_000)
+        } else {
+            location.strip_prefix('p').and_then(|p| p.parse::<i64>().ok())
+        }.filter(|p| *p >= 0 && *p <= block.length_centimm)
+            .ok_or_else(|| issue("Некорректная координата врезки"))?;
+        if position >= from_centimm && position <= to_centimm {
+            relocated.push(format!("{kind}:p{}:{side}:{sources}", position - from_centimm));
+        } else {
+            // Торцевые профили также могут оставить материал обработки внутри
+            // фрагмента, даже когда сама координата узла уже удалена.
+            let reach = if matches!(kind, "Type6" | "Type7_1") { 9_650 } else { 9_705 };
+            if position.saturating_add(reach) <= from_centimm || position.saturating_sub(reach) >= to_centimm {
+                continue;
+            }
+            return Err(crate::api::ApiFailure::new("NODE_CUT_CROSSES_SPLIT",
+                "Разрез оставляет часть производственной врезки за границей её координаты",
+                Some(block.id.clone())));
+        }
+    }
+    block.cuts = relocated;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct Frame {
     origin: P,
@@ -61,6 +104,7 @@ struct Cut<'a> {
     name: &'a str,
     slot: usize,
     face: usize,
+    position_mm: Option<f64>,
 }
 fn cuts(block: &Block, last: usize) -> Result<Vec<Cut<'_>>, String> {
     let mut result = Vec::new();
@@ -79,7 +123,15 @@ fn cuts(block: &Block, last: usize) -> Result<Vec<Cut<'_>>, String> {
                 .and_then(|v| v.parse().ok())
                 .ok_or_else(|| format!("Некорректный каталожный запил: {text}"))
         };
-        let slot = number(fields.next(), 'x')?;
+        let location = fields.next().unwrap_or("");
+        let position_mm = location.strip_prefix('p').map(|p| p.parse::<i64>()
+            .map(|p| p as f64 / 100.).map_err(|_| format!("Некорректная координата: {text}"))).transpose()?;
+        let slot = if let Some(position) = position_mm {
+            if position < 0. || position > block.length_centimm as f64 / 100. {
+                return Err(format!("Врезка за пределами детали: {text}"));
+            }
+            if position == 0. { 1 } else if position == block.length_centimm as f64 / 100. { last } else { 2 }
+        } else { number(Some(location), 'x')? };
         let mut face = number(fields.next(), 'y')?;
         if slot == 0 || slot > last || !(1..=3).contains(&face) {
             return Err(format!("Запил вне слотов изделия: {text}"));
@@ -94,15 +146,17 @@ fn cuts(block: &Block, last: usize) -> Result<Vec<Cut<'_>>, String> {
                     name: "Type6",
                     slot,
                     face: 1,
+                    position_mm,
                 },
                 Cut {
                     name: "Type6",
                     slot,
                     face: 3,
+                    position_mm,
                 },
             ]);
         } else {
-            result.push(Cut { name, slot, face });
+            result.push(Cut { name, slot, face, position_mm });
         }
     }
     Ok(result)
@@ -112,15 +166,16 @@ fn cuts(block: &Block, last: usize) -> Result<Vec<Cut<'_>>, String> {
 fn polygons(cut: &Cut<'_>, last: usize, length: f64) -> Result<Vec<Vec<P>>, String> {
     let (i, j) = (cut.slot, cut.face);
     let mut f = Frame::new();
-    if j == 1 && i > 1 {
+    let internal_coordinate = cut.position_mm.is_some() && cut.name == "Type6";
+    if j == 1 && (i > 1 || internal_coordinate) {
         f.shift(0., 193.);
         f.scale(1., -1.);
     }
-    if i == last && j == 1 {
+    if i == last && j == 1 && !internal_coordinate {
         f.scale(-1., 1.);
         f.shift(-length, 0.);
     }
-    if i == last && j == 3 {
+    if i == last && j == 3 && !internal_coordinate {
         f.rotate(180.);
         f.shift(-length, -193.);
     }
@@ -177,11 +232,11 @@ fn polygons(cut: &Cut<'_>, last: usize, length: f64) -> Result<Vec<Vec<P>>, Stri
             ]
         }
         "Type6" => {
-            if i == 1 || i == last || j == 2 {
+            if (!internal_coordinate && (i == 1 || i == last)) || j == 2 {
                 return Err("Type6 требует внутренний слот y1/y3".into());
             }
             // CBE_Type6:233; edgeType_depth=0 для фиксированного каталога.
-            f.shift((i as f64 - 2.) * 320., 0.);
+            f.shift(cut.position_mm.unwrap_or((i as f64 - 1.) * 320.) - 320., 0.);
             f.rotate(90.);
             f.shift(96.5, -320.);
             vec![
@@ -294,6 +349,8 @@ pub fn node_stock(block: &Block, width_mm: f64, height_mm: f64) -> Result<Vec<Me
     let product = block
         .product_key
         .as_deref()
+        .or_else(|| block.cuts.iter().find(|cut| cut.starts_with("Type"))
+            .and_then(|cut| cut.split(':').next()))
         .ok_or("У узла нет product_key")?;
     if !matches!(
         product,
@@ -311,18 +368,12 @@ pub fn node_stock(block: &Block, width_mm: f64, height_mm: f64) -> Result<Vec<Me
     ) {
         return Err(format!("Геометрия изделия {product} не поддержана"));
     }
-    let length = block
-        .catalog_nominal_centimm
-        .unwrap_or(block.length_centimm) as f64
-        / 100.;
-    if (length - 320.).abs() > 1e-7 && (length - 640.).abs() > 1e-7 {
-        return Err("Каталог узлов требует номинал 320 или 640 мм".into());
+    let length = block.length_centimm as f64 / 100.;
+    if !length.is_finite() || length <= 0. {
+        return Err("Длина узла должна быть положительной".into());
     }
-    let last = (length / 320.).round() as usize + 1;
+    let last = ((length / 320.).round() as usize + 1).max(2);
     let cuts = cuts(block, last)?;
-    if cuts.is_empty() {
-        return Err("У каталожного узла отсутствуют fixed cuts".into());
-    }
     let is_l = |c: &Cut<'_>| matches!(c.name, "Type1" | "Type2" | "Type3" | "Type4");
     let begin = if cuts.iter().any(|c| c.slot == 1 && is_l(c)) {
         96.5
@@ -549,14 +600,18 @@ mod tests {
         }
     }
     #[test]
-    fn distal_clip_keeps_the_catalog_stock_nominal() {
+    fn distal_clip_exports_only_finished_node_stock() {
         let original = block("Type2", 320, 0, [0., 0.], &["Type2:x1:y3:w"]);
         let expected = node_stock(&original, 193., 63.).unwrap();
         let mut clipped = original;
         clipped.length_centimm = 29300;
         clipped.catalog_nominal_centimm = Some(32000);
         clipped.cuts.push("arm:w:distal".into());
-        assert_eq!(node_stock(&clipped, 193., 63.).unwrap(), expected);
+        let actual = node_stock(&clipped, 193., 63.).unwrap();
+        assert!(actual.iter().flat_map(|m| &m.vertices).all(|p| p[0] <= 293.000001));
+        let before: f64 = expected.iter().map(crate::solid_geometry::volume).sum();
+        let after: f64 = actual.iter().map(crate::solid_geometry::volume).sum();
+        assert!(after < before);
         clipped.cuts.push("Type2:xBAD:y3:w".into());
         assert!(node_stock(&clipped, 193., 63.).is_err());
     }
@@ -593,6 +648,7 @@ mod tests {
                 name: "Type5_1",
                 slot: 1,
                 face: 2,
+                position_mm: None,
             },
             2,
             320.,
@@ -603,6 +659,7 @@ mod tests {
                 name: "Type5_1",
                 slot: 2,
                 face: 2,
+                position_mm: None,
             },
             2,
             320.,
@@ -612,6 +669,16 @@ mod tests {
             assert!((a[0] + b[0] - 320.).abs() < 1e-8);
             assert!((a[1] + b[1]).abs() < 1e-8);
         }
+    }
+
+    #[test]
+    fn relocated_internal_profile_keeps_its_shape_on_a_shorter_part() {
+        let original = block("Type6", 640, 0, [0., 0.], &["Type6:x2:y1:w"]);
+        let mut shortened = block("Type6", 640, 0, [0., 0.], &["Type6:p16000:y1:w"]);
+        shortened.length_centimm = 48000;
+        let original_volume: f64 = node_stock(&original, 193., 63.).unwrap().iter().map(crate::solid_geometry::volume).sum();
+        let actual_volume: f64 = node_stock(&shortened, 193., 63.).unwrap().iter().map(crate::solid_geometry::volume).sum();
+        assert!((original_volume - actual_volume - 160. * 193. * 63.).abs() < 1e-4);
     }
     #[test]
     fn all_catalog_profiles_triangulate() {
@@ -627,7 +694,7 @@ mod tests {
             ("Type8_1", 1, 3),
             ("Type10_1", 1, 2),
         ] {
-            for p in polygons(&Cut { name, slot, face }, 3, 640.).unwrap() {
+            for p in polygons(&Cut { name, slot, face, position_mm: None }, 3, 640.).unwrap() {
                 assert!(!triangles(p).unwrap().is_empty());
             }
         }

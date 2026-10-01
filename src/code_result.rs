@@ -48,6 +48,20 @@ fn token(face: u8, position: i64, length: i64, product: &str) -> String {
     format!(" [{face}-{position}-Тип {product}]")
 }
 
+pub(crate) fn validate_end_states(block: &Block) -> Result<(), ApiFailure> {
+    if (!block.natural_end_left && !block.hide_spikes_left)
+        || (!block.natural_end_right && !block.hide_spikes_right)
+    {
+        return Err(issue(block, "Искусственный торец не может иметь шипы"));
+    }
+    let insets = i64::from(block.natural_end_left && block.hide_spikes_left)
+        + i64::from(block.natural_end_right && block.hide_spikes_right);
+    if block.length_centimm <= insets * 500 {
+        return Err(issue(block, "Снятие шипов поглощает всю длину детали"));
+    }
+    Ok(())
+}
+
 fn export_block(
     request: &LayoutRequest,
     profile: &Profile,
@@ -56,6 +70,7 @@ fn export_block(
     if block.id.is_empty() || block.length_centimm <= 0 || block.length_centimm > 100_000_000 {
         return Err(issue(block, "Некорректная идентичность или длина детали"));
     }
+    validate_end_states(block)?;
     let mut tokens = Vec::new();
     let mut node_cuts = Vec::new();
     let mut trims = Vec::new();
@@ -109,20 +124,8 @@ fn export_block(
                 node_cut["x"] = json!(x);
             }
             node_cuts.push(node_cut);
-        } else if let Some(source) = cut.strip_prefix("opening_volume:") {
-            if !request
-                .opening_volumes
-                .iter()
-                .any(|opening| opening.guid == source)
-            {
-                return Err(issue(block, "Не найден исходный объём проёма"));
-            }
-            trims.push(json!({"kind":"opening_volume","source_opening_id":source}));
-        } else if let Some(source) = cut.strip_prefix("beam_volume:") {
-            if !request.beams.iter().any(|beam| beam.guid == source) {
-                return Err(issue(block, "Не найден исходный объём балки"));
-            }
-            trims.push(json!({"kind":"beam_volume","source_beam_id":source}));
+        } else if cut.starts_with("opening_volume:") || cut.starts_with("beam_volume:") {
+            return Err(issue(block, "Объёмный разрез не завершён до экспорта детали"));
         } else {
             let mut trim = json!({"description":cut});
             if cut == "left" || cut == "right" {
@@ -251,9 +254,10 @@ fn export_block(
         json!({"id":block.id,"code1":code1,"code2":code2,"product_type":product_type,
         "placement":{"origin_mm":[mm(block.start.x)-begin_extension*cos,mm(block.start.y)-begin_extension*sin,mm(block.z_centimm)],
             "x_axis":[clean(cos),clean(sin),0.0],"y_axis":[clean(-sin),clean(cos),0.0],"z_axis":[0.0,0.0,1.0]},
-        "length_mm":physical_length,"nominal_length_mm":mm(block.catalog_nominal_centimm.unwrap_or(block.length_centimm)),
+        "length_mm":physical_length,"nominal_length_mm":mm(block.length_centimm),
         "width_mm":width,"height_mm":mm(profile.index_centimm),"course_index":block.course_index,
         "source_ids":source_ids,"wall_ids":wall_ids,"hide_spikes_left":block.hide_spikes_left,"hide_spikes_right":block.hide_spikes_right,
+        "natural_end_left":block.natural_end_left,"natural_end_right":block.natural_end_right,
         "node_cuts":node_cuts,"trims":trims}),
     )
 }
@@ -265,7 +269,8 @@ pub fn export_codes(
     blocks: &[Block],
     warnings: &[ApiFailure],
 ) -> Result<Value, ApiFailure> {
-    let mut ordered: Vec<_> = blocks.iter().collect();
+    let prepared = crate::offcut_plan::prepare(request, profile, blocks)?;
+    let mut ordered: Vec<_> = prepared.blocks.iter().collect();
     ordered.sort_by(|a, b| a.id.cmp(&b.id));
     let mut seen = BTreeSet::new();
     let mut values = Vec::new();
@@ -273,11 +278,12 @@ pub fn export_codes(
         if !seen.insert(&block.id) {
             return Err(issue(block, "Повторный идентификатор детали"));
         }
-        values.push(export_block(request, profile, block)?);
+        let mut value = export_block(request, profile, block)?;
+        prepared.annotate(&mut value);
+        values.push(value);
     }
     let mut result = exchange::success_result_with_warnings(standard, values, Vec::new(), warnings);
     result["format"] = json!("fb-layout-codes/1");
-    result.as_object_mut().unwrap().remove("beam_adjustments");
     Ok(result)
 }
 
@@ -296,7 +302,20 @@ mod tests {
     }
 
     #[test]
-    fn bridge_preserves_long_cut_positions_and_opening_trim_sources() {
+    fn relocated_node_cut_keeps_coordinate_and_refuses_lost_partial_profile() {
+        let mut item = block("part", "ordinary", None, vec!["Type6:x2:y1:run-example"]);
+        crate::node_shapes::relocate_node_cuts(&mut item, 16000, 64000).unwrap();
+        assert_eq!(item.cuts, vec!["Type6:p16000:y1:run-example"]);
+        let mut crossing = block("part", "ordinary", None, vec!["Type6:x2:y1:run-example"]);
+        let error = crate::node_shapes::relocate_node_cuts(&mut crossing, 35000, 64000).unwrap_err();
+        assert_eq!(error.code, "NODE_CUT_CROSSES_SPLIT");
+        let mut end_profile = block("part", "node_L", Some("Type1"), vec!["Type1:x1:y1:run-example"]);
+        assert_eq!(crate::node_shapes::relocate_node_cuts(&mut end_profile, 5000, 64000).unwrap_err().code,
+            "NODE_CUT_CROSSES_SPLIT");
+    }
+
+    #[test]
+    fn bridge_preserves_long_cut_positions_without_late_volume_trims() {
         let standard = parse_request(include_str!(
             "../Документация/Граничные контракты/examples/layout-request.v1.json"
         ))
@@ -319,7 +338,6 @@ mod tests {
         bridge.length_centimm = 192000;
         bridge.is_bridge = true;
         bridge.catalog_nominal_centimm = Some(192000);
-        bridge.cuts.push("opening_volume:opening-example".into());
         bridge.source_ids.push("opening:opening-example".into());
         let result = export_block(&request, &profile, &bridge).unwrap();
         assert_eq!(result["product_type"], "Перемычка");
@@ -331,12 +349,8 @@ mod tests {
             result["source_ids"],
             json!(["opening-example", "wall-example"])
         );
-        assert!(result["trims"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|trim| trim["kind"] == "opening_volume"
-                && trim["source_opening_id"] == "opening-example"));
+        assert!(!result["trims"].as_array().unwrap().iter().any(|trim|
+            matches!(trim["kind"].as_str(), Some("beam_volume" | "opening_volume"))));
         bridge.cuts = vec![
             "Type6:p128012:y1:run-example".into(),
             "Type6:p128012:y3:run-example".into(),
@@ -352,22 +366,10 @@ mod tests {
         );
         assert_eq!(arbitrary["node_cuts"][0]["position_mm"], 1280.12);
         assert!(arbitrary["node_cuts"][0].get("x").is_none());
-        bridge.cuts = vec!["beam_volume:beam-example".into()];
-        bridge.source_ids.push("beam:beam-example".into());
-        let supported = export_block(&request, &profile, &bridge).unwrap();
-        assert!(supported["trims"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|trim| trim["kind"] == "beam_volume" && trim["source_beam_id"] == "beam-example"));
-        assert!(supported["source_ids"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("beam-example")));
-        bridge.cuts = vec!["beam_volume:missing".into()];
-        assert!(export_block(&request, &profile, &bridge).is_err());
-        bridge.cuts = vec!["opening_volume:missing".into()];
-        assert!(export_block(&request, &profile, &bridge).is_err());
+        for cut in ["beam_volume:beam-example", "opening_volume:opening-example"] {
+            bridge.cuts = vec![cut.into()];
+            assert!(export_block(&request, &profile, &bridge).is_err());
+        }
     }
 
     #[test]
@@ -376,7 +378,8 @@ mod tests {
             "../Документация/Граничные контракты/examples/layout-request.v1.json"
         ))
         .unwrap();
-        let request = standard.to_layout_request().unwrap();
+        let mut request = standard.to_layout_request().unwrap();
+        request.wall_volumes[0].end_xmm = 640.0;
         let profile: Profile =
             serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
         let blocks = vec![
@@ -488,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_trim_keeps_nominal_stock_length_and_declares_sup_wall_boundary_work() {
+    fn actual_trim_exports_finished_length_and_declares_sup_wall_boundary_work() {
         let standard = parse_request(include_str!(
             "../Документация/Граничные контракты/examples/layout-request.v1.json"
         ))
@@ -504,7 +507,7 @@ mod tests {
         let value = &result["blocks"][0];
         assert_eq!(value["code1"], "П576.32");
         assert_eq!(value["length_mm"], 576.32);
-        assert_eq!(value["nominal_length_mm"], 640.0);
+        assert_eq!(value["nominal_length_mm"], 576.32);
         assert_eq!(value["hide_spikes_right"], true);
         assert!(value["trims"]
             .as_array()
@@ -519,7 +522,8 @@ mod tests {
             "../Документация/Граничные контракты/examples/layout-request.v1.json"
         ))
         .unwrap();
-        let request = standard.to_layout_request().unwrap();
+        let mut request = standard.to_layout_request().unwrap();
+        request.wall_volumes[0].end_xmm = 640.0;
         let profile: Profile =
             serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
         let blocks = [

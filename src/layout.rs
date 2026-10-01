@@ -100,6 +100,10 @@ fn one() -> usize {
     1
 }
 
+fn natural_end() -> bool {
+    true
+}
+
 fn mask_source(source: &MaskSource) -> String {
     match source {
         MaskSource::Opening(id) => format!("opening:{id}"),
@@ -149,6 +153,12 @@ fn node_error(error: NodeGeometryError, edges: &[CourseEdge], course: i64) -> Di
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObstacleEnd {
+    pub left: bool,
+    pub source_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Block {
     pub id: String,
     pub wall_id: String,
@@ -167,6 +177,10 @@ pub struct Block {
     pub is_bridge: bool,
     pub hide_spikes_left: bool,
     pub hide_spikes_right: bool,
+    #[serde(default = "natural_end")]
+    pub natural_end_left: bool,
+    #[serde(default = "natural_end")]
+    pub natural_end_right: bool,
     pub cuts: Vec<String>,
     pub source_ids: Vec<String>,
     pub catalog_nominal_centimm: Option<i64>,
@@ -174,6 +188,8 @@ pub struct Block {
     pub arms: Vec<BlockArm>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<Block>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub obstacle_ends: Vec<ObstacleEnd>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +199,353 @@ pub struct BlockArm {
     pub start: Point,
     pub end: Point,
     pub length_centimm: i64,
+}
+
+/// Окончательные детали: препятствие разделяет всю толщину и высоту изделия.
+/// Вызывается и на границе экспорта для кандидатов, созданных до изменения входа.
+pub fn finalize_parts(
+    request: &crate::api::LayoutRequest,
+    profile: &Profile,
+    blocks: &[Block],
+) -> Result<Vec<Block>, crate::api::ApiFailure> {
+    if blocks.len() > MAX_BLOCKS {
+        return Err(crate::api::ApiFailure::new("GEOMETRY_LIMIT", "Превышено число исходных деталей", None));
+    }
+    // Проверяем дерево до первого clone: глубокая входная сборка не должна
+    // переполнить стек внутри автоматически выведенного Clone.
+    let mut pending: Vec<_> = blocks.iter().map(|part| (part, 0_usize)).collect();
+    let mut count = 0_usize;
+    while let Some((part, depth)) = pending.pop() {
+        count += 1;
+        if depth > 16 || count.saturating_add(pending.len()).saturating_add(part.components.len()) > MAX_BLOCKS {
+            return Err(crate::api::ApiFailure::new("GEOMETRY_LIMIT", "Превышены пределы числа деталей или вложенности сборки", Some(part.id.clone())));
+        }
+        pending.extend(part.components.iter().map(|child| (child, depth + 1)));
+    }
+    let mut work = 0;
+    let nominal = finalize_parts_inner(request, profile, blocks, 0, &mut work, &[])?;
+    let reveals = finished_opening_reveals(request, profile, &nominal, &mut work)?;
+    if reveals.is_empty() { return Ok(nominal); }
+    finalize_parts_inner(request, profile, &nominal, 0, &mut work, &reveals)
+}
+
+/// Натуральные скрытые торцы задают общую готовую плоскость обсады.
+/// Длина опорной детали позволяет подгонять только более короткие фрагменты.
+fn finished_opening_reveals(
+    request: &crate::api::LayoutRequest,
+    profile: &Profile,
+    blocks: &[Block],
+    work: &mut usize,
+) -> Result<Vec<(usize, bool, i64)>, crate::api::ApiFailure> {
+    let mut reveals: Vec<(usize, bool, i64)> = Vec::new();
+    let mut pending: Vec<_> = blocks.iter().collect();
+    while let Some(part) = pending.pop() {
+        *work = work.saturating_add(request.opening_volumes.len());
+        if *work > MAX_BLOCKS * 256 {
+            return Err(crate::api::ApiFailure::new("GEOMETRY_LIMIT", "Превышен объём проверки общих плоскостей проёмов", Some(part.id.clone())));
+        }
+        pending.extend(part.components.iter());
+        let bottom = part.z_centimm as f64 / 100.0;
+        let top = bottom + profile.index_centimm as f64 / 100.0;
+        let angle = f64::from(part.rotation_deg).to_radians();
+        for (index, opening) in request.opening_volumes.iter().enumerate() {
+            if !matches!(opening.opening_type.as_str(), "OPENING" | "WINDOW" | "DOOR")
+                || top <= opening.start_bottom_zmm.min(opening.end_bottom_zmm) + 1e-7
+                || bottom >= opening.start_top_zmm.max(opening.end_top_zmm) - 1e-7 { continue; }
+            let dx = opening.end_xmm - opening.start_xmm;
+            let dy = opening.end_ymm - opening.start_ymm;
+            if (dx * angle.sin() - dy * angle.cos()).abs() > 0.02 { continue; }
+            for (is_start, x, y) in [(true, opening.start_xmm, opening.start_ymm),
+                (false, opening.end_xmm, opening.end_ymm)] {
+                let matches = [(part.start, part.natural_end_left, part.hide_spikes_left),
+                    (part.end, part.natural_end_right, part.hide_spikes_right)].iter()
+                    .any(|(point, natural, hidden)| *natural && *hidden
+                        && (point.x as f64 / 100.0 - x).abs() < 0.02
+                        && (point.y as f64 / 100.0 - y).abs() < 0.02);
+                if !matches { continue; }
+                if let Some((_, _, size)) = reveals.iter_mut().find(|(i, side, _)| *i == index && *side == is_start) {
+                    *size = (*size).max(part.length_centimm);
+                } else { reveals.push((index, is_start, part.length_centimm)); }
+            }
+        }
+    }
+    Ok(reveals)
+}
+
+fn finalize_parts_inner(
+    request: &crate::api::LayoutRequest,
+    profile: &Profile,
+    blocks: &[Block],
+    depth: usize,
+    work: &mut usize,
+    reveals: &[(usize, bool, i64)],
+) -> Result<Vec<Block>, crate::api::ApiFailure> {
+    if blocks.len() > MAX_BLOCKS || depth > 16 {
+        return Err(crate::api::ApiFailure::new("GEOMETRY_LIMIT",
+            "Превышены пределы числа деталей или вложенности сборки", None));
+    }
+    let mut result = Vec::new();
+    for original in blocks {
+        *work = work.saturating_add(request.beams.len())
+            .saturating_add(request.opening_volumes.len())
+            .saturating_add(request.wall_volumes.len().saturating_mul(3));
+        if *work > MAX_BLOCKS * 256 {
+            return Err(crate::api::ApiFailure::new("GEOMETRY_LIMIT",
+                "Превышен объём проверки препятствий", Some(original.id.clone())));
+        }
+        if (!original.natural_end_left && !original.hide_spikes_left)
+            || (!original.natural_end_right && !original.hide_spikes_right) {
+            return Err(crate::api::ApiFailure::new("INVALID_END_STATE",
+                "Искусственный торец не может иметь шипы", Some(original.id.clone())));
+        }
+        if original.length_centimm <= 0 {
+            continue;
+        }
+        let angle = f64::from(original.rotation_deg).to_radians();
+        let (ux, uy) = (angle.cos(), angle.sin());
+        let origin = (original.start.x as f64 / 100.0, original.start.y as f64 / 100.0);
+        let length = original.length_centimm as f64 / 100.0;
+        let owns_wall = |id: &str| original.wall_id.strip_prefix("wall:").unwrap_or(&original.wall_id) == id
+            || original.source_ids.iter().any(|source| source.strip_prefix("wall:").unwrap_or(source) == id)
+            || original.arms.iter().any(|arm| arm.wall_id.strip_prefix("wall:").unwrap_or(&arm.wall_id) == id);
+        let width = request.wall_volumes.iter()
+            .find(|w| owns_wall(&w.guid))
+            .map_or(193.0, |w| w.thickness_mm);
+        let project = |x: f64, y: f64| {
+            let (x, y) = (x - origin.0, y - origin.1);
+            (x * ux + y * uy, -x * uy + y * ux)
+        };
+        let bottom = original.z_centimm as f64 / 100.0;
+        let top = bottom + profile.index_centimm as f64 / 100.0;
+        let mut exclusions = Vec::<(i64, i64, String)>::new();
+        for beam in &request.beams {
+            let (dx, dy) = (beam.end_xmm - beam.start_xmm, beam.end_ymm - beam.start_ymm);
+            let column = dx.hypot(dy) <= 1e-7 && (beam.end_zmm - beam.start_zmm).abs() > 1e-7;
+            if !column && ((beam.end_zmm - beam.start_zmm).abs() > 1e-7
+                || beam.geometry.height_direction_x.abs() > 1e-7
+                || beam.geometry.height_direction_y.abs() > 1e-7) {
+                continue;
+            }
+            let other_z = if column { beam.end_zmm } else {
+                beam.start_zmm + beam.geometry.height_mm * beam.geometry.height_direction_z
+            };
+            if top <= beam.start_zmm.min(other_z) + 1e-7
+                || bottom >= beam.start_zmm.max(other_z) - 1e-7 {
+                continue;
+            }
+            let (a, av) = project(beam.start_xmm, beam.start_ymm);
+            let (end_x, end_y) = if column {
+                (beam.start_xmm + beam.geometry.height_direction_x * beam.geometry.height_mm,
+                    beam.start_ymm + beam.geometry.height_direction_y * beam.geometry.height_mm)
+            } else { (beam.end_xmm, beam.end_ymm) };
+            let beam_length = (end_x - beam.start_xmm).hypot(end_y - beam.start_ymm);
+            if beam_length <= 1e-7 { continue; }
+            let (b, bv) = project(end_x, end_y);
+            let axial = (b - a) / beam_length;
+            let across = (bv - av) / beam_length;
+            let half = beam.geometry.width_mm / 2.0;
+            let corners = [(a - across * half, av + axial * half),
+                (a + across * half, av - axial * half),
+                (b - across * half, bv + axial * half),
+                (b + across * half, bv - axial * half)];
+            // SAT: касание прямоугольников не удаляет материал соседней детали.
+            let intersects = [(1.0, 0.0), (0.0, 1.0), (axial, across), (-across, axial)]
+                .into_iter().all(|(x, y)| {
+                    let beam_min = corners.iter().map(|p| p.0 * x + p.1 * y).fold(f64::INFINITY, f64::min);
+                    let beam_max = corners.iter().map(|p| p.0 * x + p.1 * y).fold(f64::NEG_INFINITY, f64::max);
+                    let block_min = (length * x).min(0.0) - width / 2.0 * y.abs();
+                    let block_max = (length * x).max(0.0) + width / 2.0 * y.abs();
+                    if y.abs() < 1e-7 && (x.abs() - 1.0).abs() < 1e-7 {
+                        beam_max >= block_min - 1e-7 && block_max >= beam_min - 1e-7
+                    } else {
+                        beam_max > block_min + 1e-7 && block_max > beam_min + 1e-7
+                    }
+                });
+            if !intersects { continue; }
+            let (mut low, mut high) = if !column && across.abs() > axial.abs() {
+                let center = a - av * (b - a) / (bv - av);
+                (center - half, center + half)
+            } else {
+                (corners.iter().map(|p| p.0).fold(f64::INFINITY, f64::min),
+                    corners.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max))
+            };
+            if !column && profile.world_joint_policy.as_deref() == Some("affine_checkerboard_v1")
+                && matches!(original.rotation_deg, 0 | 90 | 180 | 270)
+                && across.abs() < 1e-7 && av.abs() < 1e-7 && bv.abs() < 1e-7 {
+                let sign = if ux + uy >= 0.0 { 1.0 } else { -1.0 };
+                let residue = -(origin.0 + origin.1) * 100.0 * sign;
+                let normalized = crate::constraints::nominal_axis_bounds(
+                    (low * 100.0, high * 100.0), (a.min(b) * 100.0, a.max(b) * 100.0), residue);
+                low = normalized.0 / 100.0;
+                high = normalized.1 / 100.0;
+            }
+            exclusions.push(((low * 100.0).round() as i64, (high * 100.0).round() as i64,
+                format!("beam:{}", beam.guid)));
+        }
+        for (opening_index, opening) in request.opening_volumes.iter().enumerate() {
+            if !matches!(opening.opening_type.as_str(), "OPENING" | "CONSOLE" | "WINDOW" | "DOOR") {
+                continue;
+            }
+            let (a, av) = project(opening.start_xmm, opening.start_ymm);
+            let (b, bv) = project(opening.end_xmm, opening.end_ymm);
+            if (av - bv).abs() > 0.02 || av.abs() > width / 2.0 + 0.02
+                || top <= opening.start_bottom_zmm.min(opening.end_bottom_zmm) + 1e-7
+                || bottom >= opening.start_top_zmm.max(opening.end_top_zmm) - 1e-7 {
+                continue;
+            }
+            let mut low = (a.min(b) * 100.0).round() as i64;
+            let mut high = (a.max(b) * 100.0).round() as i64;
+            for &(index, is_start, reference_length) in reveals {
+                if index != opening_index || original.length_centimm >= reference_length { continue; }
+                let boundary = ((if is_start { a } else { b }) * 100.0).round() as i64;
+                if !original.natural_end_right && boundary == original.length_centimm && boundary == low {
+                    low -= 500;
+                }
+                if !original.natural_end_left && boundary == 0 && boundary == high {
+                    high += 500;
+                }
+            }
+            exclusions.push((low, high, format!("opening:{}", opening.guid)));
+        }
+        let mut stock_span = Span { start: 0, end: original.length_centimm };
+        if original.kind.starts_with("node_") {
+            let wall_spans: Vec<_> = request.wall_volumes.iter().filter(|wall| {
+                owns_wall(&wall.guid)
+            }).filter_map(|wall| {
+                let (a, av) = project(wall.start_xmm, wall.start_ymm);
+                let (b, bv) = project(wall.end_xmm, wall.end_ymm);
+                ((bv - av).abs() < 0.02).then_some((a.min(b), a.max(b)))
+            }).collect();
+            if !wall_spans.is_empty() {
+                stock_span.start = (wall_spans.iter().map(|s| s.0).fold(f64::INFINITY, f64::min) * 100.0).round() as i64;
+                stock_span.end = (wall_spans.iter().map(|s| s.1).fold(f64::NEG_INFINITY, f64::max) * 100.0).round() as i64;
+                stock_span.start = stock_span.start.max(0);
+                stock_span.end = stock_span.end.min(original.length_centimm);
+            }
+        }
+        let mut spans = vec![stock_span];
+        for &(start, end, _) in &exclusions {
+            *work = work.saturating_add(spans.len());
+            if *work > MAX_BLOCKS * 256 {
+                return Err(crate::api::ApiFailure::new("GEOMETRY_LIMIT", "Превышен объём проверки препятствий", Some(original.id.clone())));
+            }
+            spans = subtract(spans, Span { start, end });
+        }
+        for span in spans {
+            if span.len() <= 0 { continue; }
+            *work = work.saturating_add(request.wall_volumes.len().saturating_mul(3)).saturating_add(1);
+            if *work > MAX_BLOCKS * 256 {
+                return Err(crate::api::ApiFailure::new("GEOMETRY_LIMIT", "Превышен объём проверки препятствий", Some(original.id.clone())));
+            }
+            let mut part = original.clone();
+            let split = span.start != 0 || span.end != original.length_centimm;
+            if split {
+                crate::node_shapes::relocate_node_cuts(&mut part, span.start, span.end)?;
+                part.id = format!("{}:part:{}-{}", original.id, span.start, span.end);
+            }
+            part.start = Point {
+                x: original.start.x + (span.start as f64 * ux).round() as i64,
+                y: original.start.y + (span.start as f64 * uy).round() as i64,
+            };
+            part.end = Point {
+                x: original.start.x + (span.end as f64 * ux).round() as i64,
+                y: original.start.y + (span.end as f64 * uy).round() as i64,
+            };
+            part.length_centimm = span.len();
+            part.arms = original.arms.iter().filter_map(|arm| {
+                let a = project(arm.start.x as f64 / 100.0, arm.start.y as f64 / 100.0).0 * 100.0;
+                let b = project(arm.end.x as f64 / 100.0, arm.end.y as f64 / 100.0).0 * 100.0;
+                let (from, to) = if (b - a).abs() < 1e-7 {
+                    if a < span.start as f64 - 1e-7 || a > span.end as f64 + 1e-7 { return None; }
+                    (0.0, 1.0)
+                } else {
+                    let left = (span.start as f64 - a) / (b - a);
+                    let right = (span.end as f64 - a) / (b - a);
+                    (left.min(right).max(0.0), left.max(right).min(1.0))
+                };
+                if to - from <= 1e-7 { return None; }
+                let point = |t: f64| Point {
+                    x: arm.start.x + ((arm.end.x - arm.start.x) as f64 * t).round() as i64,
+                    y: arm.start.y + ((arm.end.y - arm.start.y) as f64 * t).round() as i64,
+                };
+                let mut clipped = arm.clone();
+                clipped.start = point(from);
+                clipped.end = point(to);
+                clipped.length_centimm = (arm.length_centimm as f64 * (to - from)).round() as i64;
+                (clipped.length_centimm > 0).then_some(clipped)
+            }).collect();
+            part.natural_end_left = original.natural_end_left && span.start == 0;
+            part.natural_end_right = original.natural_end_right && span.end == original.length_centimm;
+            let free_end = |point: Point| {
+                let mut own_endpoints = 0;
+                for wall in &request.wall_volumes {
+                    let px = point.x as f64 / 100.0;
+                    let py = point.y as f64 / 100.0;
+                    let dx = wall.end_xmm - wall.start_xmm;
+                    let dy = wall.end_ymm - wall.start_ymm;
+                    let size = dx.hypot(dy);
+                    if size <= 1e-7 { continue; }
+                    let u = ((px - wall.start_xmm) * dx + (py - wall.start_ymm) * dy) / size;
+                    let v = ((px - wall.start_xmm) * dy - (py - wall.start_ymm) * dx) / size;
+                    if v.abs() > 0.02 || u < -0.02 || u > size + 0.02 { continue; }
+                    let t = (u / size).clamp(0.0, 1.0);
+                    let wall_bottom = wall.start_bottom_zmm + (wall.end_bottom_zmm - wall.start_bottom_zmm) * t;
+                    let wall_top = wall.start_top_zmm + (wall.end_top_zmm - wall.start_top_zmm) * t;
+                    if top <= wall_bottom + 1e-7 || bottom >= wall_top - 1e-7 { continue; }
+                    if !owns_wall(&wall.guid) { return false; }
+                    if u.abs() > 0.02 && (u - size).abs() > 0.02 { return false; }
+                    own_endpoints += 1;
+                }
+                own_endpoints == 1
+            };
+            let obstacle_hide = original.source_ids.iter().any(|id| id.starts_with("beam:") || id.starts_with("opening:"))
+                || original.cuts.iter().any(|cut| cut.starts_with("beam_volume:") || cut.starts_with("opening_volume:"));
+            part.hide_spikes_left = !part.natural_end_left || free_end(part.start)
+                || (!obstacle_hide && span.start == 0 && original.hide_spikes_left)
+                || exclusions.iter().any(|&(_, end, _)| end == span.start);
+            part.hide_spikes_right = !part.natural_end_right || free_end(part.end)
+                || (!obstacle_hide && span.end == original.length_centimm && original.hide_spikes_right)
+                || exclusions.iter().any(|&(start, _, _)| start == span.end);
+            part.cuts.retain(|cut| !cut.starts_with("beam_volume:")
+                && !cut.starts_with("opening_volume:") && cut != "left" && cut != "right"
+                && !(cut.starts_with("arm:") && cut.ends_with(":distal")));
+            // Причина открытого торца переживает разделение и экспорт. Короткая
+            // длина сама по себе не разрешает использовать деталь как добор.
+            part.obstacle_ends.retain(|end| if end.left { span.start == 0 }
+                else { span.end == original.length_centimm });
+            for (start, end, source) in &exclusions {
+                for (left, adjacent) in [(true, *end == span.start), (false, *start == span.end)] {
+                    if adjacent {
+                        let reason = ObstacleEnd { left, source_id: source.clone() };
+                        if !part.obstacle_ends.contains(&reason) { part.obstacle_ends.push(reason); }
+                        if !part.source_ids.contains(source) { part.source_ids.push(source.clone()); }
+                    }
+                }
+            }
+            part.catalog_nominal_centimm = Some(part.length_centimm);
+            if split && part.kind.starts_with("node_") && !part.cuts.iter().any(|cut| cut.starts_with("Type")) {
+                part.kind = "ordinary".into();
+                part.catalog_status = "length_only".into();
+                part.local_origin = None;
+                part.local_rotation_deg = None;
+                part.arms.clear();
+            }
+            if !part.kind.starts_with("node_") { part.product_key = None; }
+            if !original.components.is_empty() {
+                let components = finalize_parts_inner(request, profile, &original.components, depth + 1, work, reveals)?;
+                part.components = components.into_iter().filter(|child| {
+                    let a = project(child.start.x as f64 / 100.0, child.start.y as f64 / 100.0).0 * 100.0;
+                    let b = project(child.end.x as f64 / 100.0, child.end.y as f64 / 100.0).0 * 100.0;
+                    a.min(b) < span.end as f64 && a.max(b) > span.start as f64
+                }).collect();
+            }
+            result.push(part);
+            if result.len() > MAX_BLOCKS {
+                return Err(crate::api::ApiFailure::new("GEOMETRY_LIMIT", "Превышено число окончательных деталей", Some(original.id.clone())));
+            }
+        }
+    }
+    Ok(result)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,7 +716,7 @@ fn classify_candidate(
             end: course.z + profile.index_centimm,
         },
     };
-    let result = if profile.full_course_clearance
+    let result = if !constraints.evidence.is_empty() || profile.full_course_clearance
         || profile.longitudinal_full_wall_thickness
         || profile.assembly_clearance_mm > 0.0
     {
@@ -592,6 +955,9 @@ fn free_spans(
         .iter()
         .filter(|l| l.course_index == course_index && l.run_id == run.id)
     {
+        if constraints.opening_axis(&lintel.opening_id).is_some() {
+            continue;
+        }
         if let (Some(a), Some(b)) = (lintel.left_support, lintel.right_support) {
             solid = subtract(
                 solid,
@@ -695,39 +1061,26 @@ fn choose_pieces_with_roof_ends(
         let mut at = start;
         while at < end {
             let remaining = end - at;
-            if remaining < profile.minimum_cut_centimm && !roof_end {
-                let Some(last) = result.last_mut() else {
-                    // Материал задан моделью. Фрагмент остаётся в кандидате,
-                    // а производственный минимум проверяется предупреждением.
-                    result.push((remaining, true));
-                    break;
-                };
-                if last.0 + remaining > special_limit {
-                    return None;
-                }
-                last.0 += remaining;
-                last.1 = !profile.ordinary_nominal_lengths_centimm.contains(&last.0);
-                break;
-            }
             let mut distance = (residue - at).rem_euclid(profile.ordinary_length_centimm);
             if distance == 0 {
                 distance = profile.ordinary_length_centimm;
             }
-            if distance < profile.minimum_cut_centimm && !(roof_start && at == start) {
-                distance += profile.ordinary_length_centimm;
-            }
-            let piece = if remaining <= profile.ordinary_length_centimm {
-                remaining
-            } else {
-                distance.min(remaining)
-            };
+            let piece = distance.min(remaining);
             if piece > special_limit {
                 return None;
             }
-            result.push((
-                piece,
-                !profile.ordinary_nominal_lengths_centimm.contains(&piece),
-            ));
+            // Сращиваются только два коротких фрагмента. Соседняя длинная
+            // деталь сохраняет руст; на фронтоне сращивание запрещено.
+            if !roof_start && !roof_end && piece < profile.minimum_cut_centimm
+                && result.last().is_some_and(|last| last.0 < profile.minimum_cut_centimm)
+            {
+                if let Some(last) = result.last_mut() {
+                    last.0 += piece;
+                    last.1 = !profile.ordinary_nominal_lengths_centimm.contains(&last.0);
+                }
+            } else {
+                result.push((piece, !profile.ordinary_nominal_lengths_centimm.contains(&piece)));
+            }
             at += piece;
             if result.len() >= MAX_BLOCKS {
                 return None;
@@ -1931,11 +2284,14 @@ fn block(
         is_bridge: bridge,
         hide_spikes_left: cuts.iter().any(|v| v == "left"),
         hide_spikes_right: cuts.iter().any(|v| v == "right"),
+        natural_end_left: !cuts.iter().any(|v| v == "left"),
+        natural_end_right: !cuts.iter().any(|v| v == "right"),
         cuts,
         source_ids: sources,
         arms: Vec::new(),
         catalog_nominal_centimm: None,
         components: Vec::new(),
+        obstacle_ends: Vec::new(),
     }
 }
 
@@ -2014,8 +2370,39 @@ fn lintel_segments(
     Some(result)
 }
 
+/// Стыки склейки допустимы только на уже существующем торце детали
+/// внутри простенка с минимальным опиранием для обоих соседних проёмов.
+fn glued_lintel_segments(
+    selected: &[(usize, Span)],
+    openings: &[(String, Span)],
+    maximum: i64,
+    support: i64,
+) -> Option<Vec<Span>> {
+    let mut start = selected.first()?.1.start;
+    let end = selected.last()?.1.end;
+    if maximum <= 0 {
+        return None;
+    }
+    let joints: Vec<_> = selected.windows(2)
+        .map(|pair| pair[0].1.end)
+        .filter(|joint| openings.windows(2).any(|pair|
+            *joint - pair[0].1.end >= support && pair[1].1.start - *joint >= support))
+        .collect();
+    let mut segments = Vec::new();
+    while end - start > maximum {
+        let joint = joints.iter().copied()
+            .filter(|joint| *joint > start && *joint - start <= maximum)
+            .max()?;
+        segments.push(Span { start, end: joint });
+        start = joint;
+    }
+    segments.push(Span { start, end });
+    Some(segments)
+}
+
 /// Перемычка заменяет продольные детали, сохраняя врезки и поперечные
-/// части узлов. Крайние рядовые детали делятся по минимальному опиранию.
+/// части узлов. Целые детали склеиваются с опиранием не меньше профильного
+/// минимума (не менее 150 мм); из двух венцов выбирается короткий вариант.
 fn merge_t_lintels(
     blocks: &mut Vec<Block>,
     constraints: &Constraints,
@@ -2029,7 +2416,7 @@ fn merge_t_lintels(
         .copied()
         .max()
         .unwrap_or(0);
-    for candidate in &constraints.lintel_candidates {
+    'candidate: for candidate in &constraints.lintel_candidates {
         if !visited.insert((candidate.course_index, candidate.opening_id.clone())) {
             continue;
         }
@@ -2049,11 +2436,29 @@ fn merge_t_lintels(
         let on_axis = |p: Point| {
             ((p.x as f64 - a.x_mm * 100.0) * uy - (p.y as f64 - a.y_mm * 100.0) * ux).abs() <= 1.0
         };
+        let group = lintel_groups(constraints, &candidate.run_id, candidate.course_index)
+            .into_iter()
+            .find(|group| group.iter().any(|item| item.opening_id == candidate.opening_id))
+            .unwrap_or_else(|| vec![candidate]);
+        let support = (profile.lintel_support_mm.max(150.0) * 100.0).round() as i64;
+        let mut openings = Vec::new();
+        for item in &group {
+            let Some((left, right)) = constraints.opening_axis(&item.opening_id) else {
+                continue 'candidate;
+            };
+            let position = |point: crate::domain::RawPoint| project(Point {
+                x: (point.x_mm * 100.0).round() as i64,
+                y: (point.y_mm * 100.0).round() as i64,
+            });
+            let (left, right) = (position(left), position(right));
+            openings.push((item.opening_id.clone(), Span { start: left.min(right), end: left.max(right) }));
+        }
+        openings.sort_by_key(|(_, span)| span.start);
         let required = Span {
-            start: -(profile.lintel_support_mm * 100.0).round() as i64,
-            end: ((width + profile.lintel_support_mm) * 100.0).round() as i64,
+            start: openings.first().map(|(_, span)| span.start).unwrap_or(0) - support,
+            end: openings.last().map(|(_, span)| span.end).unwrap_or(0) + support,
         };
-        if required.len() > maximum
+        if maximum <= 0
             || blocks.iter().any(|part| {
                 part.course_index == candidate.course_index
                     && part.is_bridge
@@ -2062,7 +2467,7 @@ fn merge_t_lintels(
         {
             continue;
         }
-        let mut placement = None;
+        let mut placement: Option<(i64, Vec<(usize, Span)>, Span, Vec<Span>)> = None;
         for offset in 0..=1 {
             let course = candidate.course_index + offset;
             let mut coverage = Vec::new();
@@ -2087,8 +2492,16 @@ fn merge_t_lintels(
                     }
                 }
             }
-            let span = required;
-            if span.len() > maximum {
+            let mut selected: Vec<_> = coverage
+                .into_iter()
+                .filter(|(_, part_span)| part_span.intersects(required))
+                .collect();
+            selected.sort_by_key(|(_, part_span)| part_span.start);
+            let (Some((_, first)), Some((_, last))) = (selected.first(), selected.last()) else {
+                continue;
+            };
+            let span = Span { start: first.start, end: last.end };
+            if span.start > required.start || span.end < required.end {
                 continue;
             }
             let transverse_blocked = blocks
@@ -2108,265 +2521,129 @@ fn merge_t_lintels(
             if transverse_blocked {
                 continue;
             }
-            let mut selected: Vec<_> = coverage
-                .into_iter()
-                .filter(|(_, part_span)| part_span.intersects(span))
-                .map(|(index, part_span)| {
-                    (
-                        index,
-                        Span {
-                            start: part_span.start.max(span.start),
-                            end: part_span.end.min(span.end),
-                        },
-                    )
-                })
-                .collect();
-            selected.sort_by_key(|(_, part_span)| part_span.start);
             if selected
-                .first()
-                .is_none_or(|(_, first)| first.start != span.start)
-                || selected.last().is_none_or(|(_, last)| last.end != span.end)
-                || selected
                     .windows(2)
                     .any(|pair| pair[0].1.end != pair[1].1.start)
                 || selected.iter().any(|(i, _)| blocks[*i].is_bridge)
             {
                 continue;
             }
-            placement = Some((course, selected, span));
-            break;
+            let Some(segments) = glued_lintel_segments(&selected, &openings, maximum, support) else {
+                continue;
+            };
+            if placement.as_ref().is_none_or(|(_, _, best, _)| span.len() < best.len()) {
+                placement = Some((course, selected, span, segments));
+            }
         }
-        let Some((course, selected, span)) = placement else {
+        let Some((course, selected, _, segments)) = placement else {
             continue;
         };
         let point = |u: i64| Point {
             x: (a.x_mm * 100.0 + u as f64 * ux).round() as i64,
             y: (a.y_mm * 100.0 + u as f64 * uy).round() as i64,
         };
-        let first_block = &blocks[selected[0].0];
-        let mut merged = block(
-            &CourseEdge {
-                edge_id: first_block.edge_id.clone(),
-                wall_id: first_block.wall_id.clone(),
-                start: point(span.start),
-                end: point(span.end),
-            },
-            course,
-            first_block.z_centimm,
-            Span {
-                start: 0,
-                end: span.len(),
-            },
-            span.len(),
-            "bridge",
-            true,
-            Vec::new(),
-            vec![candidate.opening_id.clone()],
-        );
-        merged.id = format!(
-            "c{course}:lintel:{}:{}-{}",
-            candidate.opening_id, span.start, span.end
-        );
-        let mut cuts_valid = true;
-        for (i, used) in &selected {
-            let part = &blocks[*i];
-            merged.source_ids.extend(part.source_ids.iter().cloned());
-            for cut in &part.cuts {
-                if !cut.starts_with("Type") {
-                    if cut.starts_with("opening_volume:") || cut.starts_with("beam_volume:") {
-                        merged.cuts.push(cut.clone());
+        let mut bridges = Vec::new();
+        for span in segments {
+            let selected: Vec<_> = selected.iter().copied()
+                .filter(|(_, part)| part.intersects(span)).collect();
+            let first_block = &blocks[selected[0].0];
+            let mut merged = block(
+                &CourseEdge {
+                    edge_id: first_block.edge_id.clone(),
+                    wall_id: first_block.wall_id.clone(),
+                    start: point(span.start),
+                    end: point(span.end),
+                },
+                course,
+                first_block.z_centimm,
+                Span {
+                    start: 0,
+                    end: span.len(),
+                },
+                span.len(),
+                "bridge",
+                true,
+                Vec::new(),
+                openings.iter().filter(|(_, opening)| opening.intersects(span))
+                    .map(|(id, _)| id.clone()).collect(),
+            );
+            merged.id = format!(
+                "c{course}:lintel:{}:{}-{}",
+                candidate.opening_id, span.start, span.end
+            );
+            let mut cuts_valid = true;
+            for (i, used) in &selected {
+                let part = &blocks[*i];
+                merged.source_ids.extend(part.source_ids.iter().cloned());
+                for cut in &part.cuts {
+                    if !cut.starts_with("Type") {
+                        if cut.starts_with("opening_volume:") || cut.starts_with("beam_volume:") {
+                            merged.cuts.push(cut.clone());
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                let fields: Vec<_> = cut.splitn(4, ':').collect();
-                let Some(local_position) = fields.get(1).and_then(|s| {
-                    s.strip_prefix('x')
-                        .and_then(|s| s.parse::<i64>().ok())
-                        .map(|x| (x - 1) * 32_000)
-                        .or_else(|| s.strip_prefix('p').and_then(|s| s.parse::<i64>().ok()))
-                }) else {
-                    cuts_valid = false;
-                    break;
-                };
-                let rotation = f64::from(part.rotation_deg).to_radians();
-                let cut_point = Point {
-                    x: (part.start.x as f64 + local_position as f64 * rotation.cos()).round()
-                        as i64,
-                    y: (part.start.y as f64 + local_position as f64 * rotation.sin()).round()
-                        as i64,
-                };
-                if project(cut_point) < used.start || project(cut_point) > used.end {
-                    continue;
-                }
-                let position = project(cut_point) - span.start;
-                if fields.len() != 4 || position < 0 || position > span.len() {
-                    cuts_valid = false;
-                    break;
-                }
-                let coordinate = if position % 32_000 == 0 {
-                    format!("x{}", position / 32_000 + 1)
-                } else {
-                    format!("p{position}")
-                };
-                let Some(mut face) = fields[2]
-                    .strip_prefix('y')
-                    .and_then(|v| v.parse::<u8>().ok())
-                    .filter(|v| (1..=3).contains(v))
-                else {
-                    cuts_valid = false;
-                    break;
-                };
-                // Разворот оси детали зеркалит и координату, и грань врезки.
-                if rotation.cos() * ux + rotation.sin() * uy < 0.0 {
-                    face = 4 - face;
-                }
-                merged.cuts.push(format!(
-                    "{}:{}:y{}:{}",
-                    fields[0], coordinate, face, fields[3]
-                ));
-            }
-        }
-        if !cuts_valid {
-            continue;
-        }
-        merged.cuts.sort();
-        merged.cuts.dedup();
-        merged.source_ids.sort();
-        merged.source_ids.dedup();
-        merged.catalog_nominal_centimm = profile
-            .bridge_nominal_lengths_centimm
-            .iter()
-            .copied()
-            .filter(|n| *n >= span.len())
-            .min();
-        let mut residuals = Vec::new();
-        for (index, used) in &selected {
-            let part = &blocks[*index];
-            let points: Vec<_> = if part.arms.is_empty() {
-                vec![part.start, part.end]
-            } else {
-                part.arms
-                    .iter()
-                    .flat_map(|arm| [arm.start, arm.end])
-                    .collect()
-            };
-            let original = Span {
-                start: points.iter().map(|p| project(*p)).min().unwrap_or(0),
-                end: points.iter().map(|p| project(*p)).max().unwrap_or(0),
-            };
-            for (side, remainder) in [
-                (
-                    "left",
-                    Span {
-                        start: original.start,
-                        end: used.start,
-                    },
-                ),
-                (
-                    "right",
-                    Span {
-                        start: used.end,
-                        end: original.end,
-                    },
-                ),
-            ] {
-                if remainder.len() <= 0 {
-                    continue;
-                }
-                let mut residual = part.clone();
-                residual.id = format!("{}:lintel-{side}-{}", part.id, candidate.opening_id);
-                residual.start = point(remainder.start);
-                residual.end = point(remainder.end);
-                residual.length_centimm = remainder.len();
-                residual.rotation_deg = merged.rotation_deg;
-                residual.cuts.retain(|cut| cut != "left" && cut != "right");
-                if !part.arms.is_empty() {
-                    let rotation = f64::from(part.rotation_deg).to_radians();
-                    let forward = rotation.cos() * ux + rotation.sin() * uy >= 0.0;
-                    let origin = if forward {
-                        remainder.start
-                    } else {
-                        remainder.end
+                    let fields: Vec<_> = cut.splitn(4, ':').collect();
+                    let Some(local_position) = fields.get(1).and_then(|s| {
+                        s.strip_prefix('x')
+                            .and_then(|s| s.parse::<i64>().ok())
+                            .map(|x| (x - 1) * 32_000)
+                            .or_else(|| s.strip_prefix('p').and_then(|s| s.parse::<i64>().ok()))
+                    }) else {
+                        cuts_valid = false;
+                        break;
                     };
-                    residual.start = point(origin);
-                    residual.end = residual.start;
-                    residual.rotation_deg = part.rotation_deg;
-                    residual.arms = part
-                        .arms
-                        .iter()
-                        .filter_map(|arm| {
-                            let start = project(arm.start)
-                                .min(project(arm.end))
-                                .max(remainder.start);
-                            let end = project(arm.start).max(project(arm.end)).min(remainder.end);
-                            if end <= start {
-                                return None;
-                            }
-                            let mut clipped = arm.clone();
-                            clipped.start = point(start);
-                            clipped.end = point(end);
-                            clipped.length_centimm = end - start;
-                            Some(clipped)
-                        })
-                        .collect();
-                    residual.cuts.clear();
-                    for cut in &part.cuts {
-                        if !cut.starts_with("Type") {
-                            if cut.starts_with("opening_volume:") || cut.starts_with("beam_volume:")
-                            {
-                                residual.cuts.push(cut.clone());
-                            }
-                            continue;
-                        }
-                        let fields: Vec<_> = cut.splitn(4, ':').collect();
-                        let Some(at) = fields.get(1).and_then(|s| {
-                            s.strip_prefix('x')
-                                .and_then(|s| s.parse::<i64>().ok())
-                                .map(|x| (x - 1) * 32_000)
-                                .or_else(|| s.strip_prefix('p').and_then(|s| s.parse::<i64>().ok()))
-                        }) else {
-                            continue;
-                        };
-                        if fields.len() != 4 {
-                            continue;
-                        }
-                        let old_origin = project(part.start);
-                        let world_at = old_origin + if forward { at } else { -at };
-                        if world_at < remainder.start || world_at > remainder.end {
-                            continue;
-                        }
-                        let position = (world_at - origin).abs();
-                        let coordinate = if position % 32_000 == 0 {
-                            format!("x{}", position / 32_000 + 1)
-                        } else {
-                            format!("p{position}")
-                        };
-                        residual.cuts.push(format!(
-                            "{}:{}:{}:{}",
-                            fields[0], coordinate, fields[2], fields[3]
-                        ));
+                    let rotation = f64::from(part.rotation_deg).to_radians();
+                    let cut_point = Point {
+                        x: (part.start.x as f64 + local_position as f64 * rotation.cos()).round()
+                            as i64,
+                        y: (part.start.y as f64 + local_position as f64 * rotation.sin()).round()
+                            as i64,
+                    };
+                    if project(cut_point) < used.start || project(cut_point) > used.end {
+                        continue;
                     }
-                    if !residual.cuts.iter().any(|cut| cut.starts_with("Type")) {
-                        residual.kind = "ordinary".into();
-                        residual.product_key = None;
-                        residual.start = point(remainder.start);
-                        residual.end = point(remainder.end);
-                        residual.rotation_deg = merged.rotation_deg;
-                        residual.arms.clear();
-                        residual.local_origin = None;
-                        residual.local_rotation_deg = None;
+                    let position = project(cut_point) - span.start;
+                    if fields.len() != 4 || position < 0 || position > span.len() {
+                        cuts_valid = false;
+                        break;
                     }
+                    let coordinate = if position % 32_000 == 0 {
+                        format!("x{}", position / 32_000 + 1)
+                    } else {
+                        format!("p{position}")
+                    };
+                    let Some(mut face) = fields[2]
+                        .strip_prefix('y')
+                        .and_then(|v| v.parse::<u8>().ok())
+                        .filter(|v| (1..=3).contains(v))
+                    else {
+                        cuts_valid = false;
+                        break;
+                    };
+                    // Разворот оси детали зеркалит и координату, и грань врезки.
+                    if rotation.cos() * ux + rotation.sin() * uy < 0.0 {
+                        face = 4 - face;
+                    }
+                    merged.cuts.push(format!(
+                        "{}:{}:y{}:{}",
+                        fields[0], coordinate, face, fields[3]
+                    ));
                 }
-                residual
-                    .cuts
-                    .push(if side == "left" { "right" } else { "left" }.into());
-                if side == "left" {
-                    residual.hide_spikes_right = true;
-                } else {
-                    residual.hide_spikes_left = true;
-                }
-                residuals.push(residual);
             }
+            if !cuts_valid {
+                continue 'candidate;
+            }
+            merged.cuts.sort();
+            merged.cuts.dedup();
+            merged.source_ids.sort();
+            merged.source_ids.dedup();
+            merged.catalog_nominal_centimm = profile
+                .bridge_nominal_lengths_centimm
+                .iter()
+                .copied()
+                .filter(|n| *n >= span.len())
+                .min();
+            bridges.push(merged);
         }
         let removed: BTreeSet<_> = selected.iter().map(|(index, _)| *index).collect();
         let mut index = 0;
@@ -2375,9 +2652,11 @@ fn merge_t_lintels(
             index += 1;
             keep
         });
-        blocks.push(merged);
-        blocks.extend(residuals);
-        completed.insert((candidate.course_index, candidate.opening_id.clone()));
+        blocks.extend(bridges);
+        for item in group {
+            completed.insert((item.course_index, item.opening_id.clone()));
+            visited.insert((item.course_index, item.opening_id.clone()));
+        }
     }
     completed
 }
@@ -2703,6 +2982,40 @@ pub fn calculate_candidate(
                         continue;
                     }
                     for (part_index, part) in parts.into_iter().enumerate() {
+                        let angle = f64::from(part.world_rotation_deg).to_radians();
+                        let (axis_x, axis_y) = (angle.cos(), angle.sin());
+                        let mut part_hide_left = false;
+                        let mut part_hide_right = false;
+                        let mut oriented_cut = false;
+                        for resolved in geometry.arms.iter().filter(|arm| arm.cut_at_distal_end) {
+                            if !part
+                                .covered_arms
+                                .iter()
+                                .any(|arm| arm.run_id == resolved.run_id)
+                            {
+                                continue;
+                            }
+                            let Some(idx) = edges
+                                .iter()
+                                .position(|edge| edge.edge_id == resolved.run_id)
+                            else {
+                                continue;
+                            };
+                            let edge = &edges[idx];
+                            let direction = if resolved.at_start { 1.0 } else { -1.0 };
+                            let dot = direction
+                                * ((edge.end.x - edge.start.x) as f64 * axis_x
+                                    + (edge.end.y - edge.start.y) as f64 * axis_y);
+                            if dot.abs() > 1.0 {
+                                oriented_cut = true;
+                                part_hide_left |= dot < 0.0;
+                                part_hide_right |= dot > 0.0;
+                            }
+                        }
+                        if !oriented_cut {
+                            part_hide_left = hide_left;
+                            part_hide_right = hide_right;
+                        }
                         let mut part_arms = Vec::new();
                         for arm in &part.covered_arms {
                             let Some(idx) = edges.iter().position(|e| e.edge_id == arm.run_id)
@@ -2773,13 +3086,16 @@ pub fn calculate_candidate(
                             local_origin: Some(part.local_origin),
                             local_rotation_deg: Some(part.local_rotation_deg),
                             is_bridge: false,
-                            hide_spikes_left: hide_left,
-                            hide_spikes_right: hide_right,
+                            hide_spikes_left: part_hide_left,
+                            hide_spikes_right: part_hide_right,
+                            natural_end_left: true,
+                            natural_end_right: true,
                             cuts,
                             source_ids: sources,
                             arms: part_arms,
                             catalog_nominal_centimm: Some(part.nominal_length_centimm),
                             components: Vec::new(),
+                            obstacle_ends: Vec::new(),
                         });
                     }
                 } else {
@@ -2806,11 +3122,14 @@ pub fn calculate_candidate(
                         is_bridge: false,
                         hide_spikes_left: hide_left,
                         hide_spikes_right: hide_right,
+                        natural_end_left: true,
+                        natural_end_right: true,
                         cuts: geometry.cuts.clone(),
                         source_ids: geometry.source_ids.clone(),
                         arms: node_arms,
                         catalog_nominal_centimm: None,
                         components: Vec::new(),
+                        obstacle_ends: Vec::new(),
                     });
                 }
             }
@@ -2876,9 +3195,18 @@ pub fn calculate_candidate(
             for v in &voids {
                 solid = subtract(solid, *v);
             }
-            let expected_solid = solid.clone();
+            let mut expected_solid = solid.clone();
             let mut placed = Vec::new();
             for group in lintel_groups(constraints, &edge.edge_id, course.index) {
+                if group.iter().all(|candidate| constraints.opening_axis(&candidate.opening_id).is_some()) {
+                    errors.push(diagnostic(
+                        DiagnosticCode::InvalidSupport,
+                        "Не найдено склеиваемых деталей с достаточным опиранием",
+                        Some(edge),
+                        Some(course.index),
+                    ));
+                    continue;
+                }
                 let first = group[0];
                 let last = group[group.len() - 1];
                 let Some(left) = first.left_support else {
@@ -2899,9 +3227,10 @@ pub fn calculate_candidate(
                     ));
                     continue;
                 };
+                let minimum_support = (profile.lintel_support_mm.max(150.0) * 100.0).round() as i64;
                 let bridge = Span {
-                    start: left.start,
-                    end: right.end,
+                    start: left.start.min(first.span.start - minimum_support),
+                    end: right.end.max(last.span.end + minimum_support),
                 };
                 if left.end != first.span.start
                     || right.start != last.span.end
@@ -3106,21 +3435,24 @@ pub fn calculate_candidate(
                         start: cursor,
                         end: cursor + piece,
                     };
+                    if piece < 2_000
+                        && ((roof_start && piece_index == 0)
+                            || (roof_end && piece_index + 1 == piece_count))
+                    {
+                        expected_solid = subtract(expected_solid, current);
+                        cursor += piece;
+                        continue;
+                    }
                     let mut volume_sources = Vec::new();
                     match classify_candidate(topology, constraints, course, edge, current, profile)
                     {
                         Ok(Exclusion::None) => {}
                         Ok(Exclusion::Partial { source_ids }) => volume_sources = source_ids,
-                        Ok(Exclusion::FullVoid { source_ids }) => {
-                            errors.push(diagnostic(
-                                DiagnosticCode::UnsupportedGeometry,
-                                format!(
-                                    "Ordinary требует 3D-подрезки из-за {:?} на run {} [{}, {})",
-                                    source_ids, edge.edge_id, current.start, current.end
-                                ),
-                                Some(edge),
-                                Some(course.index),
-                            ));
+                        Ok(Exclusion::FullVoid { .. }) => {
+                            // Точная объёмная проверка доказала, что материал
+                            // полностью занят препятствием. Он исключается и
+                            // из эталона покрытия, а не становится пустой деталью.
+                            expected_solid = subtract(expected_solid, current);
                             cursor += piece;
                             continue;
                         }
@@ -3161,11 +3493,11 @@ pub fn calculate_candidate(
                     }
                     // Даже каталожный блок у точной грани проёма имеет
                     // спиленные шипы: наличие продольной подрезки не требуется.
-                    for mask in constraints.masks.iter().filter(|m| {
-                        m.course_index == course.index
-                            && m.run_id == edge.edge_id
-                            && matches!(m.source, MaskSource::Opening(_))
-                    }) {
+                    for mask in constraints
+                        .masks
+                        .iter()
+                        .filter(|m| m.course_index == course.index && m.run_id == edge.edge_id)
+                    {
                         if current.start == mask.interval.end {
                             item.hide_spikes_left = true;
                             item.source_ids.push(mask_source(&mask.source));
@@ -3208,6 +3540,16 @@ pub fn calculate_candidate(
                     } else {
                         Some(piece)
                     };
+                    if profile.world_joint_policy.as_deref() == Some("affine_checkerboard_v1")
+                        && matches!(item.rotation_deg, 0 | 90 | 180 | 270) {
+                        // Происхождение торца определяется исходной мировой сеткой
+                        // заготовок, а не длиной остатка или названием первого запила.
+                        let factory = |point: Point| (i128::from(point.x) + i128::from(point.y)).rem_euclid(32_000) == 0;
+                        item.natural_end_left = factory(item.start);
+                        item.natural_end_right = factory(item.end);
+                        item.hide_spikes_left = !item.natural_end_left;
+                        item.hide_spikes_right = !item.natural_end_right;
+                    }
                     blocks.push(item);
                     placed.push(current);
                     cursor += piece;
@@ -3826,7 +4168,7 @@ mod tests {
         );
     }
     #[test]
-    fn roof_tail_keeps_tiny_piece_and_spikes_while_lower_courses_keep_merge() {
+    fn roof_tail_discards_tiny_piece_while_lower_courses_keep_rust() {
         let mut p = profile();
         p.world_joint_policy = Some("affine_checkerboard_v1".into());
         p.maximum_special_blank_centimm = Some(128_000);
@@ -3849,12 +4191,21 @@ mod tests {
                 .iter()
                 .map(|b| b.length_centimm)
                 .collect::<Vec<_>>(),
-            vec![64_000, 64_000, 64_000, 15]
+            vec![64_000, 64_000, 64_000]
         );
-        let tiny = roof.blocks.last().unwrap();
-        assert!(!tiny.hide_spikes_left && !tiny.hide_spikes_right);
-        assert_eq!(tiny.catalog_nominal_centimm, Some(32_000));
-        assert!(tiny.cuts.iter().any(|cut| cut == "right"));
+
+        for (tail, expected_count) in [(1_999, 3), (2_000, 4)] {
+            let mut boundary = topology(vec![edge("run", "wall", (0, 0), (192_000 + tail, 0))], 1);
+            let mut wall = t.walls[0].clone();
+            wall.top_start = 192_000 + tail + 6_300;
+            wall.top_end = wall.top_start - 256_000;
+            boundary.walls.push(wall);
+            let output = calculate(&boundary, &Constraints::default(), &p).unwrap();
+            assert_eq!(output.blocks.len(), expected_count);
+            if tail == 2_000 {
+                assert!(output.blocks.iter().any(|block| block.length_centimm == 2_000));
+            }
+        }
 
         // Та же стена в нижнем венце: верх не подрезает текущий материал.
         t.courses[0].z = 0;
@@ -3866,7 +4217,7 @@ mod tests {
                 .iter()
                 .map(|b| b.length_centimm)
                 .collect::<Vec<_>>(),
-            vec![64_000, 64_000, 64_015]
+            vec![64_000, 64_000, 64_000, 15]
         );
         assert!(lower.blocks.last().unwrap().hide_spikes_right);
 
@@ -3878,7 +4229,7 @@ mod tests {
     }
 
     #[test]
-    fn roof_start_keeps_short_fragment_without_absorbing_next_module() {
+    fn roof_start_discards_short_fragment_without_absorbing_next_module() {
         let mut p = profile();
         p.world_joint_policy = Some("affine_checkerboard_v1".into());
         p.maximum_special_blank_centimm = Some(128_000);
@@ -3906,7 +4257,7 @@ mod tests {
                 .iter()
                 .map(|b| b.length_centimm)
                 .collect::<Vec<_>>(),
-            vec![15, 64_000, 64_000, 64_000]
+            vec![64_000, 64_000, 64_000]
         );
         assert!(!roof.blocks[0].hide_spikes_left && !roof.blocks[0].hide_spikes_right);
         t.walls[0].top_start = 300_000;
@@ -3917,7 +4268,7 @@ mod tests {
                 .iter()
                 .map(|b| b.length_centimm)
                 .collect::<Vec<_>>(),
-            vec![64_015, 64_000, 64_000]
+            vec![15, 64_000, 64_000, 64_000]
         );
         assert!(flat.blocks[0].hide_spikes_left);
     }
@@ -4469,7 +4820,9 @@ mod tests {
             lintel_candidates: vec![lintel.clone()],
             ..Default::default()
         };
-        let result = calculate(&t, &constraints, &profile()).unwrap();
+        let mut p = profile();
+        p.bridge_nominal_lengths_centimm = vec![64_000];
+        let result = calculate(&t, &constraints, &p).unwrap();
         assert_eq!(covered(&result.blocks, "e"), 100_000);
         assert_eq!(result.blocks.iter().filter(|b| b.is_bridge).count(), 1);
         let mut bad = lintel;
@@ -4480,7 +4833,7 @@ mod tests {
                 lintel_candidates: vec![bad],
                 ..Default::default()
             },
-            &profile(),
+            &p,
         )
         .unwrap_err();
         assert!(err.iter().any(|d| d.code == DiagnosticCode::InvalidSupport));
@@ -4623,17 +4976,17 @@ mod tests {
             assert_eq!(bridge.course_index, 1 + offset);
             assert_eq!(
                 (bridge.start.x, bridge.end.x, bridge.length_centimm),
-                (100_000, 220_000, 120_000)
+                (96_000, 224_000, 128_000)
             );
-            assert!(bridge.cuts.contains(&"Type6:p60000:y1:e".into()));
-            assert!(bridge.cuts.contains(&"Type6:p60000:y3:e".into()));
+            assert!(bridge.cuts.contains(&"Type6:x3:y1:e".into()));
+            assert!(bridge.cuts.contains(&"Type6:x3:y3:e".into()));
             assert_eq!(bridge.source_ids.len(), 5);
             assert_eq!(
                 blocks
                     .iter()
                     .filter(|b| b.course_index == bridge.course_index)
                     .count(),
-                4
+                2
             );
             assert!(blocks.iter().any(|b| b.course_index == bridge.course_index
                 && b.product_key.as_deref() == Some("Type5_1")));
@@ -4641,6 +4994,119 @@ mod tests {
                 assert_eq!(blocks.iter().filter(|b| b.course_index == 1).count(), 5);
             }
         }
+        // 149 мм недостаточно: склеивается ещё одна деталь с каждой стороны.
+        // Ровно 150 мм допустимо даже при ошибочно малом профильном минимуме.
+        p.lintel_support_mm = 50.0;
+        p.bridge_nominal_lengths_centimm = vec![256_000];
+        let chain = |course, boundaries: &[i64]| -> Vec<Block> {
+            boundaries.windows(2).map(|pair| block(
+                &e, course, course * 6_300,
+                Span { start: pair[0], end: pair[1] }, 320_000,
+                "ordinary", false, Vec::new(), Vec::new(),
+            )).collect()
+        };
+        for (boundaries, expected) in [
+            (vec![73_100, 105_100, 214_900, 246_900], (73_100, 246_900)),
+            (vec![73_000, 105_000, 215_000, 247_000], (105_000, 215_000)),
+        ] {
+            let mut blocks = chain(1, &boundaries);
+            assert!(merge_t_lintels(&mut blocks, &c, &p).contains(&(1, "o".into())));
+            let bridge = blocks.iter().find(|b| b.is_bridge).unwrap();
+            assert_eq!((bridge.start.x, bridge.end.x), expected);
+        }
+        let mut blocks = chain(1, &[73_100, 105_100, 214_900, 246_900]);
+        blocks.extend(chain(2, &[73_000, 105_000, 215_000, 247_000]));
+        merge_t_lintels(&mut blocks, &c, &p);
+        let bridge = blocks.iter().find(|b| b.is_bridge).unwrap();
+        assert_eq!(bridge.course_index, 2);
+        assert_eq!(bridge.length_centimm, 110_000);
+
+        let mut too_high = chain(3, &[105_000, 215_000]);
+        let mut first_candidate = c.clone();
+        first_candidate.lintel_candidates.retain(|candidate| candidate.course_index == 1);
+        assert!(merge_t_lintels(&mut too_high, &first_candidate, &p).is_empty());
+
+        // Обычная перемычка проходит тот же путь склейки после раскладки.
+        let output = calculate(&t, &c, &p).unwrap();
+        let bridge = output.blocks.iter().find(|b| b.is_bridge).unwrap();
+        assert!(bridge.start.x <= 105_000 && bridge.end.x >= 215_000);
+        assert!(bridge.length_centimm > 110_000);
+
+        let nearby = build_constraints(
+            &t,
+            &[("left", 1200.0, 1400.0), ("right", 1600.0, 1800.0)].map(|(id, start, end)| RawOpening {
+                id: id.into(),
+                start: RawPoint { x_mm: start, y_mm: 0.0 },
+                end: RawPoint { x_mm: end, y_mm: 0.0 },
+                bottom_start_mm: 0.0, bottom_end_mm: 0.0,
+                top_start_mm: 63.0, top_end_mm: 63.0,
+            }),
+            &[], 63.0, 150.0,
+        ).unwrap();
+        let output = calculate(&t, &nearby, &p).unwrap();
+        let bridges: Vec<_> = output.blocks.iter().filter(|block| block.is_bridge).collect();
+        assert!(!bridges.is_empty());
+        assert!(bridges.iter().all(|block| block.source_ids.contains(&"left".into())
+            && block.source_ids.contains(&"right".into())));
+
+    }
+
+    #[test]
+    fn real_640_pier_splits_glued_lintels_only_at_next_course_existing_joint() {
+        use crate::constraints::{build_constraints, RawOpening};
+        use crate::domain::{NormalizedWall, RawPoint};
+        let e = edge("e", "wall", (1_408_000, 576_000), (1_408_000, 992_000));
+        let mut t = topology(vec![e.clone()], 38);
+        t.courses[0].z = 214_200;
+        let mut below = t.courses[0].clone();
+        below.index = 37;
+        below.z = 207_900;
+        t.courses.push(below);
+        let mut next = t.courses[0].clone();
+        next.index = 39;
+        next.z = 220_500;
+        t.courses.push(next);
+        t.walls.push(NormalizedWall {
+            id: "wall".into(), start: e.start, end: e.end,
+            bottom_start: -25_200, bottom_end: -25_200,
+            top_start: 300_000, top_end: 300_000, thickness: 19_300,
+        });
+        let constraints = build_constraints(&t,
+            &[("lower", 7040.0, 6066.0), ("upper", 8654.0, 7680.0)].map(|(id, start, end)| RawOpening {
+                id: id.into(),
+                start: RawPoint { x_mm: 14080.0, y_mm: start },
+                end: RawPoint { x_mm: 14080.0, y_mm: end },
+                bottom_start_mm: 0.0, bottom_end_mm: 0.0,
+                top_start_mm: 2142.0, top_end_mm: 2142.0,
+            }), &[], 63.0, 150.0).unwrap();
+        assert_eq!(constraints.lintel_candidates.len(), 2);
+        let parts = |course, boundaries: &[i64]| -> Vec<Block> {
+            boundaries.windows(2).map(|pair| block(
+                &e, course, course * 6_300 - 25_200,
+                Span { start: pair[0] - 576_000, end: pair[1] - 576_000 },
+                416_000, "ordinary", false, Vec::new(), Vec::new(),
+            )).collect()
+        };
+        let mut p = profile();
+        p.lintel_support_mm = 150.0;
+        p.bridge_nominal_lengths_centimm = vec![275_000];
+        let mut current = parts(38, &[576_000, 640_000, 704_000, 768_000, 832_000, 896_000, 960_000, 992_000]);
+        assert!(merge_t_lintels(&mut current, &constraints, &p).is_empty());
+        assert!(current.iter().all(|block| !block.is_bridge));
+        let mut blocks = current;
+        blocks.extend(parts(39, &[576_000, 608_000, 672_000, 736_000, 800_000, 864_000, 928_000, 992_000]));
+        let completed = merge_t_lintels(&mut blocks, &constraints, &p);
+        assert!(completed.contains(&(38, "lower".into())) && completed.contains(&(38, "upper".into())));
+        let mut bridges: Vec<_> = blocks.iter().filter(|block| block.is_bridge).collect();
+        bridges.sort_by_key(|block| block.start.y.min(block.end.y));
+        assert_eq!(bridges.len(), 2);
+        assert!(bridges.iter().all(|block| block.course_index == 39));
+        assert_eq!((bridges[0].start.y.min(bridges[0].end.y), bridges[0].start.y.max(bridges[0].end.y), bridges[0].length_centimm), (576_000, 736_000, 160_000));
+        assert_eq!((bridges[1].start.y.min(bridges[1].end.y), bridges[1].start.y.max(bridges[1].end.y), bridges[1].length_centimm), (736_000, 928_000, 192_000));
+        assert!(bridges[0].source_ids.contains(&"lower".into()) && !bridges[0].source_ids.contains(&"upper".into()));
+        assert!(bridges[1].source_ids.contains(&"upper".into()) && !bridges[1].source_ids.contains(&"lower".into()));
+        assert_eq!(blocks.iter().filter(|block| block.course_index == 38).count(), 7);
+        assert_eq!(covered(&blocks, "e"), 832_000);
     }
 
     #[test]
@@ -4672,7 +5138,7 @@ mod tests {
         let result = calculate(&t, &c, &p).unwrap();
         let bridges: Vec<_> = result.blocks.iter().filter(|b| b.is_bridge).collect();
         assert_eq!(bridges.len(), 1);
-        assert_eq!(bridges[0].length_centimm, 70_000);
+        assert_eq!(bridges[0].length_centimm, 90_000);
         assert!(
             bridges[0].source_ids.contains(&"a".into())
                 && bridges[0].source_ids.contains(&"b".into())
@@ -4799,5 +5265,243 @@ mod tests {
         for id in ["n", "sw"] {
             assert!(nodes[0].arms.iter().any(|a| a.edge_id == id));
         }
+    }
+    #[test]
+    fn short_fragments_never_absorb_a_long_neighbour_or_remove_150mm_rust() {
+        let mut p = profile();
+        p.minimum_cut_centimm = 15_000;
+        p.maximum_special_blank_centimm = Some(128_000);
+        let pieces = choose_pieces_with_roof_ends(0, 74_000, &p, 0, Some(10_000), false, false).unwrap();
+        assert_eq!(pieces.iter().map(|p| p.0).collect::<Vec<_>>(), vec![10_000, 64_000]);
+        let pieces = choose_pieces_with_roof_ends(0, 79_000, &p, 0, Some(15_000), false, false).unwrap();
+        assert_eq!(pieces.iter().map(|p| p.0).collect::<Vec<_>>(), vec![15_000, 64_000]);
+    }
+
+    #[test]
+    fn finalize_beam_removes_rear_and_vertical_bridges_and_creates_two_parts() {
+        let request: crate::api::LayoutRequest = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"request_id":"split","snapshot_hash":"a".repeat(64),"z0_mm":0,
+            "wall_volumes":[{"guid":"w","startXmm":0,"startYmm":0,"endXmm":640,"endYmm":0,
+                "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":63,"endTopZmm":63,"thicknessMm":193,"purposeType":1}],
+            "beams":[{"guid":"b","startXmm":320,"startYmm":-500,"startZmm":20,
+                "endXmm":320,"endYmm":76.5,"endZmm":20,
+                "geometry":{"widthMm":160,"heightMm":20,"heightDirectionX":0,"heightDirectionY":0,"heightDirectionZ":1}}]
+        })).unwrap();
+        let e = edge("e", "w", (0, 0), (64_000, 0));
+        let mut input = block(&e, 0, 0, Span {start:0,end:64_000}, 64_000, "ordinary", false, Vec::new(), vec!["wall:w".into()]);
+        input.wall_id = "run:0:0:64000:0".into();
+        let parts = finalize_parts(&request, &profile(), &[input]).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.iter().map(|p|p.length_centimm).collect::<Vec<_>>(), vec![24_000, 24_000]);
+        assert_eq!(parts[0].end.x, 24_000);
+        assert_eq!(parts[1].start.x, 40_000);
+        assert!(!parts[0].natural_end_right && parts[0].hide_spikes_right);
+        assert!(!parts[1].natural_end_left && parts[1].hide_spikes_left);
+        assert!(parts[0].natural_end_left && parts[0].hide_spikes_left);
+        assert!(parts[1].natural_end_right && parts[1].hide_spikes_right);
+        assert!(parts.iter().all(|p| p.catalog_nominal_centimm == Some(p.length_centimm) && p.cuts.is_empty()));
+        assert_eq!(finalize_parts(&request, &profile(), &parts).unwrap(), parts);
+    }
+
+    #[test]
+    fn finalize_untouched_neighbour_keeps_spikes_and_clears_inherited_beam_hide() {
+        let request: crate::api::LayoutRequest = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"request_id":"neighbour","snapshot_hash":"b".repeat(64),"z0_mm":0,
+            "wall_volumes":[{"guid":"w","startXmm":0,"startYmm":0,"endXmm":1280,"endYmm":0,
+                "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":63,"endTopZmm":63,"thicknessMm":193,"purposeType":1}]
+        })).unwrap();
+        let e = edge("e", "w", (0, 0), (128_000, 0));
+        let mut input = block(&e, 0, 0, Span {start:32_000,end:96_000}, 128_000, "ordinary", false, vec!["beam_volume:b".into()], Vec::new());
+        input.hide_spikes_left = true;
+        input.hide_spikes_right = true;
+        let parts = finalize_parts(&request, &profile(), &[input]).unwrap();
+        assert!(!parts[0].hide_spikes_left && !parts[0].hide_spikes_right);
+        assert!(parts[0].natural_end_left && parts[0].natural_end_right);
+    }
+
+    #[test]
+    fn finalize_normalizes_only_exact_encoded_five_mm_beam_end() {
+        let mut p = profile();
+        p.world_joint_policy = Some("affine_checkerboard_v1".into());
+        for end in [0.0, 5.0] {
+            let request: crate::api::LayoutRequest = serde_json::from_value(serde_json::json!({
+                "schema_version":1,"request_id":"nominal","snapshot_hash":"c".repeat(64),"z0_mm":0,
+                "wall_volumes":[{"guid":"w","startXmm":-640,"startYmm":0,"endXmm":640,"endYmm":0,
+                    "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":63,"endTopZmm":63,"thicknessMm":193,"purposeType":1}],
+                "beams":[{"guid":"b","startXmm":-640,"startYmm":0,"startZmm":0,
+                    "endXmm":end,"endYmm":0,"endZmm":0,
+                    "geometry":{"widthMm":193,"heightMm":63,"heightDirectionX":0,"heightDirectionY":0,"heightDirectionZ":1}}]
+            })).unwrap();
+            let e = edge("e", "w", (0, 0), (64_000, 0));
+            let input = block(&e, 0, 0, Span {start:0,end:64_000}, 64_000, "ordinary", false, Vec::new(), Vec::new());
+            let parts = finalize_parts(&request, &p, &[input]).unwrap();
+            assert_eq!(parts.len(), 1);
+            assert_eq!(parts[0].length_centimm, 64_000);
+            assert_eq!(parts[0].start.x, 0);
+            assert!(parts[0].natural_end_left && parts[0].hide_spikes_left);
+            assert_eq!(request.beams[0].end_xmm, end);
+        }
+    }
+
+    #[test]
+    fn finalize_rejects_deep_component_tree_before_recursive_overflow() {
+        let request: crate::api::LayoutRequest = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"request_id":"depth","snapshot_hash":"d".repeat(64),"z0_mm":0,
+            "wall_volumes":[{"guid":"w","startXmm":0,"startYmm":0,"endXmm":1280,"endYmm":0,
+                "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":63,"endTopZmm":63,"thicknessMm":193,"purposeType":1}]
+        })).unwrap();
+        let e = edge("e", "w", (0, 0), (64_000, 0));
+        let template = block(&e, 0, 0, Span {start:0,end:64_000}, 64_000, "ordinary", false, Vec::new(), Vec::new());
+        let mut nested = template.clone();
+        for _ in 0..18 {
+            let mut parent = template.clone();
+            parent.components = vec![nested];
+            nested = parent;
+        }
+        let error = finalize_parts(&request, &profile(), &[nested]).unwrap_err();
+        assert_eq!(error.code, "GEOMETRY_LIMIT");
+    }
+
+    #[test]
+    fn factory_320_and_640_ends_touching_opening_remove_five_once() {
+        for length in [32_000, 64_000] {
+            let mut request: crate::api::LayoutRequest = serde_json::from_value(serde_json::json!({
+                "schema_version":1,"request_id":"opening-contact","snapshot_hash":"e".repeat(64),"z0_mm":0,
+                "wall_volumes":[{"guid":"w","startXmm":-640,"startYmm":0,"endXmm":1280,"endYmm":0,
+                    "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":63,"endTopZmm":63,"thicknessMm":193,"purposeType":1}],
+                "opening_volumes":[{"guid":"o","openingType":"WINDOW",
+                    "startXmm":length as f64 / 100.0,"startYmm":0,"endXmm":length as f64 / 100.0+160.0,"endYmm":0,
+                    "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":63,"endTopZmm":63}]
+            })).unwrap();
+            let e = edge("e", "w", (0, 0), (length, 0));
+            let input = block(&e, 0, 0, Span {start:0,end:length}, length, "ordinary", false, Vec::new(), vec!["wall:w".into()]);
+            let parts = finalize_parts(&request, &profile(), &[input.clone()]).unwrap();
+            assert_eq!(parts.len(), 1);
+            assert_eq!(parts[0].length_centimm, length);
+            assert!(parts[0].natural_end_right && parts[0].hide_spikes_right);
+            assert!(parts[0].natural_end_left && !parts[0].hide_spikes_left);
+            let rendered = crate::materialize::materialize(&request, &parts, &profile()).unwrap();
+            let volume: f64 = rendered.physical.blocks.iter().flat_map(|part| &part.bodies)
+                .map(crate::solid_geometry::volume).sum();
+            assert!((volume - (length as f64 / 100.0 - 5.0) * 193.0 * 63.0).abs() < 1e-4);
+
+            // Разрез внутри исходного изделия не получает дополнительного -5.
+            request.opening_volumes[0].start_xmm = 100.0;
+            request.opening_volumes[0].end_xmm = 260.0;
+            let parts = finalize_parts(&request, &profile(), &[input]).unwrap();
+            assert_eq!(parts.len(), 2);
+            assert!(!parts[0].natural_end_right && parts[0].hide_spikes_right);
+            assert!(!parts[1].natural_end_left && parts[1].hide_spikes_left);
+            let rendered = crate::materialize::materialize(&request, &parts, &profile()).unwrap();
+            let volume: f64 = rendered.physical.blocks.iter().flat_map(|part| &part.bodies)
+                .map(crate::solid_geometry::volume).sum();
+            assert!((volume - (length as f64 / 100.0 - 160.0) * 193.0 * 63.0).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn type8_fragment_320_has_straight_artificial_end_at_opening() {
+        let request: crate::api::LayoutRequest = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"request_id":"type8-contact","snapshot_hash":"f".repeat(64),"z0_mm":0,
+            "wall_volumes":[{"guid":"w","startXmm":-640,"startYmm":0,"endXmm":1280,"endYmm":0,
+                "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":63,"endTopZmm":63,"thicknessMm":193,"purposeType":1}],
+            "opening_volumes":[{"guid":"o","openingType":"OPENING","startXmm":320,"startYmm":0,"endXmm":1280,"endYmm":0,
+                "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":63,"endTopZmm":63}]
+        })).unwrap();
+        let e = edge("e", "w", (0, 0), (64_000, 0));
+        let mut input = block(&e, 0, 0, Span {start:0,end:64_000}, 64_000, "node_T", false,
+            vec!["Type8:x1:y1:e".into()], vec!["wall:w".into()]);
+        input.product_key = Some("Type8".into());
+        input.catalog_nominal_centimm = Some(64_000);
+        let parts = finalize_parts(&request, &profile(), &[input]).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].length_centimm, 32_000);
+        assert!(parts[0].natural_end_left && !parts[0].hide_spikes_left);
+        assert!(!parts[0].natural_end_right && parts[0].hide_spikes_right);
+        let rendered = crate::materialize::materialize(&request, &parts, &profile()).unwrap();
+        let rightmost = rendered.physical.blocks.iter().flat_map(|part| &part.bodies)
+            .flat_map(|mesh| &mesh.vertices).map(|point| point[0]).fold(f64::NEG_INFINITY, f64::max);
+        assert!((rightmost - 320.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mixed_opening_reveal_aligns_short_artificial_node_once() {
+        let request: crate::api::LayoutRequest = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"request_id":"mixed-reveal","snapshot_hash":"f".repeat(64),"z0_mm":0,
+            "wall_volumes":[{"guid":"w","startXmm":-640,"startYmm":0,"endXmm":1280,"endYmm":0,
+                "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":126,"endTopZmm":126,"thicknessMm":193,"purposeType":1}],
+            "opening_volumes":[{"guid":"o","openingType":"WINDOW","startXmm":320,"startYmm":0,"endXmm":1280,"endYmm":0,
+                "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":126,"endTopZmm":126}]
+        })).unwrap();
+        let e = edge("e", "w", (0, 0), (64_000, 0));
+        let mut short = block(&e, 0, 0, Span {start:0,end:64_000}, 64_000, "node_T", false,
+            vec!["Type8:x1:y1:e".into()], vec!["wall:w".into()]);
+        short.product_key = Some("Type8".into());
+        let mut reference = block(&e, 1, 6300, Span {start:0,end:64_000}, 64_000, "ordinary", false,
+            Vec::new(), vec!["wall:w".into()]);
+        reference.start.x = -32_000;
+        reference.end.x = 32_000;
+        let parts = finalize_parts(&request, &profile(), &[short.clone(), reference]).unwrap();
+        assert_eq!(parts[0].length_centimm, 31_500);
+        assert_eq!(parts[0].end.x, 31_500);
+        assert!(!parts[0].natural_end_right && parts[0].hide_spikes_right);
+        assert!(parts[0].cuts.iter().any(|cut| cut.starts_with("Type8:p0:")));
+        assert_eq!(parts[1].length_centimm, 64_000);
+        assert_eq!(parts[1].end.x, 32_000);
+        assert!(parts[1].natural_end_right && parts[1].hide_spikes_right);
+        assert_eq!(finalize_parts(&request, &profile(), &parts).unwrap(), parts);
+        let rendered = crate::materialize::materialize(&request, &parts, &profile()).unwrap();
+        for physical in &rendered.physical.blocks {
+            let max = physical.bodies.iter().flat_map(|body| &body.vertices)
+                .map(|point| point[0]).fold(f64::NEG_INFINITY, f64::max);
+            assert!((max - 315.0).abs() < 1e-6);
+        }
+        // Без натуральной опорной плоскости все искусственные торцы остаются номинальными.
+        let alone = finalize_parts(&request, &profile(), &[short.clone()]).unwrap();
+        assert_eq!(alone[0].length_centimm, 32_000);
+        let mut long_artificial = parts[1].clone();
+        long_artificial.id = "long-artificial".into();
+        long_artificial.natural_end_right = false;
+        let both = finalize_parts(&request, &profile(), &[parts[1].clone(), long_artificial]).unwrap();
+        assert_eq!(both[1].length_centimm, 64_000);
+        assert_eq!(both[1].end.x, 32_000);
+        for purpose in ["DOOR", "OPENING"] {
+            let mut other_request = request.clone();
+            other_request.opening_volumes[0].opening_type = purpose.into();
+            let aligned = finalize_parts(&other_request, &profile(), &[short.clone(), parts[1].clone()]).unwrap();
+            assert_eq!(aligned[0].length_centimm, 31_500);
+            assert_eq!(aligned[1].length_centimm, 64_000);
+            assert_eq!(finalize_parts(&other_request, &profile(), &aligned).unwrap(), aligned);
+        }
+    }
+
+    #[test]
+    fn reversed_b07_and_forward_b21_remove_factory_spikes_at_both_gap_edges() {
+        let mut p = profile();
+        p.world_joint_policy = Some("affine_checkerboard_v1".into());
+        let request: crate::api::LayoutRequest = serde_json::from_value(serde_json::json!({
+            "schema_version":1,"request_id":"b21-b07-contact","snapshot_hash":"7".repeat(64),"z0_mm":-252,
+            "wall_volumes":[{"guid":"w","startXmm":0,"startYmm":320,"endXmm":8000,"endYmm":320,
+                "startBottomZmm":-252,"endBottomZmm":-252,"startTopZmm":3000,"endTopZmm":3000,"thicknessMm":193,"purposeType":1}],
+            "beams":[{"guid":"B21","startXmm":-896.5,"startYmm":320,"startZmm":2268,"endXmm":1920,"endYmm":320,"endZmm":2268,
+                "geometry":{"widthMm":160,"heightMm":315,"heightDirectionX":-6.7962199403762088e-17,"heightDirectionY":-1.689582373646205e-32,"heightDirectionZ":1}},
+                {"guid":"B07","startXmm":7685,"startYmm":320,"startZmm":2268,"endXmm":3200,"endYmm":320,"endZmm":2268,
+                "geometry":{"widthMm":160,"heightMm":315,"heightDirectionX":4.6648026244754483e-17,"heightDirectionY":-5.16443349516189e-34,"heightDirectionZ":1}}]
+        })).unwrap();
+        let e = edge("e", "w", (0, 32_000), (800_000, 32_000));
+        let left = block(&e, 44, 252_000, Span {start:192_000,end:256_000}, 800_000, "ordinary", false, Vec::new(), vec!["wall:w".into()]);
+        let right = block(&e, 44, 252_000, Span {start:256_000,end:320_000}, 800_000, "ordinary", false, Vec::new(), vec!["wall:w".into()]);
+        let parts = finalize_parts(&request, &p, &[left, right]).unwrap();
+        assert_eq!(parts.iter().map(|part| part.length_centimm).collect::<Vec<_>>(), vec![64_000,64_000]);
+        assert!(parts[0].natural_end_left && parts[0].hide_spikes_left);
+        assert!(!parts[0].hide_spikes_right && !parts[1].hide_spikes_left);
+        assert!(parts[1].natural_end_right && parts[1].hide_spikes_right);
+        let physical = crate::materialize::materialize(&request, &parts, &p).unwrap().physical;
+        let leftmost = physical.blocks[0].bodies.iter().flat_map(|mesh| &mesh.vertices)
+            .map(|point| point[0]).fold(f64::INFINITY, f64::min);
+        let rightmost = physical.blocks[1].bodies.iter().flat_map(|mesh| &mesh.vertices)
+            .map(|point| point[0]).fold(f64::NEG_INFINITY, f64::max);
+        assert!((leftmost - 1925.0).abs() < 1e-6);
+        assert!((rightmost - 3195.0).abs() < 1e-6);
     }
 }

@@ -1,11 +1,11 @@
 {
   "profile_id": "banya-prototype",
-  "revision": "1",
+  "revision": "2",
   "catalog_version": "ForestBrick-compatibility-study",
   "world_joint_policy": "affine_checkerboard_v1",
   "node_assembly_family": "forestbrick_legacy_observed",
-  "lintel_support_mm": 200.0,
-  "longitudinal_full_wall_thickness": false,
+  "lintel_support_mm": 150.0,
+  "longitudinal_full_wall_thickness": true,
   "full_course_clearance": false,
   "assembly_clearance_mm": 0.0,
   "ordinary_length_centimm": 64000,
@@ -14,7 +14,7 @@
     32000,
     64000
   ],
-  "minimum_cut_centimm": 20000,
+  "minimum_cut_centimm": 15000,
   "max_ordinary_cuts_per_free_span": 2,
   "index_centimm": 6300,
   "coordinate_tolerance_centimm": 1,

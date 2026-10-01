@@ -35,11 +35,21 @@ pub struct RawBeam {
     pub height_direction_z: f64,
 }
 
+fn beam_is_inclined(beam: &RawBeam) -> bool {
+    (beam.end.x_mm - beam.start.x_mm).hypot(beam.end.y_mm - beam.start.y_mm) > EPS
+        && ((beam.bottom_end_mm - beam.bottom_start_mm).abs() > EPS
+            || beam.height_direction_x.abs() > EPS
+            || beam.height_direction_y.abs() > EPS
+            || (beam.height_direction_z.abs() - 1.0).abs() > EPS)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct BeamCutPolicy {
     pub longitudinal_full_wall_thickness: bool,
     pub full_course_clearance: bool,
     pub assembly_clearance_mm: f64,
+    /// Распознаёт уже включённые в исходный торец 5 мм шипа на мировой сетке.
+    pub affine_world_joint_spike_compensation: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +164,7 @@ enum EvidenceGeometry {
         frame: Frame,
         source_u: Interval,
         assembly_envelope: Option<LocalBox>,
+        perpendicular_cut: Option<LocalBox>,
     },
 }
 
@@ -244,6 +255,56 @@ impl Frame {
             v: -x * self.uy + y * self.ux,
             t,
         }
+    }
+}
+
+fn nominal_beam_body_u(
+    beam: &RawBeam,
+    frame: &Frame,
+    run: &WallRun,
+    course_index: i64,
+    physical_u: (f64, f64),
+) -> (f64, f64) {
+    // Компенсация относится только к соосным ортогональным торцам источника.
+    // Грань, полученная обрезкой по стене, не является торцом балки.
+    if !((frame.ux - 1.0).abs() <= EPS && frame.uy.abs() <= EPS
+        || (frame.uy - 1.0).abs() <= EPS && frame.ux.abs() <= EPS)
+    {
+        return physical_u;
+    }
+    let start = frame.project(beam.start, 0.0);
+    let end = frame.project(beam.end, 1.0);
+    if start.v.abs() > EPS || end.v.abs() > EPS {
+        return physical_u;
+    }
+    let Ok(Some(residue)) = crate::grid::joint_residue(course_index, run) else {
+        return physical_u;
+    };
+    nominal_axis_bounds(physical_u, (start.u.min(end.u), start.u.max(end.u)), residue as f64)
+}
+
+/// Общая нормализация уже закодированного припуска шипов источника.
+/// Все координаты в сотых мм; исходный запрос остаётся неизменным.
+pub(crate) fn nominal_axis_bounds(
+    physical_u: (f64, f64),
+    source_u: (f64, f64),
+    residue: f64,
+) -> (f64, f64) {
+    let on_half_module = |u: f64| {
+        let phase = (u - residue).rem_euclid(32_000.0);
+        phase <= EPS || 32_000.0 - phase <= EPS
+    };
+    let (mut low, mut high) = physical_u;
+    if (low - source_u.0).abs() <= EPS && on_half_module(low + 500.0) {
+        low += 500.0;
+    }
+    if (high - source_u.1).abs() <= EPS && on_half_module(high - 500.0) {
+        high -= 500.0;
+    }
+    if high - low <= EPS {
+        physical_u
+    } else {
+        (low, high)
     }
 }
 
@@ -569,50 +630,6 @@ fn positive_volume(points: &[Local3]) -> bool {
         > EPS * normal.norm()
 }
 
-#[derive(Clone, Copy)]
-struct Local2 {
-    u: f64,
-    z: f64,
-}
-
-fn clip2(poly: &[Local2], f: impl Fn(Local2) -> f64) -> Vec<Local2> {
-    let mut out = Vec::new();
-    if poly.is_empty() {
-        return out;
-    }
-    let mut a = *poly.last().unwrap();
-    let mut fa = f(a);
-    for &b in poly {
-        let fb = f(b);
-        if (fa >= -EPS) != (fb >= -EPS) {
-            let t = fa / (fa - fb);
-            out.push(Local2 {
-                u: a.u + (b.u - a.u) * t,
-                z: a.z + (b.z - a.z) * t,
-            });
-        }
-        if fb >= -EPS {
-            out.push(b);
-        }
-        a = b;
-        fa = fb;
-    }
-    out
-}
-
-fn polygon_area(poly: &[Local2]) -> f64 {
-    if poly.len() < 3 {
-        return 0.0;
-    }
-    let mut twice = 0.0;
-    for index in 0..poly.len() {
-        let a = poly[index];
-        let b = poly[(index + 1) % poly.len()];
-        twice += a.u * b.z - b.u * a.z;
-    }
-    twice.abs() / 2.0
-}
-
 fn beam_contains(frame: &Frame, beam: &RawBeam, point: Local3) -> bool {
     let (axis, height, width, axis_length) = beam_axes(beam).unwrap();
     let origin = Vec3 {
@@ -653,11 +670,15 @@ impl ConstraintEvidence {
                 frame,
                 source_u,
                 assembly_envelope,
+                perpendicular_cut,
             } => {
                 if assembly {
                     if let Some(envelope) = assembly_envelope {
                         return envelope.classify(solid);
                     }
+                }
+                if let Some(cut) = perpendicular_cut {
+                    return cut.classify(solid);
                 }
                 let u_low = solid.u.start.max(source_u.start) as f64;
                 let u_high = solid.u.end.min(source_u.end) as f64;
@@ -699,59 +720,15 @@ impl ConstraintEvidence {
                     Relation::Partial
                 }
             }
-            EvidenceGeometry::Opening { opening, frame } => {
-                let a = frame.project(opening.start, 0.0);
-                let b = frame.project(opening.end, 1.0);
-                let u_low = solid.u.start.max(self.coarse_interval.start) as f64;
-                let u_high = solid.u.end.min(self.coarse_interval.end) as f64;
-                let v_low = (solid.v.start as f64).max(-frame.half_thickness);
-                let v_high = (solid.v.end as f64).min(frame.half_thickness);
-                if u_high - u_low <= EPS || v_high - v_low <= EPS {
-                    return Relation::None;
-                }
-                let polygon = [
-                    Local2 {
-                        u: a.u,
-                        z: opening.bottom_start_mm * SCALE,
-                    },
-                    Local2 {
-                        u: a.u,
-                        z: opening.top_start_mm * SCALE,
-                    },
-                    Local2 {
-                        u: b.u,
-                        z: opening.top_end_mm * SCALE,
-                    },
-                    Local2 {
-                        u: b.u,
-                        z: opening.bottom_end_mm * SCALE,
-                    },
-                ];
-                let polygon = clip2(&polygon, |p| p.u - u_low);
-                let polygon = clip2(&polygon, |p| u_high - p.u);
-                let polygon = clip2(&polygon, |p| p.z - z_low);
-                let polygon = clip2(&polygon, |p| z_high - p.z);
-                if polygon_area(&polygon) <= EPS {
-                    return Relation::None;
-                }
-                let full = u_low <= solid.u.start as f64 + EPS
-                    && u_high >= solid.u.end as f64 - EPS
-                    && v_low <= solid.v.start as f64 + EPS
-                    && v_high >= solid.v.end as f64 - EPS
-                    && z_low <= solid.z.start as f64 + EPS
-                    && z_high >= solid.z.end as f64 - EPS
-                    && [solid.u.start, solid.u.end].into_iter().all(|u| {
-                        let t = (u as f64 - a.u) / (b.u - a.u);
-                        let bottom = z_at(opening.bottom_start_mm, opening.bottom_end_mm, t);
-                        let top = z_at(opening.top_start_mm, opening.top_end_mm, t);
-                        solid.z.start as f64 >= bottom - EPS && solid.z.end as f64 <= top + EPS
-                    });
-                if full {
-                    Relation::Full
-                } else {
-                    Relation::Partial
-                }
+            EvidenceGeometry::Opening { frame, .. } => LocalBox {
+                u_low: self.coarse_interval.start as f64,
+                u_high: self.coarse_interval.end as f64,
+                v_low: -frame.half_thickness,
+                v_high: frame.half_thickness,
+                z_low: self.course_z as f64,
+                z_high: (self.course_z + self.course_height) as f64,
             }
+            .classify(solid),
         }
     }
 }
@@ -766,8 +743,8 @@ impl Constraints {
         })
     }
 
-    /// Возвращает физические вычеты прямоугольных балок без расширения до венца.
-    /// Наклонная призма не подменяется своим ограничивающим параллелепипедом.
+    /// Возвращает вычеты балок без расширения до венца.
+    /// Поперечный проход вычитается перпендикулярно на всю толщину стены.
     pub fn beam_box_cuts(
         &self,
         run_id: &str,
@@ -794,12 +771,35 @@ impl Constraints {
                 beam,
                 frame,
                 source_u,
+                perpendicular_cut,
                 ..
             } = &evidence.geometry
             else {
                 continue;
             };
             if evidence.classify(solid, false) == Relation::None {
+                continue;
+            }
+            if let Some(cut) = perpendicular_cut {
+                let grid = |low, high, span: Interval| -> Result<Interval, ConstraintError> {
+                    Ok(Interval {
+                        start: quantize(low)
+                            .ok_or_else(|| error(&beam.id, "Вычет балки вне координатной сетки"))?
+                            .max(span.start),
+                        end: quantize(high)
+                            .ok_or_else(|| error(&beam.id, "Вычет балки вне координатной сетки"))?
+                            .min(span.end),
+                    })
+                };
+                let volume = SolidBox {
+                    u: grid(cut.u_low, cut.u_high, solid.u)?,
+                    v: grid(cut.v_low, cut.v_high, solid.v)?,
+                    z: grid(cut.z_low, cut.z_high, solid.z)?,
+                };
+                cuts.push(BeamBoxCut {
+                    beam_id: beam.id.clone(),
+                    volume,
+                });
                 continue;
             }
             let (axis, height, width, _) =
@@ -1064,13 +1064,18 @@ pub fn build_constraints_with_policy(
                 <= EPS
         {
             errors.push(error(&beam.id, "Некорректная геометрия балки"));
-        } else if beam_axes(beam).is_none()
-            || (beam.top_start_mm - beam.bottom_start_mm - beam.height_mm * beam.height_direction_z)
-                .abs()
-                > 0.01
-            || (beam.top_end_mm - beam.bottom_end_mm - beam.height_mm * beam.height_direction_z)
-                .abs()
-                > 0.01
+        } else if !beam_is_inclined(beam)
+            && (beam_axes(beam).is_none()
+                || (beam.top_start_mm
+                    - beam.bottom_start_mm
+                    - beam.height_mm * beam.height_direction_z)
+                    .abs()
+                    > 0.01
+                || (beam.top_end_mm
+                    - beam.bottom_end_mm
+                    - beam.height_mm * beam.height_direction_z)
+                    .abs()
+                    > 0.01)
         {
             errors.push(unsupported_beam(&beam.id));
         }
@@ -1080,6 +1085,42 @@ pub fn build_constraints_with_policy(
     }
     let course_height = course_height.unwrap();
     let support = support.unwrap();
+    // Keep the request untouched; course-expanded dimensions belong to constraints.
+    let expanded_openings: Vec<_> = openings
+        .iter()
+        .cloned()
+        .map(|mut opening| {
+            let z0 = topology.z0 as f64;
+            let step = course_height as f64;
+            let floor = |z: f64| (z0 + ((z * SCALE - z0) / step).floor() * step) / SCALE;
+            let ceil = |z: f64| (z0 + ((z * SCALE - z0) / step).ceil() * step) / SCALE;
+            opening.bottom_start_mm = floor(opening.bottom_start_mm);
+            opening.bottom_end_mm = floor(opening.bottom_end_mm);
+            opening.top_start_mm = ceil(opening.top_start_mm);
+            opening.top_end_mm = ceil(opening.top_end_mm);
+            opening
+        })
+        .collect();
+    for opening in &expanded_openings {
+        if [
+            opening.bottom_start_mm,
+            opening.bottom_end_mm,
+            opening.top_start_mm,
+            opening.top_end_mm,
+        ]
+        .iter()
+        .any(|z| quantize(z * SCALE).is_none())
+        {
+            errors.push(error(
+                &opening.id,
+                "Расширенные границы проёма вне координатной сетки",
+            ));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let openings = expanded_openings.as_slice();
     let mut result = Constraints {
         beam_cut_policy: policy,
         ..Constraints::default()
@@ -1173,62 +1214,29 @@ pub fn build_constraints_with_policy(
                 );
                 if let Some((from, to)) = bounds(&occupied) {
                     if let Some(coarse) = outer_interval(from, to, frame.length) {
-                        let full_poly = clip(&poly, |p| {
-                            course.z as f64
-                                - z_at(opening.bottom_start_mm, opening.bottom_end_mm, p.t)
+                        // Any intersected course is cleared through its full height.
+                        let interval = coarse;
+                        let coverage = MaskCoverage::FullSectionVoid;
+                        result.masks.push(Mask {
+                            run_id: run.id.clone(),
+                            course_index: course.index,
+                            interval,
+                            source: MaskSource::Opening(opening.id.clone()),
+                            coverage,
                         });
-                        let full_poly = clip(&full_poly, |p| {
-                            z_at(opening.top_start_mm, opening.top_end_mm, p.t)
-                                - (course.z + course_height) as f64
+                        result.evidence.push(ConstraintEvidence {
+                            run_id: run.id.clone(),
+                            course_index: course.index,
+                            source: MaskSource::Opening(opening.id.clone()),
+                            coarse_interval: interval,
+                            beam_projection: None,
+                            course_z: course.z,
+                            course_height,
+                            geometry: EvidenceGeometry::Opening {
+                                opening: opening.clone(),
+                                frame,
+                            },
                         });
-                        let full = bounds(&full_poly)
-                            .and_then(|(low, high)| inner_interval(low, high, frame.length));
-                        let mut pieces = Vec::with_capacity(3);
-                        if let Some(full) = full {
-                            if coarse.start < full.start {
-                                pieces.push((
-                                    Interval {
-                                        start: coarse.start,
-                                        end: full.start,
-                                    },
-                                    MaskCoverage::PartialDepth,
-                                ));
-                            }
-                            pieces.push((full, MaskCoverage::FullSectionVoid));
-                            if full.end < coarse.end {
-                                pieces.push((
-                                    Interval {
-                                        start: full.end,
-                                        end: coarse.end,
-                                    },
-                                    MaskCoverage::PartialDepth,
-                                ));
-                            }
-                        } else {
-                            pieces.push((coarse, MaskCoverage::PartialDepth));
-                        }
-                        for (interval, coverage) in pieces {
-                            result.masks.push(Mask {
-                                run_id: run.id.clone(),
-                                course_index: course.index,
-                                interval,
-                                source: MaskSource::Opening(opening.id.clone()),
-                                coverage,
-                            });
-                            result.evidence.push(ConstraintEvidence {
-                                run_id: run.id.clone(),
-                                course_index: course.index,
-                                source: MaskSource::Opening(opening.id.clone()),
-                                coarse_interval: interval,
-                                beam_projection: None,
-                                course_z: course.z,
-                                course_height,
-                                geometry: EvidenceGeometry::Opening {
-                                    opening: opening.clone(),
-                                    frame,
-                                },
-                            });
-                        }
                     }
                 }
                 let max_top = poly
@@ -1274,6 +1282,9 @@ pub fn build_constraints_with_policy(
             for beam in beams {
                 let dx = beam.end.x_mm - beam.start.x_mm;
                 let dy = beam.end.y_mm - beam.start.y_mm;
+                if beam_is_inclined(beam) {
+                    continue;
+                }
                 let axial = (dx * frame.ux + dy * frame.uy).abs();
                 let across = (-dx * frame.uy + dy * frame.ux).abs();
                 let orientation = if dx.hypot(dy) <= EPS {
@@ -1286,11 +1297,10 @@ pub fn build_constraints_with_policy(
                 let assembly_longitudinal = !policy.full_course_clearance
                     && policy.longitudinal_full_wall_thickness
                     && orientation == BeamOrientation::Longitudinal;
-                let clearance = if assembly_longitudinal || policy.full_course_clearance {
-                    policy.assembly_clearance_mm * SCALE
-                } else {
-                    0.0
-                };
+                let full_course_clearance =
+                    policy.full_course_clearance && orientation != BeamOrientation::Transverse;
+                // Размер разделяющего разреза совпадает с номинальным телом балки.
+                let clearance = 0.0;
                 let z_scan_clearance = if assembly_longitudinal {
                     clearance
                 } else {
@@ -1308,7 +1318,7 @@ pub fn build_constraints_with_policy(
                         course.z as f64 - z_scan_clearance,
                         (course.z + course_height) as f64 + z_scan_clearance,
                     );
-                    let Some((low_u, high_u)) = bounds3(&clipped) else {
+                    let Some((mut low_u, mut high_u)) = bounds3(&clipped) else {
                         continue;
                     };
                     let low_v = clipped.iter().map(|p| p.v).fold(f64::INFINITY, f64::min);
@@ -1325,30 +1335,58 @@ pub fn build_constraints_with_policy(
                     {
                         continue;
                     }
-                    let raw_assembly_envelope = if policy.full_course_clearance {
+                    let physical_u = (low_u, high_u);
+                    if policy.affine_world_joint_spike_compensation
+                        && orientation == BeamOrientation::Longitudinal
+                    {
+                        (low_u, high_u) =
+                            nominal_beam_body_u(beam, source_frame, run, course.index, physical_u);
+                    }
+                    // Для прохода через стену ширина не зависит от угла в плане:
+                    // прямоугольник центрируется в пересечении исходных осей.
+                    let perpendicular_cut = if orientation == BeamOrientation::Transverse {
+                        let start_u = (beam.start.x_mm * SCALE - source_frame.start.x as f64)
+                            * source_frame.ux
+                            + (beam.start.y_mm * SCALE - source_frame.start.y as f64)
+                                * source_frame.uy;
+                        let start_v = -(beam.start.x_mm * SCALE - source_frame.start.x as f64)
+                            * source_frame.uy
+                            + (beam.start.y_mm * SCALE - source_frame.start.y as f64)
+                                * source_frame.ux;
+                        let delta_u = dx * source_frame.ux + dy * source_frame.uy;
+                        let delta_v = -dx * source_frame.uy + dy * source_frame.ux;
+                        let center_u = start_u - start_v * delta_u / delta_v;
+                        low_u = (center_u - beam.width_mm * SCALE / 2.0).max(*from);
+                        high_u = (center_u + beam.width_mm * SCALE / 2.0).min(*to);
+                        if high_u - low_u <= EPS {
+                            continue;
+                        }
                         Some(LocalBox {
-                            u_low: (low_u - clearance).max(*from),
-                            u_high: (high_u + clearance).min(*to),
+                            u_low: low_u,
+                            u_high: high_u,
+                            v_low: -source_frame.half_thickness,
+                            v_high: source_frame.half_thickness,
+                            z_low: low_z,
+                            z_high: high_z,
+                        })
+                    } else {
+                        None
+                    };
+                    // Любое пересечение балки является разделяющим разрезом изделия,
+                    // а не несквозным карманом по толщине или высоте.
+                    let raw_assembly_envelope = {
+                        Some(LocalBox {
+                            u_low: low_u,
+                            u_high: high_u,
                             v_low: -source_frame.half_thickness,
                             v_high: source_frame.half_thickness,
                             z_low: course.z as f64,
                             z_high: (course.z + course_height) as f64,
                         })
-                    } else if assembly_longitudinal {
-                        Some(LocalBox {
-                            u_low: (low_u - clearance).max(*from),
-                            u_high: (high_u + clearance).min(*to),
-                            v_low: -source_frame.half_thickness,
-                            v_high: source_frame.half_thickness,
-                            z_low: (low_z - clearance).max(course.z as f64),
-                            z_high: (high_z + clearance).min((course.z + course_height) as f64),
-                        })
-                    } else {
-                        None
                     };
                     let raw_mask_low = raw_assembly_envelope.map_or(low_u, |shape| shape.u_low);
                     let raw_mask_high = raw_assembly_envelope.map_or(high_u, |shape| shape.u_high);
-                    let assembly_envelope = if policy.full_course_clearance {
+                    let assembly_envelope = if full_course_clearance {
                         raw_assembly_envelope.and_then(|shape| {
                             outer_interval(shape.u_low, shape.u_high, frame.length).map(|grid| {
                                 LocalBox {
@@ -1366,7 +1404,7 @@ pub fn build_constraints_with_policy(
                     }
                     let mask_low = assembly_envelope.map_or(low_u, |box_| box_.u_low);
                     let mask_high = assembly_envelope.map_or(high_u, |box_| box_.u_high);
-                    let coarse = if policy.full_course_clearance {
+                    let coarse = if full_course_clearance {
                         outer_interval(mask_low, mask_high, frame.length)
                     } else {
                         interval(mask_low, mask_high, frame.length)
@@ -1379,7 +1417,7 @@ pub fn build_constraints_with_policy(
                             source: MaskSource::Beam(beam.id.clone()),
                             coarse_interval: piece,
                             beam_projection: Some(BeamProjectionProvenance {
-                                physical_u: (low_u, high_u),
+                                physical_u,
                                 assembly_u_before_grid: (raw_mask_low, raw_mask_high),
                                 clearance_mm: clearance / SCALE,
                             }),
@@ -1393,9 +1431,10 @@ pub fn build_constraints_with_policy(
                                     end: *to as i64,
                                 },
                                 assembly_envelope,
+                                perpendicular_cut,
                             },
                         });
-                        if policy.full_course_clearance {
+                        if full_course_clearance {
                             let full = inner_interval(mask_low, mask_high, frame.length);
                             let mut push_piece = |span: Interval| {
                                 result.masks.push(Mask {
@@ -1429,19 +1468,15 @@ pub fn build_constraints_with_policy(
                 if parts.is_empty() {
                     continue;
                 }
-                if !policy.full_course_clearance {
-                    parts.sort_by_key(|part| part.start);
-                    let mut merged: Vec<Interval> = Vec::new();
-                    for part in parts {
-                        if let Some(last) = merged.last_mut() {
-                            if part.start <= last.end {
-                                last.end = last.end.max(part.end);
-                                continue;
-                            }
-                        }
-                        merged.push(part);
-                    }
-                    for interval in merged {
+                if !full_course_clearance {
+                    // Keep source boundaries: a merged mask can cross several evidence
+                    // boxes although each source clears the entire wall section.
+                    parts.sort_by_key(|part| (part.start, part.end));
+                    parts.dedup();
+                    // Для поперечных проходов границы источников также важны:
+                    // общий интервал может быть покрыт несколькими evidence,
+                    // тогда проверка одного evidence не доказывает FullVoid.
+                    for interval in parts {
                         result.masks.push(Mask {
                             run_id: run.id.clone(),
                             course_index: course.index,
@@ -1742,7 +1777,59 @@ mod tests {
     }
 
     #[test]
-    fn sloped_top_masks_only_part_of_upper_course() {
+    fn nonaligned_opening_expands_relative_to_building_z0_without_changing_input() {
+        let mut topology = topology();
+        topology.z0 = 5_000;
+        for course in &mut topology.courses {
+            course.z += 5_000;
+        }
+        let mut input = opening();
+        input.bottom_start_mm = 70.0;
+        input.bottom_end_mm = 70.0;
+        input.top_start_mm = 300.0;
+        input.top_end_mm = 300.0;
+        let result = build_constraints(&topology, &[input.clone()], &[], 200.0, 300.0).unwrap();
+        let courses: Vec<_> = result
+            .masks
+            .iter()
+            .map(|m| (m.course_index, m.coverage))
+            .collect();
+        assert_eq!(
+            courses,
+            vec![
+                (0, MaskCoverage::FullSectionVoid),
+                (1, MaskCoverage::FullSectionVoid)
+            ]
+        );
+        assert_eq!(input.bottom_start_mm, 70.0);
+        assert_eq!(input.top_start_mm, 300.0);
+        assert!(matches!(
+            result
+                .classify_box(
+                    "run",
+                    0,
+                    SolidBox {
+                        u: Interval {
+                            start: 110_000,
+                            end: 120_000
+                        },
+                        v: Interval {
+                            start: -10_000,
+                            end: 10_000
+                        },
+                        z: Interval {
+                            start: 5_000,
+                            end: 25_000
+                        },
+                    }
+                )
+                .unwrap(),
+            Exclusion::FullVoid { .. }
+        ));
+    }
+
+    #[test]
+    fn sloped_top_expands_to_courses_and_clears_their_height() {
         let mut opening = opening();
         opening.top_start_mm = 300.0;
         opening.top_end_mm = 500.0;
@@ -1750,7 +1837,7 @@ mod tests {
         assert!(result.masks.iter().any(|m| m.course_index == 2
             && m.interval
                 == Interval {
-                    start: 150_000,
+                    start: 100_000,
                     end: 200_000
                 }));
         assert_eq!(result.lintel_candidates[0].course_index, 3);
@@ -1762,27 +1849,18 @@ mod tests {
             .collect();
         assert_eq!(
             masks,
-            vec![
-                (
-                    Interval {
-                        start: 100_000,
-                        end: 150_000
-                    },
-                    MaskCoverage::PartialDepth
-                ),
-                (
-                    Interval {
-                        start: 150_000,
-                        end: 200_000
-                    },
-                    MaskCoverage::FullSectionVoid
-                ),
-            ]
+            vec![(
+                Interval {
+                    start: 100_000,
+                    end: 200_000
+                },
+                MaskCoverage::FullSectionVoid
+            )]
         );
     }
 
     #[test]
-    fn slanted_bottom_and_top_partition_full_center_with_exact_evidence() {
+    fn slanted_opening_clears_full_height_of_each_intersected_course() {
         let mut opening = opening();
         opening.bottom_end_mm = 300.0;
         opening.top_start_mm = 300.0;
@@ -1796,29 +1874,13 @@ mod tests {
             .collect();
         assert_eq!(
             masks,
-            vec![
-                (
-                    Interval {
-                        start: 100_000,
-                        end: 133_334
-                    },
-                    MaskCoverage::PartialDepth
-                ),
-                (
-                    Interval {
-                        start: 133_334,
-                        end: 166_666
-                    },
-                    MaskCoverage::FullSectionVoid
-                ),
-                (
-                    Interval {
-                        start: 166_666,
-                        end: 200_000
-                    },
-                    MaskCoverage::PartialDepth
-                ),
-            ]
+            vec![(
+                Interval {
+                    start: 100_000,
+                    end: 200_000
+                },
+                MaskCoverage::FullSectionVoid
+            )]
         );
         let full = SolidBox {
             u: Interval {
@@ -1852,7 +1914,7 @@ mod tests {
                     }
                 )
                 .unwrap(),
-            Exclusion::Partial { .. }
+            Exclusion::FullVoid { .. }
         ));
         assert!(result
             .evidence
@@ -1862,11 +1924,12 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_beam_height_direction_is_explicit_error() {
+    fn inclined_height_direction_is_ignored_without_geometry_error() {
         let mut beam = beam(raw(1000.0, 0.0), raw(2000.0, 0.0), 200.0);
         beam.height_direction_z = 0.8;
-        let errors = build_constraints(&topology(), &[], &[beam], 200.0, 300.0).unwrap_err();
-        assert_eq!(errors[0].kind, ConstraintErrorKind::UnsupportedBeamGeometry);
+        let result = build_constraints(&topology(), &[], &[beam], 200.0, 300.0).unwrap();
+        assert!(result.masks.is_empty());
+        assert!(result.evidence.is_empty());
     }
 
     #[test]
@@ -1898,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn inclined_axis_and_height_section_are_clipped_in_three_dimensions() {
+    fn inclined_axis_and_height_section_are_ignored() {
         let mut inclined = beam(raw(1000.0, 0.0), raw(2000.0, 0.0), 200.0);
         inclined.bottom_end_mm = 500.0;
         inclined.height_direction_x = -1.0 / 5.0_f64.sqrt();
@@ -1906,19 +1969,9 @@ mod tests {
         inclined.top_start_mm = inclined.height_mm * inclined.height_direction_z;
         inclined.top_end_mm = 500.0 + inclined.top_start_mm;
         let result = build_constraints(&topology(), &[], &[inclined], 200.0, 300.0).unwrap();
-        assert_eq!(
-            result.beam_classifications[0].orientation,
-            BeamOrientation::Longitudinal
-        );
-        assert!(result.masks.iter().any(|mask| mask.course_index == 0));
-        assert!(result.masks.iter().any(|mask| mask.course_index == 1));
-        assert!(result.masks.iter().any(|mask| mask.course_index == 2));
-        assert!(result.masks.iter().any(|mask| mask.course_index == 3));
-        assert!(result
-            .masks
-            .iter()
-            .filter(|mask| mask.course_index == 0)
-            .all(|mask| mask.interval.end < 200_000));
+        assert!(result.beam_classifications.is_empty());
+        assert!(result.masks.is_empty());
+        assert!(result.evidence.is_empty());
     }
 
     #[test]
@@ -1985,18 +2038,53 @@ mod tests {
                 .iter()
                 .filter(|mask| mask.course_index == 0)
                 .count(),
-            2
+            3
         );
-        assert!(result
+        let beam_masks: Vec<_> = result
             .masks
             .iter()
-            .any(|mask| mask.source == MaskSource::Beam("beam".into())
-                && mask.interval
-                    == Interval {
-                        start: 185_000,
-                        end: 215_000
-                    }));
+            .filter(|mask| mask.course_index == 0 && mask.source == MaskSource::Beam("beam".into()))
+            .collect();
+        assert_eq!(beam_masks.iter().map(|mask| mask.interval).collect::<Vec<_>>(),
+            vec![Interval {start:185_000,end:200_000}, Interval {start:200_000,end:215_000}]);
+        assert!(beam_masks.iter().all(|mask| mask.coverage == MaskCoverage::FullSectionVoid));
         assert!(result.masks.iter().all(|mask| mask.run_id == "run"));
+        let longitudinal = beam(raw(1500.0, 0.0), raw(2500.0, 0.0), 200.0);
+        let expanded = build_constraints_with_policy(
+            &topology,
+            &[],
+            &[longitudinal],
+            200.0,
+            300.0,
+            BeamCutPolicy {
+                longitudinal_full_wall_thickness: true,
+                ..BeamCutPolicy::default()
+            },
+        )
+        .unwrap();
+        let masks: Vec<_> = expanded
+            .masks
+            .iter()
+            .filter(|m| m.course_index == 0)
+            .collect();
+        assert_eq!(masks.len(), 2);
+        assert!(masks
+            .iter()
+            .all(|m| m.coverage == MaskCoverage::FullSectionVoid));
+        assert_eq!(
+            masks[0].interval,
+            Interval {
+                start: 150_000,
+                end: 200_000
+            }
+        );
+        assert_eq!(
+            masks[1].interval,
+            Interval {
+                start: 200_000,
+                end: 250_000
+            }
+        );
     }
 
     #[test]
@@ -2086,7 +2174,7 @@ mod tests {
             .iter()
             .find(|mask| mask.course_index == 0)
             .unwrap();
-        assert_eq!(mask.coverage, MaskCoverage::PartialDepth);
+        assert_eq!(mask.coverage, MaskCoverage::FullSectionVoid);
         let whole = SolidBox {
             u: Interval {
                 start: 120_000,
@@ -2146,7 +2234,7 @@ mod tests {
     }
 
     #[test]
-    fn transverse_pocket_keeps_twenty_mm_skin_and_exact_height() {
+    fn transverse_pocket_clears_wall_thickness_and_keeps_exact_height() {
         let mut topology = topology();
         topology.walls[0].thickness = 19_300;
         let mut transverse = beam(raw(1500.0, -800.0), raw(1500.0, 76.5), 160.0);
@@ -2182,7 +2270,7 @@ mod tests {
                     },
                     v: Interval {
                         start: -9_650,
-                        end: 7_650
+                        end: 9_650
                     },
                     z: Interval {
                         start: 3_000,
@@ -2191,8 +2279,8 @@ mod tests {
                 },
             }]
         );
-        assert_eq!(whole.v.end - cuts[0].volume.v.end, 2_000);
-        assert_eq!(
+        assert_eq!(whole.v.end, cuts[0].volume.v.end);
+        assert!(matches!(
             constraints
                 .classify_box(
                     "run",
@@ -2206,8 +2294,8 @@ mod tests {
                     }
                 )
                 .unwrap(),
-            Exclusion::None
-        );
+            Exclusion::Partial { .. }
+        ));
         assert_eq!(
             constraints
                 .classify_box(
@@ -2271,6 +2359,7 @@ mod tests {
                 longitudinal_full_wall_thickness: true,
                 full_course_clearance: false,
                 assembly_clearance_mm: 10.0,
+                ..BeamCutPolicy::default()
             },
         )
         .unwrap();
@@ -2282,11 +2371,11 @@ mod tests {
         assert_eq!(
             mask.interval,
             Interval {
-                start: 99_000,
-                end: 201_000
+                start: 100_000,
+                end: 200_000
             }
         );
-        assert_eq!(mask.coverage, MaskCoverage::PartialDepth);
+        assert_eq!(mask.coverage, MaskCoverage::FullSectionVoid);
         let inside = SolidBox {
             u: Interval {
                 start: 120_000,
@@ -2311,8 +2400,8 @@ mod tests {
         ));
         let added = SolidBox {
             u: Interval {
-                start: 99_100,
-                end: 99_900,
+                start: 100_100,
+                end: 100_900,
             },
             z: Interval {
                 start: 4_100,
@@ -2337,12 +2426,12 @@ mod tests {
         };
         assert_eq!(
             result.classify_assembly_box("run", 0, outside).unwrap(),
-            Exclusion::None
+            Exclusion::FullVoid { source_ids: vec!["beam:beam".into()] }
         );
     }
 
     #[test]
-    fn assembly_clearance_reaches_next_course_without_physical_collision() {
+    fn nominal_beam_does_not_reserve_a_nonintersecting_next_course() {
         let mut near_top = beam(raw(1000.0, 0.0), raw(2000.0, 0.0), 160.0);
         near_top.bottom_start_mm = 95.0;
         near_top.bottom_end_mm = 95.0;
@@ -2359,6 +2448,7 @@ mod tests {
                 longitudinal_full_wall_thickness: true,
                 full_course_clearance: false,
                 assembly_clearance_mm: 10.0,
+                ..BeamCutPolicy::default()
             },
         )
         .unwrap();
@@ -2380,14 +2470,8 @@ mod tests {
             result.classify_box("run", 1, above).unwrap(),
             Exclusion::None
         );
-        assert!(matches!(
-            result.classify_assembly_box("run", 1, above).unwrap(),
-            Exclusion::FullVoid { .. }
-        ));
-        assert!(result
-            .masks
-            .iter()
-            .any(|mask| mask.course_index == 1 && mask.coverage == MaskCoverage::PartialDepth));
+        assert_eq!(result.classify_assembly_box("run", 1, above).unwrap(), Exclusion::None);
+        assert!(!result.masks.iter().any(|mask| mask.course_index == 1));
     }
 
     #[test]
@@ -2411,6 +2495,7 @@ mod tests {
                 longitudinal_full_wall_thickness: false,
                 full_course_clearance: true,
                 assembly_clearance_mm: 0.0,
+                ..BeamCutPolicy::default()
             },
         )
         .unwrap();
@@ -2426,7 +2511,7 @@ mod tests {
     }
 
     #[test]
-    fn sloped_beam_gets_independent_full_course_intervals() {
+    fn sloped_beam_is_ignored_even_with_full_course_clearance() {
         let mut sloped = beam(raw(1000.0, 0.0), raw(2000.0, 0.0), 160.0);
         sloped.bottom_end_mm = 400.0;
         sloped.height_direction_x = -2.0 / 29.0_f64.sqrt();
@@ -2441,37 +2526,321 @@ mod tests {
             200.0,
             300.0,
             BeamCutPolicy {
-                longitudinal_full_wall_thickness: false,
                 full_course_clearance: true,
-                assembly_clearance_mm: 0.0,
+                assembly_clearance_mm: 5.0,
+                ..BeamCutPolicy::default()
             },
         )
         .unwrap();
-        let first = result
-            .masks
-            .iter()
-            .find(|mask| mask.course_index == 0 && mask.coverage == MaskCoverage::FullSectionVoid)
+        assert!(result.masks.is_empty());
+        assert!(result.evidence.is_empty());
+        assert!(result.beam_classifications.is_empty());
+    }
+
+    #[test]
+    fn transverse_diagonal_uses_width_height_and_no_lintel_or_clearance() {
+        let mut crossing = beam(raw(1200.0, -600.0), raw(1800.0, 600.0), 160.0);
+        crossing.bottom_start_mm = 50.0;
+        crossing.bottom_end_mm = 50.0;
+        crossing.top_start_mm = 150.0;
+        crossing.top_end_mm = 150.0;
+        crossing.height_mm = 100.0;
+        let constraints = build_constraints_with_policy(
+            &topology(),
+            &[],
+            &[crossing],
+            200.0,
+            300.0,
+            BeamCutPolicy {
+                full_course_clearance: true,
+                assembly_clearance_mm: 5.0,
+                ..BeamCutPolicy::default()
+            },
+        )
+        .unwrap();
+        let solid = SolidBox {
+            u: Interval {
+                start: 100_000,
+                end: 200_000,
+            },
+            v: Interval {
+                start: -10_000,
+                end: 10_000,
+            },
+            z: Interval {
+                start: 0,
+                end: 20_000,
+            },
+        };
+        assert_eq!(
+            constraints.beam_box_cuts("run", 0, solid).unwrap(),
+            vec![BeamBoxCut {
+                beam_id: "beam".into(),
+                volume: SolidBox {
+                    u: Interval {
+                        start: 142_000,
+                        end: 158_000
+                    },
+                    v: solid.v,
+                    z: Interval {
+                        start: 5_000,
+                        end: 15_000
+                    },
+                },
+            }]
+        );
+        assert!(constraints.lintel_candidates.is_empty());
+        assert!(constraints.masks.iter().all(|mask| mask.course_index == 0));
+        let above = SolidBox {
+            u: Interval { start: 142_000, end: 158_000 },
+            z: Interval {
+                start: 15_000,
+                end: 20_000,
+            },
+            ..solid
+        };
+        assert_eq!(
+            constraints.classify_assembly_box("run", 0, above).unwrap(),
+            Exclusion::FullVoid { source_ids: vec!["beam:beam".into()] }
+        );
+        let beside = SolidBox {
+            u: Interval {
+                start: 158_000,
+                end: 158_500,
+            },
+            ..solid
+        };
+        assert_eq!(
+            constraints.classify_box("run", 0, beside).unwrap(),
+            Exclusion::None
+        );
+    }
+
+    #[test]
+    fn mirrored_vertical_height_direction_keeps_the_same_physical_beam_volume() {
+        for (start, end) in [
+            (raw(1000.0, 0.0), raw(2000.0, 0.0)),
+            (raw(1500.0, -400.0), raw(1500.0, 400.0)),
+        ] {
+            let positive = beam(start, end, 160.0);
+            let negative = RawBeam {
+                bottom_start_mm: 200.0,
+                bottom_end_mm: 200.0,
+                top_start_mm: 0.0,
+                top_end_mm: 0.0,
+                height_direction_z: -1.0,
+                ..positive.clone()
+            };
+            let upward = build_constraints(&topology(), &[], &[positive], 200.0, 300.0).unwrap();
+            let downward = build_constraints(&topology(), &[], &[negative], 200.0, 300.0).unwrap();
+            assert_eq!(upward.masks, downward.masks);
+            assert_eq!(upward.beam_classifications, downward.beam_classifications);
+            let solid = SolidBox {
+                u: Interval {
+                    start: 100_000,
+                    end: 200_000,
+                },
+                v: Interval {
+                    start: -10_000,
+                    end: 10_000,
+                },
+                z: Interval {
+                    start: 0,
+                    end: 20_000,
+                },
+            };
+            let expected = upward.beam_box_cuts("run", 0, solid).unwrap();
+            assert!(!expected.is_empty());
+            assert_eq!(expected, downward.beam_box_cuts("run", 0, solid).unwrap());
+            assert_eq!(
+                upward.classify_box("run", 0, solid).unwrap(),
+                downward.classify_box("run", 0, solid).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn horizontal_beam_with_rolled_height_is_ignored() {
+        let mut rolled = beam(raw(1000.0, 0.0), raw(2000.0, 0.0), 160.0);
+        rolled.height_direction_y = 0.6;
+        rolled.height_direction_z = 0.8;
+        rolled.top_start_mm = 160.0;
+        rolled.top_end_mm = 160.0;
+        let result = build_constraints(&topology(), &[], &[rolled], 200.0, 300.0).unwrap();
+        assert!(result.masks.is_empty());
+        assert!(result.evidence.is_empty());
+    }
+
+    #[test]
+    fn real_b09_and_reverse_b27_keep_nominal_body_and_physical_endpoints() {
+        for (y, start, end, expected) in [
+            (
+                9920.0,
+                -896.5,
+                3205.0,
+                Interval {
+                    start: 0,
+                    end: 320_000,
+                },
+            ),
+            (
+                320.0,
+                12485.0,
+                10235.0,
+                Interval {
+                    start: 1_024_000,
+                    end: 1_248_000,
+                },
+            ),
+        ] {
+            let mut topology = topology();
+            topology.walls[0].start.y = (y * SCALE) as i64;
+            topology.walls[0].end = point(1_600_000, (y * SCALE) as i64);
+            for course in &mut topology.courses {
+                let run = &mut course.runs[0];
+                run.start = topology.walls[0].start;
+                run.end = topology.walls[0].end;
+                run.length = 1_600_000;
+                run.sources[0].start = run.start;
+                run.sources[0].end = run.end;
+                run.sources[0].end_offset = run.length;
+            }
+            let source = beam(raw(start, y), raw(end, y), 160.0);
+            let policy = BeamCutPolicy {
+                longitudinal_full_wall_thickness: true,
+                affine_world_joint_spike_compensation: true,
+                ..BeamCutPolicy::default()
+            };
+            let result = build_constraints_with_policy(
+                &topology,
+                &[],
+                &[source.clone()],
+                200.0,
+                300.0,
+                policy,
+            )
             .unwrap();
-        let last = result
-            .masks
-            .iter()
-            .find(|mask| mask.course_index == 2 && mask.coverage == MaskCoverage::FullSectionVoid)
+            assert_eq!(result.masks[0].interval, expected);
+            let projection = result.evidence[0].beam_projection.unwrap();
+            assert_eq!(
+                projection.physical_u,
+                (start.min(end).max(0.0) * SCALE, start.max(end) * SCALE)
+            );
+            assert_eq!(
+                projection.assembly_u_before_grid,
+                (expected.start as f64, expected.end as f64)
+            );
+            let adjacent = SolidBox {
+                u: Interval {
+                    start: expected.end,
+                    end: expected.end + 32_000,
+                },
+                v: Interval {
+                    start: -10_000,
+                    end: 10_000,
+                },
+                z: Interval {
+                    start: 0,
+                    end: 20_000,
+                },
+            };
+            assert_eq!(
+                result.classify_assembly_box("run", 0, adjacent).unwrap(),
+                Exclusion::None
+            );
+            let without_policy = build_constraints_with_policy(
+                &topology,
+                &[],
+                &[source],
+                200.0,
+                300.0,
+                BeamCutPolicy {
+                    affine_world_joint_spike_compensation: false,
+                    ..policy
+                },
+            )
             .unwrap();
-        assert!(first.interval.end < last.interval.start);
-        assert!(result
-            .masks
-            .iter()
-            .filter(|mask| mask.course_index == 0)
-            .all(|mask| mask.coverage == MaskCoverage::FullSectionVoid));
-        let original = result
-            .evidence
-            .iter()
-            .find(|item| item.course_index == 0)
-            .unwrap()
-            .beam_projection
+            assert_eq!(
+                without_policy.masks[0].interval.end,
+                (start.max(end) * SCALE) as i64
+            );
+        }
+    }
+
+    #[test]
+    fn compensated_endpoint_guard_preserves_off_grid_and_wall_clip_boundaries() {
+        let run = WallRun {
+            id: "run".into(),
+            start: point(0, 992_000),
+            end: point(1_600_000, 992_000),
+            length: 1_600_000,
+            sources: vec![],
+        };
+        let frame = Frame::new(&run, 19_300).unwrap();
+        for end in [3205.01, 3204.99, 3200.0, 3206.0] {
+            let source = beam(raw(-896.5, 9920.0), raw(end, 9920.0), 160.0);
+            let physical = (0.0, end * SCALE);
+            assert_eq!(
+                nominal_beam_body_u(&source, &frame, &run, 0, physical),
+                physical
+            );
+        }
+        let source = beam(raw(-896.5, 9920.0), raw(4000.0, 9920.0), 160.0);
+        let clipped = (0.0, 320_500.0);
+        assert_eq!(
+            nominal_beam_body_u(&source, &frame, &run, 0, clipped),
+            clipped
+        );
+        let off_axis = beam(raw(-896.5, 9920.01), raw(3205.0, 9920.01), 160.0);
+        assert_eq!(
+            nominal_beam_body_u(&off_axis, &frame, &run, 0, clipped),
+            clipped
+        );
+    }
+
+    #[test]
+    fn longitudinal_clearance_does_not_shorten_adjacent_body() {
+        for full_course_clearance in [false, true] {
+            let result = build_constraints_with_policy(
+                &topology(),
+                &[],
+                &[beam(raw(1280.0, 0.0), raw(1920.0, 0.0), 160.0)],
+                200.0,
+                300.0,
+                BeamCutPolicy {
+                    longitudinal_full_wall_thickness: true,
+                    full_course_clearance,
+                    assembly_clearance_mm: 5.0,
+                    ..BeamCutPolicy::default()
+                },
+            )
             .unwrap();
-        assert!(original.assembly_u_before_grid.0 > first.interval.start as f64);
-        assert_eq!(first.source, MaskSource::Beam("beam".into()));
+            assert_eq!(
+                result.masks[0].interval,
+                Interval {
+                    start: 128_000,
+                    end: 192_000
+                }
+            );
+            let adjacent = SolidBox {
+                u: Interval {
+                    start: 96_000,
+                    end: 128_000,
+                },
+                v: Interval {
+                    start: -10_000,
+                    end: 10_000,
+                },
+                z: Interval {
+                    start: 0,
+                    end: 20_000,
+                },
+            };
+            assert_eq!(
+                result.classify_assembly_box("run", 0, adjacent).unwrap(),
+                Exclusion::None
+            );
+        }
     }
 
     #[test]
@@ -2480,6 +2849,7 @@ mod tests {
             longitudinal_full_wall_thickness: false,
             full_course_clearance: true,
             assembly_clearance_mm: 0.0,
+            ..BeamCutPolicy::default()
         };
         let positive = beam(raw(1000.001, 0.0), raw(2000.001, 0.0), 160.0);
         let result =

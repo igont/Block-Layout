@@ -114,17 +114,18 @@ fn run() -> Result<bool, String> {
         return Ok(true);
     }
     let geometry_started = std::time::Instant::now();
-    let materialized = match fb_layout::materialize::materialize(&request, &candidate.blocks) {
-        Ok(v) => v,
-        Err(e) => {
-            candidate.diagnostics.push(e);
-            publish(
-                &result_path,
-                &exchange::failure_result(&standard, &candidate.diagnostics),
-            )?;
-            return Ok(false);
-        }
-    };
+    let materialized =
+        match fb_layout::materialize::materialize(&request, &candidate.blocks, &profile) {
+            Ok(v) => v,
+            Err(e) => {
+                candidate.diagnostics.push(e);
+                publish(
+                    &result_path,
+                    &exchange::failure_result(&standard, &candidate.diagnostics),
+                )?;
+                return Ok(false);
+            }
+        };
     candidate.diagnostics.extend(materialized.diagnostics);
     let geometry_ms = geometry_started.elapsed().as_millis();
     if let Some(path) = optional_argument("--physical") {

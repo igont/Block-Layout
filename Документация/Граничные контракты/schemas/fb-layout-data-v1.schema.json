@@ -196,23 +196,35 @@
       "properties": {"rule_id": {"$ref": "#/$defs/id"}, "component_ids": {"$ref": "#/$defs/ids"}}
     },
     "block": {
-      "type": "object", "additionalProperties": false,
+      "type": "object",
+      "additionalProperties": false,
       "required": ["id", "source_ids", "wall_ids", "course_index", "product", "placement", "stock_shape", "cuts", "spikes_removed"],
       "properties": {
-        "id": {"$ref": "#/$defs/id"}, "source_ids": {"$ref": "#/$defs/ids"}, "wall_ids": {"$ref": "#/$defs/ids"},
-        "course_index": {"type": "integer"}, "product": {"$ref": "#/$defs/product"}, "placement": {"$ref": "#/$defs/frame"},
-        "stock_shape": {"$ref": "#/$defs/shape"}, "cuts": {"type": "array", "items": {"$ref": "#/$defs/cut"}},
-        "special_origin": {"$ref": "#/$defs/specialOrigin"}, "insu": {"type": "boolean"},
-        "spikes_removed": {
-          "type": "object", "additionalProperties": false, "required": ["left", "right"],
-          "properties": {"left": {"type": "boolean"}, "right": {"type": "boolean"}}
-        }
+        "id": {"$ref": "#/$defs/id"},
+        "source_ids": {"$ref": "#/$defs/ids"},
+        "wall_ids": {"$ref": "#/$defs/ids"},
+        "course_index": {"type": "integer"},
+        "product": {"$ref": "#/$defs/product"},
+        "placement": {"$ref": "#/$defs/frame"},
+        "stock_shape": {"$ref": "#/$defs/shape"},
+        "cuts": {"type": "array", "items": {"$ref": "#/$defs/cut"}},
+        "special_origin": {"$ref": "#/$defs/specialOrigin"},
+        "insu": {"type": "boolean"},
+        "spikes_removed": {"type": "object", "additionalProperties": false, "required": ["left", "right"], "properties": {"left": {"type": "boolean"}, "right": {"type": "boolean"}}},
+        "natural_end_left": {"type": "boolean", "default": true},
+        "natural_end_right": {"type": "boolean", "default": true}
       },
-      "allOf": [{
-        "if": {"properties": {"product": {"properties": {"category": {"const": "special"}}}}},
-        "then": {"required": ["special_origin"]},
-        "else": {"not": {"required": ["special_origin"]}}
-      }]
+      "allOf": [
+        {"if": {"properties": {"product": {"properties": {"category": {"const": "special"}}}}}, "then": {"required": ["special_origin"]}, "else": {"not": {"required": ["special_origin"]}}},
+        {
+          "if": {"required": ["natural_end_left"], "properties": {"natural_end_left": {"const": false}}},
+          "then": {"properties": {"spikes_removed": {"properties": {"left": {"const": true}}}}}
+        },
+        {
+          "if": {"required": ["natural_end_right"], "properties": {"natural_end_right": {"const": false}}},
+          "then": {"properties": {"spikes_removed": {"properties": {"right": {"const": true}}}}}
+        }
+      ]
     },
     "beamAdjustment": {
       "type": "object", "additionalProperties": false, "required": ["beam_id", "side", "amount_mm", "rule_id", "source_ids"],

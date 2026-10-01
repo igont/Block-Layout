@@ -16,7 +16,8 @@
     "catalog": {"$ref": "#/$defs/versionedRef"},
     "scope": {"$ref": "#/$defs/scope"},
     "blocks": {"type": "array", "items": {"$ref": "#/$defs/block"}},
-    "warnings": {"type": "array", "items": {"$ref": "#/$defs/diagnostic"}}
+    "warnings": {"type": "array", "items": {"$ref": "#/$defs/diagnostic"}},
+    "beam_adjustments": {"type": "array", "maxItems": 0}
   },
   "$defs": {
     "id": {"type": "string", "minLength": 1},
@@ -50,21 +51,74 @@
     "trim": {
       "oneOf": [
         {"type": "object", "additionalProperties": false, "required": ["description"], "properties": {"description": {"$ref": "#/$defs/id"}, "side": {"enum": ["left", "right"]}}},
-        {"type": "object", "additionalProperties": false, "required": ["kind", "source_wall_id"], "properties": {"kind": {"const": "wall_boundary"}, "source_wall_id": {"$ref": "#/$defs/id"}}},
-        {"type": "object", "additionalProperties": false, "required": ["kind", "source_opening_id"], "properties": {"kind": {"const": "opening_volume"}, "source_opening_id": {"$ref": "#/$defs/id"}}},
-        {"type": "object", "additionalProperties": false, "required": ["kind", "source_beam_id"], "properties": {"kind": {"const": "beam_volume"}, "source_beam_id": {"$ref": "#/$defs/id"}}},
-        {"type": "object", "additionalProperties": false, "required": ["kind", "description", "source_run_id"], "properties": {"kind": {"const": "arm_end_trim"}, "description": {"$ref": "#/$defs/id"}, "source_run_id": {"$ref": "#/$defs/id"}, "start_mm": {"$ref": "#/$defs/vec3"}, "end_mm": {"$ref": "#/$defs/vec3"}, "length_mm": {"$ref": "#/$defs/positive"}}}
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "source_wall_id"],
+          "properties": {"kind": {"const": "wall_boundary"}, "source_wall_id": {"$ref": "#/$defs/id"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "description", "source_run_id"],
+          "properties": {
+            "kind": {"const": "arm_end_trim"},
+            "description": {"$ref": "#/$defs/id"},
+            "source_run_id": {"$ref": "#/$defs/id"},
+            "start_mm": {"$ref": "#/$defs/vec3"},
+            "end_mm": {"$ref": "#/$defs/vec3"},
+            "length_mm": {"$ref": "#/$defs/positive"}
+          }
+        }
       ]
     },
     "block": {
-      "type": "object", "additionalProperties": false,
-      "required": ["id", "code1", "code2", "product_type", "placement", "length_mm", "nominal_length_mm", "width_mm", "height_mm", "course_index", "source_ids", "wall_ids", "hide_spikes_left", "hide_spikes_right", "node_cuts", "trims"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "code1",
+        "code2",
+        "product_type",
+        "placement",
+        "length_mm",
+        "nominal_length_mm",
+        "width_mm",
+        "height_mm",
+        "course_index",
+        "source_ids",
+        "wall_ids",
+        "hide_spikes_left",
+        "hide_spikes_right",
+        "node_cuts",
+        "trims",
+        "natural_end_left",
+        "natural_end_right"
+      ],
       "properties": {
-        "id": {"$ref": "#/$defs/id"}, "code1": {"$ref": "#/$defs/code"}, "code2": {"$ref": "#/$defs/code"}, "product_type": {"$ref": "#/$defs/id"},
-        "placement": {"$ref": "#/$defs/frame"}, "length_mm": {"$ref": "#/$defs/positive"}, "nominal_length_mm": {"$ref": "#/$defs/positive"}, "width_mm": {"$ref": "#/$defs/positive"}, "height_mm": {"$ref": "#/$defs/positive"},
-        "course_index": {"type": "integer"}, "source_ids": {"$ref": "#/$defs/ids"}, "wall_ids": {"$ref": "#/$defs/ids"}, "hide_spikes_left": {"type": "boolean"}, "hide_spikes_right": {"type": "boolean"},
-        "node_cuts": {"type": "array", "items": {"$ref": "#/$defs/nodeCut"}}, "trims": {"type": "array", "items": {"$ref": "#/$defs/trim"}}
-      }
+        "id": {"$ref": "#/$defs/id"},
+        "code1": {"$ref": "#/$defs/code"},
+        "code2": {"$ref": "#/$defs/code"},
+        "product_type": {"$ref": "#/$defs/id"},
+        "placement": {"$ref": "#/$defs/frame"},
+        "length_mm": {"$ref": "#/$defs/positive"},
+        "nominal_length_mm": {"$ref": "#/$defs/positive"},
+        "width_mm": {"$ref": "#/$defs/positive"},
+        "height_mm": {"$ref": "#/$defs/positive"},
+        "course_index": {"type": "integer"},
+        "source_ids": {"$ref": "#/$defs/ids"},
+        "wall_ids": {"$ref": "#/$defs/ids"},
+        "hide_spikes_left": {"type": "boolean"},
+        "hide_spikes_right": {"type": "boolean"},
+        "node_cuts": {"type": "array", "items": {"$ref": "#/$defs/nodeCut"}},
+        "trims": {"type": "array", "items": {"$ref": "#/$defs/trim"}},
+        "natural_end_left": {"type": "boolean", "default": true},
+        "natural_end_right": {"type": "boolean", "default": true}
+      },
+      "allOf": [
+        {"if": {"required": ["natural_end_left"], "properties": {"natural_end_left": {"const": false}}}, "then": {"properties": {"hide_spikes_left": {"const": true}}}},
+        {"if": {"required": ["natural_end_right"], "properties": {"natural_end_right": {"const": false}}}, "then": {"properties": {"hide_spikes_right": {"const": true}}}}
+      ]
     },
     "diagnostic": {
       "type": "object", "additionalProperties": false, "required": ["code", "message", "source_ids"],

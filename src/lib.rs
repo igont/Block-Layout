@@ -10,6 +10,7 @@ pub mod materialize;
 pub mod node_assembly;
 pub mod node_geometry;
 pub mod node_shapes;
+pub mod offcut_plan;
 pub mod product_catalog;
 pub mod production_plan;
 pub mod solid_geometry;
@@ -31,6 +32,26 @@ pub struct CandidateResult {
 }
 
 /// Полный исследовательский план; замечания не делают его производственным результатом.
+fn source_beam_spans_opening(o: &RawOpening, b: &RawBeam, support_mm: f64) -> bool {
+    let dx = o.end.x_mm - o.start.x_mm;
+    let dy = o.end.y_mm - o.start.y_mm;
+    let width = dx.hypot(dy);
+    if width <= 0.0 || (o.top_start_mm - o.top_end_mm).abs() > 0.01 {
+        return false;
+    }
+    let (ux, uy) = (dx / width, dy / width);
+    let start = (b.start.x_mm - o.start.x_mm) * ux + (b.start.y_mm - o.start.y_mm) * uy;
+    let end = (b.end.x_mm - o.start.x_mm) * ux + (b.end.y_mm - o.start.y_mm) * uy;
+    (b.height_mm - 315.0).abs() < 0.01
+        && (b.bottom_start_mm - o.top_start_mm).abs() < 0.01
+        && (b.bottom_end_mm - o.top_end_mm).abs() < 0.01
+        && [b.start, b.end]
+            .iter()
+            .all(|p| ((p.x_mm - o.start.x_mm) * uy - (p.y_mm - o.start.y_mm) * ux).abs() < 0.01)
+        && start.min(end) <= -support_mm + 0.01
+        && start.max(end) >= width + support_mm - 0.01
+}
+
 pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateResult {
     let started = Instant::now();
     let failure = |diagnostics: Vec<ApiFailure>| CandidateResult {
@@ -110,6 +131,8 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
             longitudinal_full_wall_thickness: profile.longitudinal_full_wall_thickness,
             assembly_clearance_mm: profile.assembly_clearance_mm,
             full_course_clearance: profile.full_course_clearance,
+            affine_world_joint_spike_compensation: profile.world_joint_policy.as_deref()
+                == Some("affine_checkerboard_v1"),
         },
     ) {
         Ok(value) => value,
@@ -134,8 +157,23 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
             )
         }
     };
-    // Only a proven full-section obstacle splits the one-dimensional course.
-    // Partial pockets stay inside a physical block and are subtracted later.
+    let beam_spanned: Vec<_> = openings
+        .iter()
+        .filter(|o| (o.end.x_mm - o.start.x_mm).hypot(o.end.y_mm - o.start.y_mm) <= 1500.0)
+        .filter_map(|o| {
+            beams
+                .iter()
+                .find(|b| source_beam_spans_opening(o, b, profile.lintel_support_mm))
+                .map(|b| (o.id.clone(), b.id.clone()))
+        })
+        .collect();
+    constraints.lintel_candidates.retain(|candidate| {
+        !beam_spanned
+            .iter()
+            .any(|(id, _)| *id == candidate.opening_id)
+    });
+    // Разделяющая маска балки занимает всю толщину и высоту детали.
+    // Маски источников проверяются отдельно, до окончательного разделения.
     for index in 0..constraints.masks.len() {
         let mask = constraints.masks[index].clone();
         let Some(course) = topology
@@ -234,7 +272,16 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
     };
     let mut diagnostics: Vec<ApiFailure> =
         layout.diagnostics.into_iter().map(layout_failure).collect();
+    for (opening_id, beam_id) in &beam_spanned {
+        let mut note = ApiFailure::new("OPENING_SPANNED_BY_SOURCE_BEAM",
+            "Исходная балка высотой 315 мм перекрывает проём с опиранием с обеих сторон и заменяет обычные перемычки", None);
+        note.source_ids = vec![opening_id.clone(), beam_id.clone()];
+        diagnostics.push(note);
+    }
     for opening in &openings {
+        if beam_spanned.iter().any(|(id, _)| *id == opening.id) {
+            continue;
+        }
         let width =
             (opening.end.x_mm - opening.start.x_mm).hypot(opening.end.y_mm - opening.start.y_mm);
         if width > 1500.0 || (opening.top_start_mm - opening.top_end_mm).abs() > 0.01 {
@@ -285,21 +332,9 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
             if width <= 1500.0 {
                 return false;
             }
-            let (ux, uy) = (dx / width, dy / width);
-            let top = o.top_start_mm.max(o.top_end_mm);
-            !beams.iter().any(|b| {
-                let start = (b.start.x_mm - o.start.x_mm) * ux + (b.start.y_mm - o.start.y_mm) * uy;
-                let end = (b.end.x_mm - o.start.x_mm) * ux + (b.end.y_mm - o.start.y_mm) * uy;
-                let collinear = [b.start, b.end].iter().all(|p| {
-                    ((p.x_mm - o.start.x_mm) * uy - (p.y_mm - o.start.y_mm) * ux).abs() < 0.01
-                });
-                (b.height_mm - 315.0).abs() < 0.01
-                    && (b.bottom_start_mm - top).abs() < 0.01
-                    && (b.bottom_end_mm - top).abs() < 0.01
-                    && collinear
-                    && start.min(end) <= -profile.lintel_support_mm + 0.01
-                    && start.max(end) >= width + profile.lintel_support_mm - 0.01
-            })
+            !beams
+                .iter()
+                .any(|b| source_beam_spans_opening(o, b, profile.lintel_support_mm))
         })
         .map(|o| o.id.clone())
         .collect();
@@ -334,7 +369,10 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
         diagnostics.push(note);
     }
     CandidateResult {
-        blocks: layout.layout.blocks,
+        blocks: match layout::finalize_parts(request, profile, &layout.layout.blocks) {
+            Ok(blocks) => blocks,
+            Err(error) => return failure(vec![error]),
+        },
         diagnostics,
         elapsed_ms: started.elapsed().as_millis(),
     }
@@ -388,19 +426,19 @@ mod opening_tests {
     }
 
     #[test]
-    fn partial_height_preserves_block_and_declares_original_volume_for_sup() {
+    fn nonaligned_opening_bottom_clears_whole_course_and_keeps_source() {
         let profile: Profile =
             serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
         let result = inspect_request(&request(20.0), &profile);
         assert!(!result.blocks.is_empty(), "{:?}", result.diagnostics);
         assert_eq!(
             result.blocks.iter().map(|b| b.length_centimm).sum::<i64>(),
-            128_000
+            96_000
         );
         assert!(result
             .blocks
             .iter()
-            .any(|b| b.cuts.contains(&"opening_volume:opening".into())));
+            .all(|b| !b.cuts.iter().any(|c| c.starts_with("opening_volume:"))));
         assert!(result
             .blocks
             .iter()
@@ -408,7 +446,7 @@ mod opening_tests {
     }
 
     #[test]
-    fn wide_opening_requires_actual_315_beam_and_keeps_its_partial_cut() {
+    fn longitudinal_160_beam_clears_full_193_wall_thickness_for_five_courses() {
         let profile: Profile =
             serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
         let mut r = request(0.0);
@@ -437,24 +475,89 @@ mod opening_tests {
             .diagnostics
             .iter()
             .any(|d| d.code == "OPENING_SUPPORT_BEAM_REQUIRED"));
-        assert!(present
-            .blocks
+        for course in 1..=5 {
+            let blocks: Vec<_> = present
+                .blocks
+                .iter()
+                .filter(|b| b.course_index == course)
+                .collect();
+            assert_eq!(blocks.iter().map(|b| b.length_centimm).sum::<i64>(), 96_000);
+            assert!(blocks
+                .iter()
+                .all(|b| b.end.x <= 32_000 || b.start.x >= 256_000));
+            assert!(blocks
+                .iter()
+                .all(|b| !b.cuts.iter().any(|c| c.starts_with("beam_volume:"))));
+            assert!(blocks
+                .iter()
+                .filter(|b| b.end.x == 32_000)
+                .all(|b| b.hide_spikes_right));
+            assert!(blocks
+                .iter()
+                .filter(|b| b.start.x == 256_000)
+                .all(|b| b.hide_spikes_left));
+        }
+        let mut narrow = r.clone();
+        narrow.opening_volumes[0].end_xmm = 1600.0;
+        let covered = inspect_request(&narrow, &profile);
+        assert!(covered.blocks.iter().all(|b| !b.is_bridge));
+        assert!(covered
+            .diagnostics
             .iter()
-            .any(|b| b.cuts.contains(&"beam_volume:wide-beam".into())));
+            .any(|d| d.code == "OPENING_SPANNED_BY_SOURCE_BEAM"
+                && d.source_ids == vec!["opening", "wide-beam"]));
+        assert!(covered
+            .diagnostics
+            .iter()
+            .all(|d| d.code != "INVALID_SUPPORT" && d.code != "LINTEL_ROWS_INCOMPLETE"));
+        narrow.beams[0].start_xmm = 700.0;
+        let partial = inspect_request(&narrow, &profile);
+        assert!(partial
+            .diagnostics
+            .iter()
+            .all(|d| d.code != "OPENING_SPANNED_BY_SOURCE_BEAM"));
         let mut stem = r.wall_volumes[0].clone();
         stem.guid = "stem".into();
         stem.start_xmm = 1600.0;
         stem.end_xmm = 1600.0;
         stem.end_ymm = 1280.0;
         r.wall_volumes.push(stem);
-        // Частичное пересечение по высоте сохраняет узел и требует выреза SUP.
+        let full_node = inspect_request(&r, &profile);
+        for part in full_node
+            .blocks
+            .iter()
+            .filter(|b| (1..=5).contains(&b.course_index))
+        {
+            for arm in &part.arms {
+                if arm.start.y == 0 && arm.end.y == 0 {
+                    assert!(
+                        arm.start.x.max(arm.end.x) <= 32_000
+                            || arm.start.x.min(arm.end.x) >= 256_000,
+                        "Продольная часть T осталась внутри вычета балки: {:?}",
+                        part
+                    );
+                }
+            }
+        }
+        let mut clipped_node_request = r.clone();
+        clipped_node_request.beams[0].start_xmm = 1620.0;
+        let clipped_node = inspect_request(&clipped_node_request, &profile);
+        assert!(
+            clipped_node
+                .blocks
+                .iter()
+                .all(|b| b.product_key.as_deref() != Some("Type6")
+                    || b.course_index == 0),
+            "Поперечный проход должен удалить остаток Type6 на толщине стены"
+        );
+        // Даже частичное пересечение по высоте окончательно разделяет детали.
         r.beams[0].start_zmm = 80.0;
         r.beams[0].end_zmm = 80.0;
         let node = inspect_request(&r, &profile);
         assert!(
             node.blocks
                 .iter()
-                .any(|b| !b.arms.is_empty() && b.cuts.contains(&"beam_volume:wide-beam".into())),
+                .all(|b| !b.cuts.iter().any(|cut| cut.starts_with("beam_volume:"))),
             "{:?} nodes={:?}",
             node.diagnostics,
             node.blocks

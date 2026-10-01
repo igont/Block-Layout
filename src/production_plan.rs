@@ -649,10 +649,13 @@ mod tests {
             is_bridge: false,
             hide_spikes_left: false,
             hide_spikes_right: false,
+            natural_end_left: true,
+            natural_end_right: true,
             cuts: vec!["Type1:x1:y1:run-1".into()],
             source_ids: vec!["wall:wall-1".into()],
             catalog_nominal_centimm: Some(64_000),
             components: Vec::new(),
+            obstacle_ends: Vec::new(),
             arms: vec![crate::layout::BlockArm {
                 wall_id: "wall-1".into(),
                 edge_id: "run-1".into(),
