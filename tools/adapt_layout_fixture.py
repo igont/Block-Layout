@@ -43,14 +43,18 @@ def adapt(source, profile):
     for wall in source["wall_volumes"]:
         if wall.get("purposeType", 0) != 1:
             raise ValueError(f"Назначение стены {wall['guid']} не поддержано прототипом")
-        walls.append({"id": wall["guid"], "purpose": "fb_wall", "volume": prism(wall)})
+        walls.append({"id": wall["guid"], "purpose": "fb_console" if wall.get("openingType") == "CONSOLE" else "fb_wall", "volume": prism(wall)})
     openings = []
-    purposes = {"OPENING": "opening", "CONSOLE": "console"}
+    purposes = {"OPENING": "opening", "CONSOLE": "console", "WINDOW": "window",
+                "DOOR": "door", "PARTITION_OPENING": "partition_opening"}
     for opening in source.get("opening_volumes", []):
         purpose = purposes.get(opening.get("openingType", ""))
         if purpose is None:
             raise ValueError(f"Назначение проёма {opening['guid']} нельзя перенести без потерь")
-        openings.append({"id": opening["guid"], "purpose": purpose, "volume": prism(opening)})
+        entry = {"id": opening["guid"], "purpose": purpose, "volume": prism(opening)}
+        if opening.get("isOutside", False):
+            entry["is_outside"] = True
+        openings.append(entry)
     beams = []
     for beam in source.get("beams", []):
         geometry = beam["geometry"]

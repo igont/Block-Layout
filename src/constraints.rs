@@ -126,6 +126,8 @@ pub struct LintelCandidate {
 
 #[derive(Clone, Debug, Default)]
 pub struct Constraints {
+    /// Ось консоли от корня в стене к свободному торцу; материал не вычитается.
+    pub console_axes: HashMap<String, (RawPoint, RawPoint)>,
     pub masks: Vec<Mask>,
     pub lintel_candidates: Vec<LintelCandidate>,
     pub beam_classifications: Vec<BeamClassification>,
@@ -735,6 +737,9 @@ impl ConstraintEvidence {
 
 impl Constraints {
     pub(crate) fn opening_axis(&self, id: &str) -> Option<(RawPoint, RawPoint)> {
+        if let Some(axis) = self.console_axes.get(id) {
+            return Some(*axis);
+        }
         self.evidence.iter().find_map(|e| match &e.geometry {
             EvidenceGeometry::Opening { opening, .. } if opening.id == id => {
                 Some((opening.start, opening.end))

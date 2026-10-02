@@ -108,7 +108,7 @@
     "wallVolume": {
       "type": "object", "additionalProperties": false, "required": ["id", "purpose", "volume"],
       "properties": {
-        "id": {"$ref": "#/$defs/id"}, "purpose": {"enum": ["fb_wall", "context"]},
+        "id": {"$ref": "#/$defs/id"}, "purpose": {"enum": ["fb_wall", "fb_console", "context"]},
         "volume": {"$ref": "#/$defs/axisPrism"}
       }
     },
@@ -116,6 +116,7 @@
       "type": "object", "additionalProperties": false, "required": ["id", "purpose", "volume"],
       "properties": {
         "id": {"$ref": "#/$defs/id"}, "purpose": {"enum": ["opening", "window", "door", "partition_opening", "console", "wall_trim"]},
+        "is_outside": {"type": "boolean", "default": false},
         "wall_ids": {"$ref": "#/$defs/ids"}, "volume": {"$ref": "#/$defs/axisPrism"}
       }
     },

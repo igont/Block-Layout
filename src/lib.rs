@@ -62,6 +62,16 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
     if let Err(error) = request.validate() {
         return failure(vec![error]);
     }
+    // Единая локальная копия нужна и ограничениям, и окончательной подрезке узлов.
+    let mut effective = request.clone();
+    for opening in &mut effective.opening_volumes {
+        if !opening.is_outside && opening.start_bottom_zmm.abs() < 0.01
+            && opening.end_bottom_zmm.abs() < 0.01 {
+            opening.start_bottom_zmm = -2.0 * profile.index_centimm as f64 / 100.0;
+            opening.end_bottom_zmm = opening.start_bottom_zmm;
+        }
+    }
+    let request = &effective;
     let building = match topology::normalize_building(request.raw_building()) {
         Ok(value) => value,
         Err(message) => {
@@ -157,6 +167,31 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
             )
         }
     };
+    for wall in request.wall_volumes.iter().filter(|w| w.opening_type == "CONSOLE") {
+        for course in &topology.courses {
+            for run in &course.runs {
+                let Some(source) = run.sources.iter().find(|s| s.wall_id == wall.guid) else { continue; };
+                let (root, tip) = if source.end_offset == run.length && source.start_offset > 0 {
+                    (source.start, source.end)
+                } else if source.start_offset == 0 && source.end_offset < run.length {
+                    (source.end, source.start)
+                } else if course.vertices.iter().any(|v| v.point == source.start && v.rays.len() >= 3)
+                    && course.vertices.iter().any(|v| v.point == source.end && v.rays.len() == 1) {
+                    (source.start, source.end)
+                } else if course.vertices.iter().any(|v| v.point == source.end && v.rays.len() >= 3)
+                    && course.vertices.iter().any(|v| v.point == source.start && v.rays.len() == 1) {
+                    (source.end, source.start)
+                } else { continue; };
+                let raw = |p: domain::Point| RawPoint { x_mm: p.x as f64 / 100.0, y_mm: p.y as f64 / 100.0 };
+                constraints.console_axes.insert(wall.guid.clone(), (raw(root), raw(tip)));
+                constraints.lintel_candidates.push(constraints::LintelCandidate {
+                    opening_id: wall.guid.clone(), run_id: run.id.clone(), course_index: course.index,
+                    span: constraints::Interval { start: source.start_offset, end: source.end_offset },
+                    left_support: None, right_support: None,
+                });
+            }
+        }
+    }
     let beam_spanned: Vec<_> = openings
         .iter()
         .filter(|o| (o.end.x_mm - o.start.x_mm).hypot(o.end.y_mm - o.start.y_mm) <= 1500.0)
@@ -272,6 +307,21 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
     };
     let mut diagnostics: Vec<ApiFailure> =
         layout.diagnostics.into_iter().map(layout_failure).collect();
+    for wall in request.wall_volumes.iter().filter(|w| w.opening_type == "CONSOLE") {
+        if !constraints.console_axes.contains_key(&wall.guid) {
+            diagnostics.push(ApiFailure::new("CONSOLE_ROOT_REQUIRED",
+                "Не найден корень консоли на непрерывной стене; материал сохранён", Some(wall.guid.clone())));
+            continue;
+        }
+        for part in layout.layout.blocks.iter().filter(|b| b.product_key.as_deref() == Some("Type6")
+            && b.source_ids.contains(&format!("wall:{}", wall.guid))) {
+            let mut warning = ApiFailure::new("CONSOLE_LINTEL_UNPLACED",
+                "Перемычка консоли не помещается в исходном ряду типа 6 с заглублением больше длины консоли; материал сохранён",
+                Some(wall.guid.clone()));
+            warning.course_index = Some(part.course_index);
+            diagnostics.push(warning);
+        }
+    }
     for (opening_id, beam_id) in &beam_spanned {
         let mut note = ApiFailure::new("OPENING_SPANNED_BY_SOURCE_BEAM",
             "Исходная балка высотой 315 мм перекрывает проём с опиранием с обеих сторон и заменяет обычные перемычки", None);

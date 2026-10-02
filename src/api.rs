@@ -42,6 +42,8 @@ pub struct Volume {
     pub purpose_type: i32,
     #[serde(default)]
     pub opening_type: String,
+    #[serde(default)]
+    pub is_outside: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

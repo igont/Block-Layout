@@ -71,6 +71,8 @@ pub struct WallVolume {
 pub struct Opening {
     pub id: String,
     pub purpose: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_outside: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wall_ids: Option<Vec<String>>,
     pub volume: AxisPrism,
@@ -144,6 +146,7 @@ impl AxisPrism {
             thickness_mm: self.left_thickness_mm + self.right_thickness_mm,
             purpose_type: purpose,
             opening_type: opening.into(),
+            is_outside: false,
         })
     }
 }
@@ -233,7 +236,7 @@ impl ExchangeRequest {
         let mut walls = Vec::new();
         for wall in &self.model.wall_volumes {
             let purpose = match wall.purpose.as_str() {
-                "fb_wall" => 1,
+                "fb_wall" | "fb_console" => 1,
                 "context" => {
                     return Err(error(
                         "UNSUPPORTED_WALL_PURPOSE",
@@ -249,7 +252,8 @@ impl ExchangeRequest {
                     ))
                 }
             };
-            walls.push(wall.volume.convert(&wall.id, purpose, "")?);
+            walls.push(wall.volume.convert(&wall.id, purpose,
+                if wall.purpose == "fb_console" { "CONSOLE" } else { "" })?);
         }
         let mut openings = Vec::new();
         for opening in &self.model.openings {
@@ -281,7 +285,9 @@ impl ExchangeRequest {
                     ))
                 }
             };
-            openings.push(opening.volume.convert(&opening.id, 2, purpose)?);
+            let mut volume = opening.volume.convert(&opening.id, 2, purpose)?;
+            volume.is_outside = opening.is_outside;
+            openings.push(volume);
         }
         let mut beams = Vec::new();
         for beam in &self.model.beams {
@@ -374,6 +380,7 @@ pub fn from_layout_request(
             Ok(WallVolume {
                 id: w.guid.clone(),
                 purpose: match w.purpose_type {
+                    1 if w.opening_type == "CONSOLE" => "fb_console",
                     1 => "fb_wall",
                     0 => "context",
                     _ => {
@@ -411,6 +418,7 @@ pub fn from_layout_request(
                 }
                 .into(),
                 wall_ids: None,
+                is_outside: o.is_outside,
                 volume: prism(o),
             })
         })

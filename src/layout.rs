@@ -2310,8 +2310,13 @@ fn lintel_groups<'a>(
     candidates.sort_by_key(|v| (v.span.start, v.span.end));
     let mut groups: Vec<Vec<&LintelCandidate>> = Vec::new();
     for candidate in candidates {
+        if constraints.console_axes.contains_key(&candidate.opening_id) {
+            groups.push(vec![candidate]);
+            continue;
+        }
         if let Some(group) = groups.last_mut() {
-            if candidate.span.start - group.last().unwrap().span.end <= 64_000 {
+            if !constraints.console_axes.contains_key(&group[0].opening_id)
+                && candidate.span.start - group.last().unwrap().span.end <= 64_000 {
                 group.push(candidate);
                 continue;
             }
@@ -2436,6 +2441,14 @@ fn merge_t_lintels(
         let on_axis = |p: Point| {
             ((p.x as f64 - a.x_mm * 100.0) * uy - (p.y as f64 - a.y_mm * 100.0) * ux).abs() <= 1.0
         };
+        let console = constraints.console_axes.contains_key(&candidate.opening_id);
+        if console && !blocks.iter().any(|part| {
+            part.course_index == candidate.course_index
+                && part.product_key.as_deref() == Some("Type6")
+                && part.arms.iter().all(|arm| on_axis(arm.start) && on_axis(arm.end))
+                && part.arms.iter().flat_map(|arm| [arm.start, arm.end]).map(project).min().is_some_and(|u| u <= 0)
+                && part.arms.iter().flat_map(|arm| [arm.start, arm.end]).map(project).max().is_some_and(|u| u >= 0)
+        }) { continue; }
         let group = lintel_groups(constraints, &candidate.run_id, candidate.course_index)
             .into_iter()
             .find(|group| group.iter().any(|item| item.opening_id == candidate.opening_id))
@@ -2454,10 +2467,13 @@ fn merge_t_lintels(
             openings.push((item.opening_id.clone(), Span { start: left.min(right), end: left.max(right) }));
         }
         openings.sort_by_key(|(_, span)| span.start);
-        let required = Span {
+        let required = if console { Span {
+            start: -((width * 100.0).round() as i64).max(support) - 1,
+            end: (width * 100.0).round() as i64,
+        }} else { Span {
             start: openings.first().map(|(_, span)| span.start).unwrap_or(0) - support,
             end: openings.last().map(|(_, span)| span.end).unwrap_or(0) + support,
-        };
+        }};
         if maximum <= 0
             || blocks.iter().any(|part| {
                 part.course_index == candidate.course_index
@@ -2468,7 +2484,7 @@ fn merge_t_lintels(
             continue;
         }
         let mut placement: Option<(i64, Vec<(usize, Span)>, Span, Vec<Span>)> = None;
-        for offset in 0..=1 {
+        for offset in 0..=if console { 0 } else { 1 } {
             let course = candidate.course_index + offset;
             let mut coverage = Vec::new();
             for (index, part) in blocks
@@ -2528,7 +2544,10 @@ fn merge_t_lintels(
             {
                 continue;
             }
-            let Some(segments) = glued_lintel_segments(&selected, &openings, maximum, support) else {
+            let segments = if console {
+                (span.len() <= maximum).then_some(vec![span])
+            } else { glued_lintel_segments(&selected, &openings, maximum, support) };
+            let Some(segments) = segments else {
                 continue;
             };
             if placement.as_ref().is_none_or(|(_, _, best, _)| span.len() < best.len()) {
@@ -3198,6 +3217,9 @@ pub fn calculate_candidate(
             let mut expected_solid = solid.clone();
             let mut placed = Vec::new();
             for group in lintel_groups(constraints, &edge.edge_id, course.index) {
+                if constraints.console_axes.contains_key(&group[0].opening_id) {
+                    continue;
+                }
                 if group.iter().all(|candidate| constraints.opening_axis(&candidate.opening_id).is_some()) {
                     errors.push(diagnostic(
                         DiagnosticCode::InvalidSupport,
