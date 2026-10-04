@@ -1,7 +1,13 @@
 use fb_layout::{
-    api::LayoutRequest, layout::Profile, materialize::materialize, solid_geometry::volume,
+    api::LayoutRequest, layout::Profile, materialize::materialize as render_final_parts, solid_geometry::volume,
 };
 use serde_json::json;
+
+// Fixtures describe raw stock; only the geometry owner finalizes it before rendering.
+fn materialize(request: &LayoutRequest, blocks: &[fb_layout::layout::Block], profile: &Profile) -> Result<fb_layout::materialize::Materialized, fb_layout::api::ApiFailure> {
+    let finished = fb_layout::layout::finalize_parts(request, profile, blocks)?;
+    render_final_parts(request, &finished, profile)
+}
 
 fn profile() -> Profile {
     serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap()
@@ -23,8 +29,8 @@ fn block(length_mm: i64) -> fb_layout::layout::Block {
 fn ordinary_cut_exports_finished_stock_without_hidden_geometry() {
     let r = request(440.0, json!([]));
     let mut part = block(440);
-    part.natural_end_right = false;
-    part.hide_spikes_right = true;
+    part.ends = fb_layout::end_state::EndStates::from_flags(part.hide_spikes_left(), part.hide_spikes_right(), part.natural_end_left(), false);
+    part.ends = fb_layout::end_state::EndStates::from_flags(part.hide_spikes_left(), true, part.natural_end_left(), part.natural_end_right());
     let rendered = materialize(&r, &[part], &profile()).unwrap();
     let body = &rendered.physical.blocks[0];
     let actual: f64 = body.bodies.iter().map(volume).sum();

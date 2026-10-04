@@ -17,9 +17,26 @@
     "scope": {"$ref": "#/$defs/scope"},
     "blocks": {"type": "array", "items": {"$ref": "#/$defs/block"}},
     "warnings": {"type": "array", "items": {"$ref": "#/$defs/diagnostic"}},
-    "beam_adjustments": {"type": "array", "maxItems": 0}
+    "beam_adjustments": {"type": "array", "items": {"$ref": "#/$defs/beamSectionReplacement"}}
   },
   "$defs": {
+    "beamSectionReplacement": {
+      "type": "object", "additionalProperties": false,
+      "required": ["beam_id", "rule_id", "original_height_mm", "height_mm", "start_z_mm", "end_z_mm", "bottom_start_z_mm", "bottom_end_z_mm", "height_direction"],
+      "properties": {
+        "beam_id": {"type": "string", "minLength": 1},
+        "rule_id": {"const": "horizontal_beam_320_to_315"},
+        "original_height_mm": {"type": "number", "minimum": 319.995, "exclusiveMaximum": 320.005}, "height_mm": {"const": 315},
+        "start_z_mm": {"type": "number"}, "end_z_mm": {"type": "number"},
+        "bottom_start_z_mm": {"type": "number"}, "bottom_end_z_mm": {"type": "number"},
+        "height_direction": {"type": "array", "minItems": 3, "maxItems": 3, "prefixItems": [{"type": "number", "minimum": -0.0000001, "maximum": 0.0000001}, {"type": "number", "minimum": -0.0000001, "maximum": 0.0000001}, {"oneOf": [{"type": "number", "minimum": 0.9999999, "maximum": 1.0000001}, {"type": "number", "minimum": -1.0000001, "maximum": -0.9999999}]}]}
+      },
+      "description": "Virtual calculation section; source beam remains nominal. start/end_z_mm are the SUP section axes, shifted down for -Z to preserve both physical bottom faces. No additive face offset or repeated reduction."
+    },
+    "doborGroup": {"type": "object", "additionalProperties": false, "required": ["source_id", "side"], "properties": {"source_id": {"$ref": "#/$defs/id"}, "side": {"enum": ["negative", "positive"]}}},
+    "cutSource": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind", "id"], "properties": {"kind": {"enum": ["opening", "beam", "wall"]}, "id": {"$ref": "#/$defs/id"}}}, {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"enum": ["stock", "imported"]}}}]},
+    "cutFace": {"type": "object", "additionalProperties": false, "required": ["plane_centimm", "sources"], "properties": {"plane_centimm": {"type": "integer", "description": "Опорная плоскость вдоль оси номинального тела заготовки, 0,01 мм; угловые выступы и сдвиг placement.origin_mm не входят в эту систему отсчёта. Потребитель не выполняет распил повторно."}, "sources": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/cutSource"}}}},
+    "endState": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["state"], "properties": {"state": {"const": "factory_uncut"}}}, {"type": "object", "additionalProperties": false, "required": ["state", "cut"], "properties": {"state": {"enum": ["factory_cut", "saw_cut"]}, "cut": {"$ref": "#/$defs/cutFace"}}}]},
     "stockInterval": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number", "minimum": 0, "maximum": 640, "multipleOf": 0.01}},
     "stockPart": {
       "type": "object", "additionalProperties": false, "required": ["block_id", "interval_mm", "stock_end"],
@@ -88,28 +105,8 @@
       ]
     },
     "block": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "id",
-        "code1",
-        "code2",
-        "product_type",
-        "placement",
-        "length_mm",
-        "nominal_length_mm",
-        "width_mm",
-        "height_mm",
-        "course_index",
-        "source_ids",
-        "wall_ids",
-        "hide_spikes_left",
-        "hide_spikes_right",
-        "node_cuts",
-        "trims",
-        "natural_end_left",
-        "natural_end_right"
-      ],
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "code1", "code2", "product_type", "placement", "length_mm", "nominal_length_mm", "width_mm", "height_mm", "course_index", "source_ids", "wall_ids", "hide_spikes_left", "hide_spikes_right", "node_cuts", "trims", "natural_end_left", "natural_end_right", "left_end", "right_end"],
       "properties": {
         "id": {"$ref": "#/$defs/id"},
         "code1": {"$ref": "#/$defs/code"},
@@ -122,6 +119,7 @@
         "height_mm": {"$ref": "#/$defs/positive"},
         "course_index": {"type": "integer"},
         "is_dobor": {"type": "boolean", "default": false},
+        "dobor_group": {"$ref": "#/$defs/doborGroup"},
         "cut_from_block_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/id"}]},
         "cut_zone_ids": {"$ref": "#/$defs/ids"},
         "stock_cut_plan": {"$ref": "#/$defs/stockCutPlan"},
@@ -132,13 +130,21 @@
         "node_cuts": {"type": "array", "items": {"$ref": "#/$defs/nodeCut"}},
         "trims": {"type": "array", "items": {"$ref": "#/$defs/trim"}},
         "natural_end_left": {"type": "boolean", "default": true},
-        "natural_end_right": {"type": "boolean", "default": true}
+        "natural_end_right": {"type": "boolean", "default": true},
+        "left_end": {"$ref": "#/$defs/endState"},
+        "right_end": {"$ref": "#/$defs/endState"}
       },
       "allOf": [
-        {"if": {"required": ["is_dobor"], "properties": {"is_dobor": {"const": true}}}, "then": {"required": ["cut_from_block_id", "cut_zone_ids"], "properties": {"cut_from_block_id": {"$ref": "#/$defs/id"}}, "not": {"required": ["stock_cut_plan"]}}, "else": {"properties": {"cut_from_block_id": {"type": "null"}}}},
+        {"if": {"required": ["is_dobor"], "properties": {"is_dobor": {"const": true}}}, "then": {"required": ["cut_from_block_id", "cut_zone_ids"], "anyOf": [{"properties": {"cut_from_block_id": {"$ref": "#/$defs/id"}}}, {"required": ["dobor_group"], "properties": {"dobor_group": {"$ref": "#/$defs/doborGroup"}}}], "not": {"required": ["stock_cut_plan"]}}, "else": {"properties": {"cut_from_block_id": {"type": "null"}}, "not": {"required": ["dobor_group"]}}},
         {"if": {"required": ["stock_cut_plan"]}, "then": {"required": ["is_dobor", "cut_from_block_id", "cut_zone_ids"], "properties": {"is_dobor": {"const": false}, "cut_from_block_id": {"type": "null"}}}},
         {"if": {"required": ["natural_end_left"], "properties": {"natural_end_left": {"const": false}}}, "then": {"properties": {"hide_spikes_left": {"const": true}}}},
-        {"if": {"required": ["natural_end_right"], "properties": {"natural_end_right": {"const": false}}}, "then": {"properties": {"hide_spikes_right": {"const": true}}}}
+        {"if": {"required": ["natural_end_right"], "properties": {"natural_end_right": {"const": false}}}, "then": {"properties": {"hide_spikes_right": {"const": true}}}},
+        {"if": {"required": ["left_end"], "properties": {"left_end": {"properties": {"state": {"const": "factory_uncut"}}, "required": ["state"]}}}, "then": {"properties": {"natural_end_left": {"const": true}, "hide_spikes_left": {"const": false}}}},
+        {"if": {"required": ["left_end"], "properties": {"left_end": {"properties": {"state": {"const": "factory_cut"}}, "required": ["state"]}}}, "then": {"properties": {"natural_end_left": {"const": true}, "hide_spikes_left": {"const": true}}}},
+        {"if": {"required": ["left_end"], "properties": {"left_end": {"properties": {"state": {"const": "saw_cut"}}, "required": ["state"]}}}, "then": {"properties": {"natural_end_left": {"const": false}, "hide_spikes_left": {"const": true}}}},
+        {"if": {"required": ["right_end"], "properties": {"right_end": {"properties": {"state": {"const": "factory_uncut"}}, "required": ["state"]}}}, "then": {"properties": {"natural_end_right": {"const": true}, "hide_spikes_right": {"const": false}}}},
+        {"if": {"required": ["right_end"], "properties": {"right_end": {"properties": {"state": {"const": "factory_cut"}}, "required": ["state"]}}}, "then": {"properties": {"natural_end_right": {"const": true}, "hide_spikes_right": {"const": true}}}},
+        {"if": {"required": ["right_end"], "properties": {"right_end": {"properties": {"state": {"const": "saw_cut"}}, "required": ["state"]}}}, "then": {"properties": {"natural_end_right": {"const": false}, "hide_spikes_right": {"const": true}}}}
       ]
     },
     "diagnostic": {

@@ -48,9 +48,20 @@ pub struct StockCutPlan {
     pub waste_intervals_mm: Vec<[f64; 2]>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoborSide { Negative, Positive }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DoborGroup {
+    pub source_id: String,
+    pub side: DoborSide,
+}
+
 pub struct PreparedParts {
     pub blocks: Vec<Block>,
     pub parents: BTreeMap<String, String>,
+    pub dobor_groups: BTreeMap<String, DoborGroup>,
     pub stock_plans: BTreeMap<String, StockCutPlan>,
     pub zones: BTreeMap<String, Vec<String>>,
 }
@@ -60,8 +71,11 @@ impl PreparedParts {
         let Some(id) = value.get("id").and_then(Value::as_str).map(str::to_owned) else {
             return;
         };
-        value["is_dobor"] = json!(self.parents.contains_key(&id));
+        value["is_dobor"] = json!(self.dobor_groups.contains_key(&id));
         value["cut_from_block_id"] = json!(self.parents.get(&id));
+        if let Some(group) = self.dobor_groups.get(&id) {
+            value["dobor_group"] = json!(group);
+        }
         if let Some(zones) = self.zones.get(&id) {
             value["cut_zone_ids"] = json!(zones);
         }
@@ -73,13 +87,13 @@ impl PreparedParts {
 
 fn obstacle_zones(block: &Block, request: &LayoutRequest) -> Vec<String> {
     block
-        .obstacle_ends
+        .obstacle_ends()
         .iter()
         .filter(|end| {
             if end.left {
-                block.hide_spikes_left
+                block.hide_spikes_left()
             } else {
-                block.hide_spikes_right
+                block.hide_spikes_right()
             }
         })
         .filter_map(|end| {
@@ -170,7 +184,7 @@ fn candidate(
     let dy = block.end.y - block.start.y;
     let forward = dx > 0 || dx == 0 && dy > 0;
     let sides: BTreeSet<bool> = block
-        .obstacle_ends
+        .obstacle_ends()
         .iter()
         .filter(|e| {
             zone_ids.iter().any(|id| {
@@ -182,25 +196,25 @@ fn candidate(
     // Между двумя проёмами сторона неоднозначна: такие детали могут быть
     // основными, но не получают добор, нарушающий выбранную сторону соседей.
     let side = (sides.len() == 1).then(|| *sides.first().unwrap());
-    let left = block.natural_end_left && !block.hide_spikes_left;
-    let right = block.natural_end_right && !block.hide_spikes_right;
+    let left = block.natural_end_left() && !block.hide_spikes_left();
+    let right = block.natural_end_right() && !block.hide_spikes_right();
     let end = match (left, right) {
         (true, false) => End::Left,
         (false, true) => End::Right,
         (false, false) => End::Flat,
         (true, true) => return None,
     };
-    let inset = i64::from(block.natural_end_left && block.hide_spikes_left)
-        + i64::from(block.natural_end_right && block.hide_spikes_right);
+    let inset = i64::from(block.natural_end_left() && block.hide_spikes_left())
+        + i64::from(block.natural_end_right() && block.hide_spikes_right());
     let length = block.length_centimm - inset * KERF;
     // Длинная часть тоже может оставить пригодный обрезок.
     if length <= 0 || length >= STOCK {
         return None;
     }
-    let stock_first = block.natural_end_left && !block.hide_spikes_left;
+    let stock_first = block.natural_end_left() && !block.hide_spikes_left();
     let typed_stock = if typed {
         // Одна наружная заводская грань фиксирует место детали в заготовке.
-        if !stock_first && !(block.natural_end_right && !block.hide_spikes_right) { return None; }
+        if !stock_first && !(block.natural_end_right() && !block.hide_spikes_right()) { return None; }
         let offset = if stock_first { 0 } else { STOCK - block.length_centimm };
         let kept = (offset, offset + length);
         let mut stock = block.clone();
@@ -327,11 +341,17 @@ fn fits(source: &Candidate, child: &Candidate) -> bool {
 }
 
 fn select_sides(groups: &mut BTreeMap<(i64, i64), Vec<Candidate>>, request: &LayoutRequest) {
-    let mut scores: BTreeMap<String, [usize; 2]> = BTreeMap::new();
-    for child in groups.values().flatten() {
-        if let Some(side) = child.side.filter(|_| child.short) {
-            for zone in &child.zone_ids {
-                scores.entry(zone.clone()).or_default()[usize::from(side)] += 1;
+    // Membership uses compatible classes on the opposite side, not the number
+    // of stock pieces left after matching individual physical pairs.
+    let mut eligible = BTreeSet::new();
+    let mut scores: BTreeMap<String, [bool; 2]> = BTreeMap::new();
+    for candidates in groups.values() {
+        for child in candidates {
+            if !child.short || child.zone_ids.len() != 1 { continue; }
+            let Some(side) = child.side else { continue; };
+            if candidates.iter().any(|source| opposite_source(source, child)) {
+                eligible.insert(child.index);
+                scores.entry(child.zone_ids[0].clone()).or_default()[usize::from(side)] = true;
             }
         }
     }
@@ -344,12 +364,12 @@ fn select_sides(groups: &mut BTreeMap<(i64, i64), Vec<Candidate>>, request: &Lay
                     || o.end_xmm == o.start_xmm && o.end_ymm > o.start_ymm;
                 (o.end_top_zmm > o.start_top_zmm) == forward
             });
-        let side = high_side.filter(|&side| score[usize::from(side)] > 0)
-            .unwrap_or(score[1] >= score[0]);
+        let side = high_side.filter(|&side| score[usize::from(side)])
+            .unwrap_or(score[1]);
         selected.insert(zone.clone(), side);
     }
     for child in groups.values_mut().flatten() {
-        child.receives_offcut = child.short && child.side.is_some_and(|side| {
+        child.receives_offcut = eligible.contains(&child.index) && child.side.is_some_and(|side| {
             child.zone_ids.iter().all(|zone| selected.get(zone) == Some(&side))
         });
     }
@@ -391,7 +411,8 @@ pub fn prepare(
     profile: &Profile,
     blocks: &[Block],
 ) -> Result<PreparedParts, ApiFailure> {
-    let blocks = crate::layout::finalize_parts(request, profile, blocks)?;
+    // Geometry is finalized by the layout owner before classification.
+    let blocks = blocks.to_vec();
     let mut ids = BTreeSet::new();
     let mut ambiguous_ids = BTreeSet::new();
     for block in &blocks {
@@ -403,6 +424,7 @@ pub fn prepare(
     let mut prepared = PreparedParts {
         blocks,
         parents: BTreeMap::new(),
+        dobor_groups: BTreeMap::new(),
         stock_plans: BTreeMap::new(),
         zones: BTreeMap::new(),
     };
@@ -423,6 +445,16 @@ pub fn prepare(
         }
     }
     select_sides(&mut groups, request);
+    for candidate in groups.values().flatten() {
+        let id = &prepared.blocks[candidate.index].id;
+        prepared.zones.insert(id.clone(), candidate.zone_ids.clone());
+        if candidate.receives_offcut {
+            prepared.dobor_groups.insert(id.clone(), DoborGroup {
+                source_id: candidate.zone_ids[0].clone(),
+                side: if candidate.side == Some(true) { DoborSide::Positive } else { DoborSide::Negative },
+            });
+        }
+    }
     for candidates in groups.values() {
         match_group(&mut prepared, candidates);
     }
@@ -452,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn side_is_fixed_before_checking_available_sources() {
+    fn incompatible_classes_do_not_establish_a_dobor_side() {
         let mut groups = BTreeMap::from([(
             (19_300, 6300),
             vec![
@@ -463,8 +495,8 @@ mod tests {
         )]);
         select_sides(&mut groups, &empty_request());
         let candidates = &groups[&(19_300, 6300)];
-        assert!(candidates[0].receives_offcut);
-        assert!(candidates[1].receives_offcut);
+        assert!(!candidates[0].receives_offcut);
+        assert!(!candidates[1].receives_offcut);
         assert!(!candidates[2].receives_offcut);
         assert!(!candidates.iter().any(|source| fits(source, &candidates[0])));
     }
@@ -472,14 +504,15 @@ mod tests {
     #[test]
     fn one_opening_keeps_the_same_side_across_different_sections() {
         let mut groups = BTreeMap::from([
-            ((19_300, 6300), vec![part(0, 30_600, false)]),
+            ((19_300, 6300), vec![part(0, 30_600, false), part(3, 30_600, true)]),
             (
                 (16_000, 6300),
-                vec![part(1, 30_600, true), part(2, 30_600, true)],
+                vec![part(1, 30_600, true), part(2, 30_600, true), part(4, 30_600, false)],
             ),
         ]);
         select_sides(&mut groups, &empty_request());
         assert!(!groups[&(19_300, 6300)][0].receives_offcut);
-        assert!(groups[&(16_000, 6300)].iter().all(|c| c.receives_offcut));
+        assert!(groups[&(16_000, 6300)][..2].iter().all(|c| c.receives_offcut));
+        assert!(!groups[&(16_000, 6300)][2].receives_offcut);
     }
 }

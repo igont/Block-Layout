@@ -41,6 +41,7 @@ fn consoles_replace_all_type6_rows_without_vertical_shift_and_preserve_exchange(
         .collect();
     assert_eq!(eligible.len(), 3);
     let result = inspect_request(&restored, &p);
+    assert!(result.diagnostics.iter().all(|d| d.code != "CONSOLE_LINTEL_UNPLACED"));
     let bridges: Vec<_> = result
         .blocks
         .iter()
@@ -101,40 +102,75 @@ fn zero_opening_keeps_two_bottom_courses_and_does_not_mutate_source() {
 }
 
 #[test]
-fn overlong_console_stays_in_its_row_and_reports_unplaced_lintels() {
+fn overlong_console_uses_available_whole_blocks_within_product_length() {
     let r = request(1600.0);
     let result = inspect_request(&r, &profile());
     assert!(!result.blocks.is_empty());
-    assert!(!result
-        .blocks
-        .iter()
-        .any(|b| b.is_bridge && b.source_ids.contains(&"console".to_owned())));
-    assert_eq!(
-        result
-            .diagnostics
-            .iter()
-            .filter(|d| d.code == "CONSOLE_LINTEL_UNPLACED")
-            .count(),
-        3
-    );
+    let bridges: Vec<_> = result.blocks.iter().filter(|b| b.is_bridge
+        && b.source_ids.contains(&"console".to_owned())).collect();
+    assert!(!bridges.is_empty());
+    assert_eq!(bridges.iter().map(|b| b.course_index).collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([8, 10, 12]));
+    assert!(bridges.iter().all(|b| b.length_centimm <= 275_000));
+    assert!(result.diagnostics.iter().all(|d| d.code != "CONSOLE_LINTEL_UNPLACED"));
 }
 
 #[test]
-fn penetration_equal_to_console_length_is_insufficient() {
+fn penetration_equal_to_console_length_is_a_valid_target() {
     let mut r = request(640.0);
     r.wall_volumes[0].start_xmm = 2560.0;
     let result = inspect_request(&r, &profile());
     assert!(!result.blocks.is_empty());
-    assert!(!result
-        .blocks
-        .iter()
-        .any(|b| b.is_bridge && b.source_ids.contains(&"console".to_owned())));
-    assert_eq!(
-        result
-            .diagnostics
-            .iter()
-            .filter(|d| d.code == "CONSOLE_LINTEL_UNPLACED")
-            .count(),
-        3
-    );
+    let bridges: Vec<_> = result.blocks.iter().filter(|b| b.is_bridge
+        && b.source_ids.contains(&"console".to_owned())).collect();
+    assert_eq!(bridges.iter().map(|b| b.course_index).collect::<Vec<_>>(), vec![8, 10, 12]);
+    assert!(bridges.iter().all(|b| b.start.x == 256_000 && b.end.x == 384_000));
+    assert!(result.diagnostics.iter().all(|d| d.code != "CONSOLE_LINTEL_UNPLACED"));
+}
+
+#[test]
+fn boundary_limited_penetration_still_produces_short_console_lintels() {
+    let mut r = request(796.5);
+    r.wall_volumes[0].start_xmm = 2880.;
+    let result = inspect_request(&r, &profile());
+    let bridges: Vec<_> = result.blocks.iter().filter(|b| b.is_bridge
+        && b.source_ids.contains(&"console".to_owned())).collect();
+    assert_eq!(bridges.iter().map(|b| b.course_index).collect::<Vec<_>>(), vec![8, 10, 12]);
+    assert!(bridges.iter().all(|b| b.start.x >= 288_000 && b.end.x == 399_650));
+    assert!(bridges.iter().all(|b| 320_000 - b.start.x < 79_650));
+    assert!(result.diagnostics.iter().all(|d| d.code != "CONSOLE_LINTEL_UNPLACED"));
+}
+
+#[test]
+fn cross_root_with_type6_profiles_is_glued_like_a_t_root_console() {
+    let mut r = request(796.5);
+    r.wall_volumes[1].start_ymm = -1280.;
+    let mut baseline = r.clone();
+    baseline.wall_volumes[2].opening_type.clear();
+    let before = inspect_request(&baseline, &profile());
+    assert!(before.blocks.iter().any(|b| b.product_key.as_deref() == Some("Type7_1")
+        && b.cuts.iter().any(|cut| cut.starts_with("Type6:"))));
+    let result = inspect_request(&r, &profile());
+    let bridges: Vec<_> = result.blocks.iter().filter(|b| b.is_bridge
+        && b.source_ids.contains(&"console".to_owned())).collect();
+    assert_eq!(bridges.iter().map(|b| b.course_index).collect::<Vec<_>>(), vec![8, 10, 12]);
+    assert!(bridges.iter().all(|b| b.cuts.iter().any(|cut| cut.starts_with("Type6:"))));
+    assert!(result.diagnostics.iter().all(|d| d.code != "CONSOLE_LINTEL_UNPLACED"));
+}
+
+#[test]
+fn beam_limited_lower_console_fragment_is_a_lintel_in_its_original_row() {
+    let mut r = request(796.5);
+    r.beams.push(serde_json::from_value(json!({"guid":"console-beam",
+        "startXmm":3300,"startYmm":-320,"startZmm":252,
+        "endXmm":3300,"endYmm":320,"endZmm":252,
+        "geometry":{"widthMm":160,"heightMm":63,
+        "heightDirectionX":0,"heightDirectionY":0,"heightDirectionZ":1}})).unwrap());
+    let result = inspect_request(&r, &profile());
+    assert!(!result.blocks.is_empty(), "{:?}", result.diagnostics);
+    let lower: Vec<_> = result.blocks.iter().filter(|b| b.is_bridge && b.course_index == 8
+        && b.source_ids.contains(&"console".to_owned())).collect();
+    assert!(!lower.is_empty(), "{:?}", result.diagnostics);
+    assert!(lower.iter().any(|b| b.end.x <= 322_000), "{lower:?}");
+    assert!(lower.iter().all(|b| b.end.x <= 322_000 || b.start.x >= 338_000));
 }

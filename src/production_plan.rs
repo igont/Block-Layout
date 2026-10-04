@@ -366,7 +366,7 @@ fn validate_part(
         )
     })?;
     let geometry = checked_geometry(block, section)?;
-    if block.hide_spikes_left || block.hide_spikes_right {
+    if block.hide_spikes_left() || block.hide_spikes_right() {
         return Err(error(
             Some(block),
             ProductionErrorKind::UnsupportedEndProcessing,
@@ -647,15 +647,11 @@ mod tests {
             local_origin: Some(origin),
             local_rotation_deg: Some(90),
             is_bridge: false,
-            hide_spikes_left: false,
-            hide_spikes_right: false,
-            natural_end_left: true,
-            natural_end_right: true,
+            ends: crate::end_state::EndStates::factory(),
             cuts: vec!["Type1:x1:y1:run-1".into()],
             source_ids: vec!["wall:wall-1".into()],
             catalog_nominal_centimm: Some(64_000),
             components: Vec::new(),
-            obstacle_ends: Vec::new(),
             arms: vec![crate::layout::BlockArm {
                 wall_id: "wall-1".into(),
                 edge_id: "run-1".into(),
@@ -861,7 +857,7 @@ mod tests {
         assert!(kinds(&errors).contains(&ProductionErrorKind::MissingInsuDecision));
         opts.insu_by_block.insert("node-1".into(), false);
         let mut altered = node();
-        altered.hide_spikes_right = true;
+        altered.ends = crate::end_state::EndStates::from_flags(altered.hide_spikes_left(), true, altered.natural_end_left(), altered.natural_end_right());
         let errors = ValidatedProductionPlan::try_from_layout_with_options(
             &Layout {
                 blocks: vec![altered],

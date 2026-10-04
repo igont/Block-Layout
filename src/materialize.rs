@@ -111,6 +111,8 @@ pub struct PhysicalBlock {
     pub bodies: Vec<Mesh>,
     pub cut: bool,
     pub is_dobor: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dobor_group: Option<crate::offcut_plan::DoborGroup>,
     pub cut_from_block_id: Option<String>,
 }
 #[derive(Serialize)]
@@ -133,11 +135,14 @@ pub fn materialize(
     profile: &Profile,
 ) -> Result<Materialized, ApiFailure> {
     let prepared = crate::offcut_plan::prepare(request, profile, blocks)?;
-    let mut materialized = materialize_parts(request, &prepared.blocks)?;
+    let mut effective = request.clone();
+    crate::effective_geometry::normalize_beams(&mut effective);
+    let mut materialized = materialize_parts(&effective, &prepared.blocks)?;
     for block in &mut materialized.exchange_blocks { prepared.annotate(block); }
     for block in &mut materialized.physical.blocks {
         block.cut_from_block_id = prepared.parents.get(&block.id).cloned();
-        block.is_dobor = block.cut_from_block_id.is_some();
+        block.dobor_group = prepared.dobor_groups.get(&block.id).cloned();
+        block.is_dobor = block.dobor_group.is_some();
     }
     Ok(materialized)
 }
@@ -229,38 +234,13 @@ fn materialize_parts(
                 .map(|w| w.thickness_mm)
                 .unwrap_or(193.0);
             let nominal = block.length_centimm as f64 / 100.0;
-            let removed_at_end = |end: f64| {
-                components.exchange_blocks.iter().any(|component| {
-                    let placement = &component["placement"];
-                    let read = |field: &str, i: usize| placement[field][i].as_f64().unwrap_or(0.0);
-                    let start = [
-                        read("origin_mm", 0),
-                        read("origin_mm", 1),
-                        read("origin_mm", 2),
-                    ];
-                    let direction = [read("x_axis", 0), read("x_axis", 1), read("x_axis", 2)];
-                    let size = component["product"]["nominal_size_mm"][0]
-                        .as_f64()
-                        .unwrap_or(0.0);
-                    [
-                        ("left", start),
-                        ("right", add(start, scale(direction, size))),
-                    ]
-                    .iter()
-                    .any(|(side, point)| {
-                        component["spikes_removed"][*side] == true
-                            && (dot(sub(*point, origin), axes[0]) - end).abs() < 1e-6
-                    })
-                })
-            };
-            let left_removed = block.hide_spikes_left || removed_at_end(0.0);
-            let right_removed = block.hide_spikes_right || removed_at_end(nominal);
             exchange.push(json!({"id":block.id,"source_ids":source_ids,"wall_ids":wall_ids,"course_index":block.course_index,
                 "product":{"category":"lintel","type_id":"DERIVED_LINTEL","code":format!("DERIVED-LINTEL-{nominal}"),"nominal_size_mm":[nominal,width,63.0]},
                 "placement":frame_json(origin,axes),"stock_shape":{"kind":"mesh","vertices_mm":shape.vertices,"faces":shape.faces},"cuts":[],
-                "spikes_removed":{"left":left_removed,"right":right_removed},"natural_end_left":block.natural_end_left,"natural_end_right":block.natural_end_right}));
+                "spikes_removed":{"left":block.hide_spikes_left(),"right":block.hide_spikes_right()},"natural_end_left":block.natural_end_left(),"natural_end_right":block.natural_end_right(),"left_end":block.ends.left(),"right_end":block.ends.right()}));
             physical.push(PhysicalBlock {
                 is_dobor: false,
+                dobor_group: None,
                 cut_from_block_id: None,
                 id: block.id.clone(),
                 kind: "bridge".into(),
@@ -326,8 +306,8 @@ fn materialize_parts(
             .into_iter()
             .collect();
         for (natural, hidden, at_left) in [
-            (block.natural_end_left, block.hide_spikes_left, true),
-            (block.natural_end_right, block.hide_spikes_right, false),
+            (block.natural_end_left(), block.hide_spikes_left(), true),
+            (block.natural_end_right(), block.hide_spikes_right(), false),
         ] {
             if natural && hidden {
                 let p = if at_left {
@@ -402,37 +382,16 @@ fn materialize_parts(
             }
         });
         let local = local_mesh(&stock, origin, axes);
-        // Запил внутри тела или по высоте не уничтожает шипы незатронутого торца.
-        let end_cut = |end: f64| {
-            let slab = vec![
-                plane(
-                    scale(axes[0], -1.0),
-                    add(origin, scale(axes[0], end - 0.001)),
-                ),
-                plane(axes[0], add(origin, scale(axes[0], end + 0.001))),
-            ];
-            let before: f64 = clip_all(stock.clone(), &slab)
-                .iter()
-                .map(solid::volume)
-                .sum();
-            let after: f64 = bodies
-                .iter()
-                .filter_map(|m| clip_all(m.clone(), &slab))
-                .map(|m| solid::volume(&m))
-                .sum();
-            before - after > 1e-5
-        };
-        let left_cut = end_cut(0.0);
-        let right_cut = end_cut(nominal);
         let mut value = json!({"id":block.id,"source_ids":sources,"wall_ids":walls.iter().map(|w|w.guid.clone()).collect::<Vec<_>>(),"course_index":block.course_index,
             "product":{"category":product,"type_id":code,"code":code,"nominal_size_mm":[nominal,width,height]},"placement":frame_json(origin,axes),
-            "stock_shape":{"kind":"mesh","vertices_mm":local.vertices,"faces":local.faces},"cuts":cuts,"spikes_removed":{"left":block.hide_spikes_left||left_cut,"right":block.hide_spikes_right||right_cut},"natural_end_left":block.natural_end_left,"natural_end_right":block.natural_end_right});
+            "stock_shape":{"kind":"mesh","vertices_mm":local.vertices,"faces":local.faces},"cuts":cuts,"spikes_removed":{"left":block.hide_spikes_left(),"right":block.hide_spikes_right()},"natural_end_left":block.natural_end_left(),"natural_end_right":block.natural_end_right(),"left_end":block.ends.left(),"right_end":block.ends.right()});
         if product == "special" {
             value["special_origin"] = json!({"rule_id":"minimum_ordinary_span_merge","component_ids":value["source_ids"]});
         }
         exchange.push(value);
         physical.push(PhysicalBlock {
             is_dobor: false,
+            dobor_group: None,
             cut_from_block_id: None,
             id: block.id.clone(),
             kind: block.kind.clone(),

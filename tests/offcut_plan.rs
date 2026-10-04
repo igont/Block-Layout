@@ -50,12 +50,14 @@ fn fixture(specs: &[(i64, bool, bool)]) -> (LayoutRequest, Profile, Vec<Block>) 
     let request = serde_json::from_value(json!({"schema_version":1,"request_id":"offcut-test",
         "snapshot_hash":"a".repeat(64),"z0_mm":0,"wall_volumes":walls,"opening_volumes":openings}))
     .unwrap();
+    let blocks = fb_layout::layout::finalize_parts(&request, &profile, &blocks).unwrap();
     (request, profile, blocks)
 }
 
 fn codes(request: &LayoutRequest, profile: &Profile, blocks: &[Block]) -> Value {
     let standard = exchange::from_layout_request(request, profile).unwrap();
-    export_codes(&standard, request, profile, blocks, &[]).unwrap()
+    let final_blocks = fb_layout::layout::finalize_parts(request, profile, blocks).unwrap();
+    export_codes(&standard, request, profile, &final_blocks, &[]).unwrap()
 }
 
 #[test]
@@ -162,7 +164,7 @@ fn one_opening_uses_one_side_and_its_own_opposite_course_first() {
     assert_eq!(codes(&request, &profile, &blocks), result);
     for block in &mut blocks {
         std::mem::swap(&mut block.start, &mut block.end);
-        std::mem::swap(&mut block.hide_spikes_left, &mut block.hide_spikes_right);
+        block.ends = block.ends.reversed(block.length_centimm);
         block.rotation_deg = 180;
     }
     let reversed_axes = codes(&request, &profile, &blocks);
@@ -198,6 +200,7 @@ fn shared_fixture(specs: &[(i64, bool, bool)]) -> (LayoutRequest, Profile, Vec<B
             block.end.x += 64000;
         }
     }
+    let blocks = fb_layout::layout::finalize_parts(&request, &profile, &blocks).unwrap();
     (request, profile, blocks)
 }
 
@@ -216,6 +219,8 @@ fn opposite_parts_of_each_opening_type_share_stock_without_moving_parts() {
         } else {
             request.opening_volumes[0].opening_type = opening_type.into();
         }
+        // The layout owner records the newly configured obstacle before classification.
+        let blocks = fb_layout::layout::finalize_parts(&request, &profile, &blocks).unwrap();
         let prepared = prepare(&request, &profile, &blocks).unwrap();
         assert_eq!(prepared.parents.get("block-1").map(String::as_str), Some("block-0"), "{opening_type}");
         let plan = &prepared.stock_plans["block-0"];
@@ -278,14 +283,14 @@ fn inclined_opening_without_short_parts_on_high_side_uses_low_side() {
 #[test]
 fn typed_long_stock_supplies_plain_reversed_offcut() {
     let (request, profile, mut blocks) = shared_fixture(&[(30600, false, true), (31500, true, false)]);
-    blocks[0].natural_end_right = false;
+    blocks[0].ends = fb_layout::end_state::EndStates::from_flags(false, true, true, false);
+    blocks[0].ends.record_cut(false, 30600, fb_layout::end_state::CutSource::Opening("shared".into())).unwrap();
     let donor = &mut blocks[1];
     donor.kind = "node_T".into(); donor.product_key = Some("Type8_1".into());
     donor.start.x = 96000; donor.end.x = 64500; donor.rotation_deg = 180;
-    donor.hide_spikes_left = false; donor.hide_spikes_right = true;
-    donor.natural_end_left = true; donor.natural_end_right = false;
+    donor.ends = fb_layout::end_state::EndStates::from_flags(false, true, true, false);
     donor.cuts = vec!["Type8_1:p0:y1:run-1".into()];
-    donor.obstacle_ends = vec![fb_layout::layout::ObstacleEnd {left:false, source_id:"opening:shared".into()}];
+    donor.ends.record_cut(false, 31500, fb_layout::end_state::CutSource::Opening("shared".into())).unwrap();
     let prepared = prepare(&request, &profile, &blocks).unwrap();
     assert_eq!(prepared.parents.get("block-0").map(String::as_str), Some("block-1"));
     let plan = &prepared.stock_plans["block-1"];
@@ -295,8 +300,68 @@ fn typed_long_stock_supplies_plain_reversed_offcut() {
     let result = codes(&request, &profile, &blocks);
     assert_eq!(result["blocks"][0]["is_dobor"], true);
     assert_eq!(result["blocks"][1]["product_type"], "Тип 8.1");
+    let mut odd_receiver = blocks[0].clone();
+    odd_receiver.id = "block-2".into();
+    odd_receiver.course_index = 20;
+    odd_receiver.z_centimm = 126000;
+    blocks.push(odd_receiver);
+    let odd = prepare(&request, &profile, &blocks).unwrap();
+    assert_eq!(odd.dobor_groups.len(), 2);
+    assert_eq!(odd.parents.len(), 1);
+    assert!(!odd.parents.contains_key("block-2"));
+    assert_eq!(serde_json::to_value(&odd.blocks).unwrap(), serde_json::to_value(&blocks).unwrap());
     // Перенос запила в остаток делает такой донор непригодным.
     blocks[1].cuts = vec!["Type6:p30000:y1:run-1".into()];
     blocks[1].product_key = Some("Type6".into());
     assert!(prepare(&request, &profile, &blocks).unwrap().parents.is_empty());
+}
+
+#[test]
+fn odd_receiver_remains_on_the_stable_side_without_inventing_stock() {
+    let (request, profile, blocks) = shared_fixture(&[
+        (32000, false, true), (32000, true, false), (32000, true, false),
+    ]);
+    let before = serde_json::to_value(&blocks).unwrap();
+    let prepared = prepare(&request, &profile, &blocks).unwrap();
+    assert_eq!(serde_json::to_value(&prepared.blocks).unwrap(), before);
+    assert_eq!(prepared.dobor_groups.len(), 2);
+    assert_eq!(prepared.parents.len(), 1);
+    assert_eq!(prepared.stock_plans.len(), 1);
+    let result = codes(&request, &profile, &blocks);
+    for index in [1, 2] {
+        let block = &result["blocks"][index];
+        assert_eq!(block["is_dobor"], true);
+        assert_eq!(block["dobor_group"], json!({"source_id":"shared", "side":"positive"}));
+    }
+    assert!(result["blocks"][2]["cut_from_block_id"].is_null());
+    assert!(result["blocks"][2].get("stock_cut_plan").is_none());
+    assert_eq!(result["blocks"][0]["cut_zone_ids"], json!(["shared"]));
+    let physical = fb_layout::materialize::materialize(&request, &blocks, &profile).unwrap();
+    let unmatched = physical.physical.blocks.iter().find(|block| block.id == "block-2").unwrap();
+    assert!(unmatched.is_dobor);
+    assert!(unmatched.cut_from_block_id.is_none());
+    assert_eq!(serde_json::to_value(&unmatched.dobor_group).unwrap(),
+        json!({"source_id":"shared", "side":"positive"}));
+}
+
+#[test]
+fn receiver_side_does_not_follow_changes_in_course_counts() {
+    let (request, profile, blocks) = shared_fixture(&[
+        (24000, false, true), (32000, true, false),
+        (24000, false, true), (24000, false, true),
+    ]);
+    let prepared = prepare(&request, &profile, &blocks).unwrap();
+    assert!(prepared.dobor_groups.contains_key("block-1"));
+    assert!(!prepared.dobor_groups.contains_key("block-0"));
+    let reduced = prepare(&request, &profile, &blocks[..2]).unwrap();
+    assert_eq!(reduced.dobor_groups, prepared.dobor_groups);
+}
+
+#[test]
+fn incompatible_sections_and_profiles_never_establish_membership() {
+    let (mut request, profile, blocks) = shared_fixture(&[(32000, false, true), (32000, true, false)]);
+    request.wall_volumes[1].thickness_mm = 160.0;
+    assert!(prepare(&request, &profile, &blocks).unwrap().dobor_groups.is_empty());
+    let (request, profile, blocks) = shared_fixture(&[(32300, false, true), (32300, true, false)]);
+    assert!(prepare(&request, &profile, &blocks).unwrap().dobor_groups.is_empty());
 }

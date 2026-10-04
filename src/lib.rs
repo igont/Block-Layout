@@ -4,10 +4,13 @@ pub mod code_result;
 pub mod constraints;
 pub mod domain;
 pub mod exchange;
+pub mod end_state;
+pub mod effective_geometry;
 pub mod grid;
 pub mod layout;
 pub mod materialize;
 pub mod node_assembly;
+mod node_compound;
 pub mod node_geometry;
 pub mod node_shapes;
 pub mod offcut_plan;
@@ -43,8 +46,8 @@ fn source_beam_spans_opening(o: &RawOpening, b: &RawBeam, support_mm: f64) -> bo
     let start = (b.start.x_mm - o.start.x_mm) * ux + (b.start.y_mm - o.start.y_mm) * uy;
     let end = (b.end.x_mm - o.start.x_mm) * ux + (b.end.y_mm - o.start.y_mm) * uy;
     (b.height_mm - 315.0).abs() < 0.01
-        && (b.bottom_start_mm - o.top_start_mm).abs() < 0.01
-        && (b.bottom_end_mm - o.top_end_mm).abs() < 0.01
+        && (b.bottom_start_mm.min(b.top_start_mm) - o.top_start_mm).abs() < 0.01
+        && (b.bottom_end_mm.min(b.top_end_mm) - o.top_end_mm).abs() < 0.01
         && [b.start, b.end]
             .iter()
             .all(|p| ((p.x_mm - o.start.x_mm) * uy - (p.y_mm - o.start.y_mm) * ux).abs() < 0.01)
@@ -64,6 +67,7 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
     }
     // Единая локальная копия нужна и ограничениям, и окончательной подрезке узлов.
     let mut effective = request.clone();
+    effective_geometry::normalize_beams(&mut effective);
     for opening in &mut effective.opening_volumes {
         if !opening.is_outside && opening.start_bottom_zmm.abs() < 0.01
             && opening.end_bottom_zmm.abs() < 0.01 {
@@ -313,10 +317,21 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
                 "Не найден корень консоли на непрерывной стене; материал сохранён", Some(wall.guid.clone())));
             continue;
         }
-        for part in layout.layout.blocks.iter().filter(|b| b.product_key.as_deref() == Some("Type6")
-            && b.source_ids.contains(&format!("wall:{}", wall.guid))) {
+        for part in layout.layout.blocks.iter().filter(|b| !b.is_bridge && (b.product_key.as_deref() == Some("Type6")
+            || b.cuts.iter().any(|cut| cut.starts_with("Type6:")))
+            && b.source_ids.contains(&format!("wall:{}", wall.guid))
+            && constraints.console_axes.get(&wall.guid).is_some_and(|(root, tip)| {
+                let dx = tip.x_mm - root.x_mm;
+                let dy = tip.y_mm - root.y_mm;
+                let on_axis = |point: domain::Point| {
+                    ((point.x as f64 / 100. - root.x_mm) * dy
+                        - (point.y as f64 / 100. - root.y_mm) * dx).abs() <= 0.01 * dx.hypot(dy)
+                };
+                if b.arms.is_empty() { on_axis(b.start) && on_axis(b.end) }
+                else { b.arms.iter().all(|arm| on_axis(arm.start) && on_axis(arm.end)) }
+            })) {
             let mut warning = ApiFailure::new("CONSOLE_LINTEL_UNPLACED",
-                "Перемычка консоли не помещается в исходном ряду типа 6 с заглублением больше длины консоли; материал сохранён",
+                "Не удалось склеить доступные детали консоли в исходном ряду; материал сохранён",
                 Some(wall.guid.clone()));
             warning.course_index = Some(part.course_index);
             diagnostics.push(warning);
@@ -327,31 +342,6 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
             "Исходная балка высотой 315 мм перекрывает проём с опиранием с обеих сторон и заменяет обычные перемычки", None);
         note.source_ids = vec![opening_id.clone(), beam_id.clone()];
         diagnostics.push(note);
-    }
-    for opening in &openings {
-        if beam_spanned.iter().any(|(id, _)| *id == opening.id) {
-            continue;
-        }
-        let width =
-            (opening.end.x_mm - opening.start.x_mm).hypot(opening.end.y_mm - opening.start.y_mm);
-        if width > 1500.0 || (opening.top_start_mm - opening.top_end_mm).abs() > 0.01 {
-            continue;
-        }
-        let required = if width <= 1000.0 { 3 } else { 5 };
-        let available = constraints
-            .lintel_candidates
-            .iter()
-            .filter(|l| l.opening_id == opening.id)
-            .map(|l| l.course_index)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
-        if available < required {
-            let top_row = opening.top_start_mm
-                + ((required - 1) * 2) as f64 * profile.index_centimm as f64 / 100.0;
-            let mut note = ApiFailure::new("LINTEL_ROWS_INCOMPLETE",format!("Для проёма имеется {available} из {required} требуемых рядов перемычек; верхний требуемый ряд {top_row} мм отсутствует в материале стены"),Some(opening.id.clone()));
-            note.source_ids.push(opening.id.clone());
-            diagnostics.push(note);
-        }
     }
     let excluded: Vec<_> = request
         .opening_volumes
@@ -418,11 +408,29 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
         note.source_ids = short;
         diagnostics.push(note);
     }
+    let blocks = match layout::finalize_parts(request, profile, &layout.layout.blocks) {
+        Ok(blocks) => blocks,
+        Err(error) => return failure(vec![error]),
+    };
+    for opening in &openings {
+        if beam_spanned.iter().any(|(id, _)| *id == opening.id) { continue; }
+        let width = (opening.end.x_mm - opening.start.x_mm).hypot(opening.end.y_mm - opening.start.y_mm);
+        if width > 1500. || (opening.top_start_mm - opening.top_end_mm).abs() > 0.01 { continue; }
+        let required = if width <= 1000. { 3 } else { 5 };
+        let source = format!("opening:{}", opening.id);
+        let available = blocks.iter().filter(|block| block.is_bridge
+            && (block.source_ids.contains(&source) || block.source_ids.contains(&opening.id)))
+            .map(|block| block.course_index).collect::<std::collections::BTreeSet<_>>().len();
+        if available < required {
+            let mut note = ApiFailure::new("LINTEL_ROWS_INCOMPLETE",
+                format!("Для проёма выпущено {available} из {required} требуемых рядов перемычек; набор неполный"),
+                Some(opening.id.clone()));
+            note.source_ids.push(source);
+            diagnostics.push(note);
+        }
+    }
     CandidateResult {
-        blocks: match layout::finalize_parts(request, profile, &layout.layout.blocks) {
-            Ok(blocks) => blocks,
-            Err(error) => return failure(vec![error]),
-        },
+        blocks,
         diagnostics,
         elapsed_ms: started.elapsed().as_millis(),
     }
@@ -468,7 +476,7 @@ mod opening_tests {
         );
         let left = result.blocks.iter().find(|b| b.end.x == 64_000).unwrap();
         let right = result.blocks.iter().find(|b| b.start.x == 96_000).unwrap();
-        assert!(left.hide_spikes_right && right.hide_spikes_left);
+        assert!(left.hide_spikes_right() && right.hide_spikes_left());
         assert!(result
             .blocks
             .iter()
@@ -541,11 +549,11 @@ mod opening_tests {
             assert!(blocks
                 .iter()
                 .filter(|b| b.end.x == 32_000)
-                .all(|b| b.hide_spikes_right));
+                .all(|b| b.hide_spikes_right()));
             assert!(blocks
                 .iter()
                 .filter(|b| b.start.x == 256_000)
-                .all(|b| b.hide_spikes_left));
+                .all(|b| b.hide_spikes_left()));
         }
         let mut narrow = r.clone();
         narrow.opening_volumes[0].end_xmm = 1600.0;
@@ -670,6 +678,35 @@ mod opening_tests {
             "Type10.1 на точном конце должен сохранить исходный венец перемычки"
         );
     }
+    #[test]
+    fn real_t_conflict_shifts_available_layers_and_warns_about_the_missing_upper_layer() {
+        let mut r = request(0.);
+        r.wall_volumes[0].end_xmm = 3200.;
+        r.wall_volumes[0].start_top_zmm = 441.;
+        r.wall_volumes[0].end_top_zmm = 441.;
+        let mut stem = r.wall_volumes[0].clone();
+        stem.guid = "stem".into();
+        stem.start_xmm = 1600.;
+        stem.end_xmm = 1600.;
+        stem.end_ymm = 1280.;
+        stem.start_top_zmm = 504.;
+        stem.end_top_zmm = 504.;
+        r.wall_volumes.push(stem);
+        r.opening_volumes[0].start_xmm = 1200.;
+        r.opening_volumes[0].end_xmm = 2000.;
+        r.opening_volumes[0].start_top_zmm = 126.;
+        r.opening_volumes[0].end_top_zmm = 126.;
+        let profile: Profile = serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
+        let result = inspect_request(&r, &profile);
+        assert!(!result.blocks.is_empty(), "{:?}", result.diagnostics);
+        let courses: std::collections::BTreeSet<_> = result.blocks.iter().filter(|block| block.is_bridge)
+            .map(|block| block.course_index).collect();
+        assert_eq!(courses, std::collections::BTreeSet::from([3, 5]), "{:?}", result.diagnostics);
+        let warning = result.diagnostics.iter().find(|note| note.code == "LINTEL_ROWS_INCOMPLETE").unwrap();
+        assert!(warning.message.contains("2 из 3"), "{}", warning.message);
+        assert_eq!(warning.source_ids, vec!["opening:opening"]);
+    }
+
     #[test]
     fn actual_t_catalog_cut_survives_in_long_bridge_and_stem_is_kept() {
         let mut r = request(0.0);

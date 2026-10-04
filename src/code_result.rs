@@ -49,13 +49,13 @@ fn token(face: u8, position: i64, length: i64, product: &str) -> String {
 }
 
 pub(crate) fn validate_end_states(block: &Block) -> Result<(), ApiFailure> {
-    if (!block.natural_end_left && !block.hide_spikes_left)
-        || (!block.natural_end_right && !block.hide_spikes_right)
+    if (!block.natural_end_left() && !block.hide_spikes_left())
+        || (!block.natural_end_right() && !block.hide_spikes_right())
     {
         return Err(issue(block, "Искусственный торец не может иметь шипы"));
     }
-    let insets = i64::from(block.natural_end_left && block.hide_spikes_left)
-        + i64::from(block.natural_end_right && block.hide_spikes_right);
+    let insets = i64::from(block.natural_end_left() && block.hide_spikes_left())
+        + i64::from(block.natural_end_right() && block.hide_spikes_right());
     if block.length_centimm <= insets * 500 {
         return Err(issue(block, "Снятие шипов поглощает всю длину детали"));
     }
@@ -244,6 +244,7 @@ pub(crate) fn export_block(
         mm(block.length_centimm) + begin_extension + l_extension(block.length_centimm);
     let product_type = match block.product_key.as_deref() {
         _ if block.is_bridge => "Перемычка".into(),
+        _ if block.kind == "node_compound" => "Комбинированный".into(),
         Some(key) if key.starts_with("Type") => {
             format!("Тип {}", key.trim_start_matches("Type").replace('_', "."))
         }
@@ -256,8 +257,9 @@ pub(crate) fn export_block(
             "x_axis":[clean(cos),clean(sin),0.0],"y_axis":[clean(-sin),clean(cos),0.0],"z_axis":[0.0,0.0,1.0]},
         "length_mm":physical_length,"nominal_length_mm":mm(block.length_centimm),
         "width_mm":width,"height_mm":mm(profile.index_centimm),"course_index":block.course_index,
-        "source_ids":source_ids,"wall_ids":wall_ids,"hide_spikes_left":block.hide_spikes_left,"hide_spikes_right":block.hide_spikes_right,
-        "natural_end_left":block.natural_end_left,"natural_end_right":block.natural_end_right,
+        "source_ids":source_ids,"wall_ids":wall_ids,"hide_spikes_left":block.hide_spikes_left(),"hide_spikes_right":block.hide_spikes_right(),
+        "natural_end_left":block.natural_end_left(),"natural_end_right":block.natural_end_right(),
+        "left_end":block.ends.left(),"right_end":block.ends.right(),
         "node_cuts":node_cuts,"trims":trims}),
     )
 }
@@ -282,7 +284,7 @@ pub fn export_codes(
         prepared.annotate(&mut value);
         values.push(value);
     }
-    let mut result = exchange::success_result_with_warnings(standard, values, Vec::new(), warnings);
+    let mut result = exchange::success_result_with_warnings(standard, values, crate::effective_geometry::beam_adjustments(request), warnings);
     result["format"] = json!("fb-layout-codes/1");
     Ok(result)
 }
@@ -502,7 +504,7 @@ mod tests {
             serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
         let mut ordinary = block("ordinary", "ordinary", None, vec!["right"]);
         ordinary.length_centimm = 57632;
-        ordinary.hide_spikes_right = true;
+        ordinary.ends = crate::end_state::EndStates::from_flags(ordinary.hide_spikes_left(), true, ordinary.natural_end_left(), ordinary.natural_end_right());
         let result = export_codes(&standard, &request, &profile, &[ordinary], &[]).unwrap();
         let value = &result["blocks"][0];
         assert_eq!(value["code1"], "П576.32");

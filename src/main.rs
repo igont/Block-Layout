@@ -139,7 +139,7 @@ fn run() -> Result<bool, String> {
     let result = exchange::success_result_with_warnings(
         &standard,
         materialized.exchange_blocks,
-        Vec::new(),
+        fb_layout::effective_geometry::beam_adjustments(&request),
         &candidate.diagnostics,
     );
     publish(&result_path, &result)?;

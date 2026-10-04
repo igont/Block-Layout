@@ -2166,6 +2166,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 3, 5, 7, 9]
         );
+        for available in [4, 5, 8, 9] {
+            let mut short = t.clone();
+            short.courses.truncate(available + 1);
+            for (end, requested) in [(2000., vec![1, 3, 5]), (2500., vec![1, 3, 5, 7, 9])] {
+                let mut source = opening();
+                source.end = raw(end, 0.);
+                let actual = build_constraints(&short, &[source], &[], 200., 200.).unwrap();
+                let expected: Vec<_> = requested.into_iter()
+                    .filter(|index| *index <= available as i64).collect();
+                assert_eq!(actual.lintel_candidates.iter().map(|c| c.course_index)
+                    .collect::<Vec<_>>(), expected, "available={available}, end={end}");
+            }
+        }
     }
 
     #[test]

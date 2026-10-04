@@ -20,7 +20,7 @@ class OffcutSchemaTest(unittest.TestCase):
                      "saw_cuts_mm": [[315, 320], [320, 325]], "waste_intervals_mm": []}
 
     def test_both_contracts_share_the_same_stock_definitions(self):
-        for name in ["stockInterval", "stockPart", "stockCutPlan"]:
+        for name in ["stockInterval", "stockPart", "stockCutPlan", "doborGroup"]:
             self.assertEqual(self.schemas[0]["$defs"][name], self.schemas[1]["$defs"][name])
         for schema in self.schemas:
             Draft202012Validator.check_schema(schema)
@@ -40,11 +40,18 @@ class OffcutSchemaTest(unittest.TestCase):
             validator = Draft202012Validator({"$defs": schema["$defs"], "allOf": constraints})
             for valid in [{}, {"is_dobor": False, "cut_from_block_id": None},
                           {"is_dobor": True, "cut_from_block_id": "parent", "cut_zone_ids": ["window"]},
+                          {"is_dobor": True, "cut_from_block_id": None, "cut_zone_ids": ["window"],
+                           "dobor_group": {"source_id": "window", "side": "positive"}},
                           {"is_dobor": False, "cut_from_block_id": None,
                            "cut_zone_ids": ["window"], "stock_cut_plan": self.plan}]:
                 validator.validate(valid)
             for invalid in [{"is_dobor": True}, {"is_dobor": True, "cut_from_block_id": None},
                             {"is_dobor": False, "cut_from_block_id": "parent"},
+                            {"is_dobor": False, "dobor_group": {"source_id": "window", "side": "positive"}},
+                            {"is_dobor": True, "cut_from_block_id": None, "cut_zone_ids": ["window"],
+                             "dobor_group": {"source_id": "window", "side": "unknown"}},
+                            {"is_dobor": True, "cut_from_block_id": None, "cut_zone_ids": ["window"],
+                             "dobor_group": {"source_id": "window"}},
                             {"stock_cut_plan": self.plan},
                             {"is_dobor": True, "cut_from_block_id": "parent",
                              "cut_zone_ids": ["window"], "stock_cut_plan": self.plan}]:
