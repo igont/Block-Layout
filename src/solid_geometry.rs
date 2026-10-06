@@ -145,6 +145,34 @@ fn push_face(mesh: &mut Mesh, points: Vec<[f64; 3]>) {
     }
 }
 
+/// Округление тела сохраняет общие вершины и удаляет схлопнувшиеся грани.
+/// Простая замена координат оставляет разные индексы у одной точки.
+pub fn quantized(mesh: &Mesh) -> Mesh {
+    let mut result = Mesh { vertices: Vec::new(), faces: Vec::new() };
+    for face in &mesh.faces {
+        push_face(&mut result, face.iter().map(|&i| {
+            mesh.vertices[i].map(crate::precision::mm)
+        }).collect());
+    }
+    let mut used = vec![false; result.vertices.len()];
+    for face in &result.faces {
+        for &i in face { used[i] = true; }
+    }
+    let mut remap = vec![0; used.len()];
+    let mut vertices = Vec::new();
+    for (i, &point) in result.vertices.iter().enumerate() {
+        if used[i] {
+            remap[i] = vertices.len();
+            vertices.push(point);
+        }
+    }
+    for face in &mut result.faces {
+        for i in face { *i = remap[*i]; }
+    }
+    result.vertices = vertices;
+    result
+}
+
 /// Пересечение с полупространством dot(normal, point) <= offset.
 /// Каждая новая граница закрывается гранью с наружной нормалью plane.normal.
 pub fn clip(mesh: &Mesh, plane: &Plane) -> Option<Mesh> {
@@ -279,6 +307,23 @@ mod tests {
         assert!((volume(&half) - 500.0).abs() < 1e-8);
         assert_closed(&half);
         assert_eq!(bounds(&half), Some(([0.0; 3], [10.0; 3])));
+    }
+
+    #[test]
+    fn quantized_sloping_lamella_welds_collapsed_edge_and_stays_closed() {
+        let blank = box_mesh([-96.5, 1944.28, 4032.0], AXES, [15.0, 615.72, 63.0]);
+        let slope = 63.0 / 142.26;
+        let clipped = clip(&blank, &Plane {
+            normal: [0.0, -slope, 1.0],
+            offset: 4032.002 - slope * 1944.28,
+        }).unwrap();
+        assert!(clipped.vertices.len() > 8, "Срез должен создать короткое ребро");
+        let rounded = quantized(&clipped);
+        assert_eq!(rounded.vertices.len(), 8);
+        assert_eq!(rounded.faces.len(), 6);
+        assert_closed(&rounded);
+        assert!((volume(&rounded) - 15.0 * 63.0 * (615.72 - 142.26 / 2.0)).abs() < 1e-6);
+        assert_eq!(quantized(&rounded), rounded);
     }
 
     #[test]

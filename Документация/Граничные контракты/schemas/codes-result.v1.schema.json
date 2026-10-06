@@ -16,6 +16,7 @@
     "catalog": {"$ref": "#/$defs/versionedRef"},
     "scope": {"$ref": "#/$defs/scope"},
     "blocks": {"type": "array", "items": {"$ref": "#/$defs/block"}},
+    "lamellas": {"type": "array", "items": {"$ref": "#/$defs/lamella"}, "description": "Отдельные физические ламели с центром в собственном теле. Новый производитель всегда передаёт массив; пустой массив очищает предыдущую раскладку ламелей."},
     "warnings": {"type": "array", "items": {"$ref": "#/$defs/diagnostic"}},
     "beam_adjustments": {"type": "array", "items": {"$ref": "#/$defs/beamSectionReplacement"}}
   },
@@ -75,6 +76,53 @@
       "type": "object", "additionalProperties": false, "required": ["origin_mm", "x_axis", "y_axis", "z_axis"],
       "properties": {"origin_mm": {"$ref": "#/$defs/vec3"}, "x_axis": {"$ref": "#/$defs/vec3"}, "y_axis": {"$ref": "#/$defs/vec3"}, "z_axis": {"$ref": "#/$defs/vec3"}}
     },
+    "centeredFrame": {
+      "type": "object", "additionalProperties": false,
+      "required": ["center_mm", "x_axis", "y_axis", "z_axis"],
+      "properties": {"center_mm": {"$ref": "#/$defs/vec3"}, "x_axis": {"$ref": "#/$defs/vec3"}, "y_axis": {"$ref": "#/$defs/vec3"}, "z_axis": {"$ref": "#/$defs/vec3"}},
+      "description": "Правая ортонормированная система: X вдоль длины, Y вдоль толщины, Z вдоль высоты. center_mm находится внутри готового тела; для прямоугольной детали это центр габарита, для подрезанного тела - среднее его вершин."
+    },
+    "lamellaSolid": {
+      "type": "object", "additionalProperties": false,
+      "required": ["vertices", "faces"],
+      "properties": {
+        "vertices": {"type": "array", "minItems": 4, "items": {"$ref": "#/$defs/vec3"}},
+        "faces": {"type": "array", "minItems": 4, "items": {"type": "array", "minItems": 3, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}}}
+      },
+      "description": "Точное замкнутое выпуклое тело в мировых миллиметрах. Грани имеют наружный обход, индексы относятся к vertices. При наличии заменяет прямоугольный габарит в физической геометрии."
+    },
+    "lamella": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "placement", "length_mm", "thickness_mm", "height_mm", "course_index", "side", "wall_ids", "beam_ids", "source_ids"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "placement": {"$ref": "#/$defs/centeredFrame"},
+        "solid": {"$ref": "#/$defs/lamellaSolid"},
+        "length_mm": {"$ref": "#/$defs/positive"},
+        "thickness_mm": {"const": 15},
+        "height_mm": {"type": "number", "exclusiveMinimum": 0, "maximum": 63},
+        "course_index": {"type": "integer"},
+        "side": {"enum": ["left", "right"], "description": "Сторона канонической оси стены; происхождение детали, без переключения её отображения."},
+        "wall_ids": {"$ref": "#/$defs/ids"},
+        "beam_ids": {"$ref": "#/$defs/ids"},
+        "recess_block_ids": {"$ref": "#/$defs/ids", "description": "Блоки того же венца и оси, чьи номинальные участки перекрываются с ячейкой готовой ламели. Третий проход определяет снятие стороны только по сетке; торцевые выступы и физические тела не участвуют. Коды и размещение блоков сохраняются."},
+        "source_ids": {"$ref": "#/$defs/ids"}
+      }
+    },
+    "lamellaRecess": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "lamella_id", "placement", "length_mm", "thickness_mm", "height_mm"],
+      "properties": {
+        "kind": {"const": "lamella_recess"},
+        "lamella_id": {"$ref": "#/$defs/id"},
+        "placement": {"$ref": "#/$defs/centeredFrame"},
+        "solid": {"$ref": "#/$defs/lamellaSolid"},
+        "length_mm": {"$ref": "#/$defs/positive"},
+        "thickness_mm": {"const": 15},
+        "height_mm": {"type": "number", "exclusiveMinimum": 0, "maximum": 63}
+      },
+      "description": "Из блока вычитается пересечение его готового тела с указанным телом ламели. Операция сохраняет остальное сечение и исходную осевую длину блока."
+    },
     "nodeCut": {
       "type": "object", "additionalProperties": false,
       "required": ["product_type", "y", "position_mm", "face", "source_run_ids"],
@@ -82,6 +130,7 @@
     },
     "trim": {
       "oneOf": [
+        {"$ref": "#/$defs/lamellaRecess"},
         {"type": "object", "additionalProperties": false, "required": ["description"], "properties": {"description": {"$ref": "#/$defs/id"}, "side": {"enum": ["left", "right"]}}},
         {
           "type": "object",

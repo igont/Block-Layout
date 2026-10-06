@@ -134,6 +134,8 @@ pub fn materialize(
     blocks: &[Block],
     profile: &Profile,
 ) -> Result<Materialized, ApiFailure> {
+    let normalized = request.normalized();
+    let request = &normalized;
     let prepared = crate::offcut_plan::prepare(request, profile, blocks)?;
     let mut effective = request.clone();
     crate::effective_geometry::normalize_beams(&mut effective);

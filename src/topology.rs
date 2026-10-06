@@ -16,20 +16,7 @@ fn scaled(value: f64, name: &str) -> Result<i64, String> {
     if !value.is_finite() || value.abs() > LIMIT as f64 / 100.0 {
         return Err(format!("{name}: координата вне допустимого диапазона"));
     }
-    let units = value * 100.0;
-    // Десятичные половины (например, 1,015 мм) могут стать 101,49999999999999
-    // при передаче через f64. Убираем только погрешность самого умножения.
-    let floor = units.floor();
-    let result = if (units - floor - 0.5).abs() <= 1e-11 {
-        let lower = floor as i64;
-        if lower % 2 == 0 {
-            lower
-        } else {
-            lower + 1
-        }
-    } else {
-        units.round_ties_even() as i64
-    };
+    let result = crate::precision::centimm(value) as i64;
     if result.abs() > LIMIT {
         return Err(format!("{name}: координата вне допустимого диапазона"));
     }
@@ -100,17 +87,38 @@ pub fn normalize_building(raw: RawBuilding) -> Result<NormalizedBuilding, String
         return Err("слишком много стен".into());
     }
     let z0 = scaled(raw.z0_mm, "z0")?;
-    let mut original_points = BTreeMap::new();
+    // Coordinate transforms can leave floating-point noise even at zero.
+    // Bound it by a few f64 roundoffs at the scale of the source geometry,
+    // rather than treating the entire 0.01 mm rounding cell as one point.
+    let coordinate_scale = raw
+        .walls
+        .iter()
+        .flat_map(|wall| {
+            [
+                wall.start.x_mm,
+                wall.start.y_mm,
+                wall.end.x_mm,
+                wall.end.y_mm,
+            ]
+        })
+        .map(f64::abs)
+        .fold(1.0, f64::max);
+    let roundoff_mm = 8.0 * f64::EPSILON * coordinate_scale;
+    let mut original_points: BTreeMap<Point, crate::domain::RawPoint> = BTreeMap::new();
     for wall in &raw.walls {
         for original in [wall.start, wall.end] {
             let normalized = point(original)?;
-            if let Some(previous) = original_points.insert(normalized, original) {
-                if previous != original {
+            if let Some(previous) = original_points.get(&normalized) {
+                if (previous.x_mm - original.x_mm).abs() > roundoff_mm
+                    || (previous.y_mm - original.y_mm).abs() > roundoff_mm
+                {
                     return Err(format!(
                         "разные точки схлопнулись при округлении: {}, {}",
                         normalized.x, normalized.y
                     ));
                 }
+            } else {
+                original_points.insert(normalized, original);
             }
         }
     }
@@ -676,6 +684,30 @@ mod tests {
             walls: vec![
                 wall("a", (0.0, 0.0), (100.0, 0.0), 0.0, 63.0),
                 wall("b", (0.004, 0.0), (0.004, 100.0), 0.0, 63.0),
+            ],
+        };
+        assert!(normalize_building(raw).unwrap_err().contains("схлопнулись"));
+    }
+
+    #[test]
+    fn shared_endpoint_with_floating_point_noise_has_same_topology() {
+        let bottom = wall("bottom", (0.0, 0.0), (9920.0, 0.0), 0.0, 63.0);
+        let right = wall("right", (9920.0, 0.0), (9920.0, 5120.0), 0.0, 63.0);
+        let expected = topology(vec![bottom.clone(), right.clone()]);
+        let mut noisy = right;
+        // Actual endpoint exported for Beresta 44 after coordinate transforms.
+        noisy.start.y_mm = -1.7763568394002505e-12;
+        assert_eq!(topology(vec![bottom.clone(), noisy.clone()]), expected);
+        assert_eq!(topology(vec![noisy, bottom]), expected);
+    }
+
+    #[test]
+    fn small_distinct_points_at_large_coordinates_are_rejected() {
+        let raw = RawBuilding {
+            z0_mm: 0.0,
+            walls: vec![
+                wall("bottom", (0.0, 0.0), (9920.0, 0.0), 0.0, 63.0),
+                wall("right", (9920.0, 0.000001), (9920.0, 5120.0), 0.0, 63.0),
             ],
         };
         assert!(normalize_building(raw).unwrap_err().contains("схлопнулись"));

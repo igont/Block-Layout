@@ -7,7 +7,7 @@
   "required": ["format", "kind", "request_id", "snapshot_hash", "coordinate_system", "profile", "catalog", "scope"],
   "properties": {
     "format": {"const": "fb-layout/1"},
-    "kind": {"enum": ["layout_request", "layout_result"]},
+    "kind": {"enum": ["layout_request", "blocks_layout_request", "lamella_layout_request", "layout_result"]},
     "request_id": {"$ref": "#/$defs/id"},
     "snapshot_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "coordinate_system": {"$ref": "#/$defs/coordinateSystem"},
@@ -23,7 +23,7 @@
   },
   "oneOf": [
     {
-      "properties": {"kind": {"const": "layout_request"}},
+      "properties": {"kind": {"enum": ["layout_request", "blocks_layout_request", "lamella_layout_request"]}},
       "required": ["model"],
       "not": {"anyOf": [{"required": ["status"]}, {"required": ["blocks"]}, {"required": ["beam_adjustments"]}, {"required": ["diagnostics"]}, {"required": ["warnings"]}]}
     },
@@ -38,7 +38,33 @@
       "not": {"anyOf": [{"required": ["model"]}, {"required": ["blocks"]}, {"required": ["beam_adjustments"]}, {"required": ["warnings"]}]}
     }
   ],
+  "allOf": [{"if": {"properties": {"kind": {"const": "lamella_layout_request"}}}, "then": {"properties": {"model": {"required": ["saved_blocks"]}}}, "else": {"properties": {"model": {"not": {"required": ["saved_blocks"]}}}}}],
   "$defs": {
+    "savedBlockFrame": {
+      "type": "object", "additionalProperties": false,
+      "required": ["origin_mm", "x_axis", "y_axis", "z_axis"],
+      "properties": {"origin_mm": {"$ref": "#/$defs/vec3"}, "x_axis": {"$ref": "#/$defs/vec3"}, "y_axis": {"$ref": "#/$defs/vec3"}, "z_axis": {"$ref": "#/$defs/vec3"}}
+    },
+    "savedBlockSolid": {
+      "type": "object", "additionalProperties": false, "required": ["vertices", "faces"],
+      "properties": {
+        "vertices": {"type": "array", "minItems": 4, "items": {"$ref": "#/$defs/vec3"}},
+        "faces": {"type": "array", "minItems": 4, "items": {"type": "array", "minItems": 3, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}}}
+      },
+      "description": "One closed convex part of the saved physical block; vertices are world millimetres and faces have outward winding. All parts together preserve holes and previous cuts."
+    },
+    "savedBlock": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "placement", "length_mm", "width_mm", "height_mm", "course_index", "wall_ids", "solids"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "placement": {"$ref": "#/$defs/savedBlockFrame"},
+        "length_mm": {"type": "number", "exclusiveMinimum": 0}, "width_mm": {"type": "number", "exclusiveMinimum": 0}, "height_mm": {"type": "number", "exclusiveMinimum": 0},
+        "course_index": {"type": "integer"}, "wall_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "grid_start_mm": {"$ref": "#/$defs/vec3"}, "grid_end_mm": {"$ref": "#/$defs/vec3"},
+        "solids": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/savedBlockSolid"}}
+      },
+      "dependentRequired": {"grid_start_mm": ["grid_end_mm"], "grid_end_mm": ["grid_start_mm"]}
+    },
     "beamSectionReplacement": {
       "type": "object", "additionalProperties": false,
       "required": ["beam_id", "rule_id", "original_height_mm", "height_mm", "start_z_mm", "end_z_mm", "bottom_start_z_mm", "bottom_end_z_mm", "height_direction"],
@@ -151,7 +177,8 @@
       "properties": {
         "wall_volumes": {"type": "array", "items": {"$ref": "#/$defs/wallVolume"}},
         "openings": {"type": "array", "items": {"$ref": "#/$defs/opening"}},
-        "beams": {"type": "array", "items": {"$ref": "#/$defs/beam"}}
+        "beams": {"type": "array", "items": {"$ref": "#/$defs/beam"}},
+        "saved_blocks": {"type": "array", "items": {"$ref": "#/$defs/savedBlock"}}
       }
     },
     "shape": {

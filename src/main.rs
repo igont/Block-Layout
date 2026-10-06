@@ -42,7 +42,9 @@ fn publish<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), String> {
         .open(&temporary)
         .map_err(|e| format!("{}: {e}", temporary.display()))?;
     let mut writer = BufWriter::new(file);
-    serde_json::to_writer(&mut writer, value).map_err(|e| e.to_string())?;
+    let mut output = serde_json::to_value(value).map_err(|e| e.to_string())?;
+    fb_layout::precision::normalize_result(&mut output);
+    serde_json::to_writer(&mut writer, &output).map_err(|e| e.to_string())?;
     writer.flush().map_err(|e| e.to_string())?;
     writer
         .into_inner()
@@ -76,9 +78,18 @@ fn run() -> Result<bool, String> {
     } else {
         // Явный локальный адаптер сохранённых снимков; публичный результат нейтрален.
         let request: LayoutRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
+        let request = request.normalized();
         let standard = exchange::from_layout_request(&request, &profile).map_err(|e| e.message)?;
         (request, standard)
     };
+    if standard.kind=="lamella_layout_request" {
+        let result=match fb_layout::lamella_saved::export(&standard,&profile) {
+            Ok(value)=>value,Err(error)=>{publish(&result_path,&exchange::failure_result(&standard,&[error]))?;return Ok(false);}
+        };
+        publish(&result_path,&result)?;
+        println!("lamellas={} output=lamellas saved_blocks_unchanged=true",result["lamellas"].as_array().map_or(0,Vec::len));
+        return Ok(true);
+    }
     let mut candidate = fb_layout::inspect_request(&request, &profile);
     if let Some(path) = optional_argument("--candidate") {
         publish(&path, &candidate)?;
@@ -90,8 +101,9 @@ fn run() -> Result<bool, String> {
         )?;
         return Ok(false);
     }
-    if optional_argument("--codes-only").as_deref() == Some(Path::new("true")) {
-        let result = match fb_layout::code_result::export_codes(
+    if standard.kind=="blocks_layout_request" || optional_argument("--codes-only").as_deref() == Some(Path::new("true")) {
+        let exporter=if standard.kind=="blocks_layout_request" {fb_layout::code_result::export_blocks}else{fb_layout::code_result::export_codes};
+        let result = match exporter(
             &standard,
             &request,
             &profile,

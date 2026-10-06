@@ -1,4 +1,4 @@
-//! Нейтральная граница fb-layout/1. Геометрия передаётся ядру без округления.
+//! Нейтральная граница fb-layout/1. Рабочая геометрия нормализуется до 0,01 мм.
 use crate::api::{ApiFailure, Beam, BeamGeometry, LayoutRequest, Volume};
 use crate::layout::Profile;
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,8 @@ pub struct Model {
     pub wall_volumes: Vec<WallVolume>,
     pub openings: Vec<Opening>,
     pub beams: Vec<ExchangeBeam>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_blocks: Option<Vec<crate::lamella::SavedBlock>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +106,20 @@ pub fn parse_request(text: &str) -> Result<ExchangeRequest, ApiFailure> {
 
 impl AxisPrism {
     fn convert(&self, id: &str, purpose: i32, opening: &str) -> Result<Volume, ApiFailure> {
+        let mut normalized = self.clone();
+        normalized.start_xy_mm = normalized.start_xy_mm.map(crate::precision::mm);
+        normalized.end_xy_mm = normalized.end_xy_mm.map(crate::precision::mm);
+        for value in [
+            &mut normalized.bottom_start_mm, &mut normalized.bottom_end_mm,
+            &mut normalized.top_start_mm, &mut normalized.top_end_mm,
+            &mut normalized.left_thickness_mm, &mut normalized.right_thickness_mm,
+        ] {
+            *value = crate::precision::mm(*value);
+        }
+        normalized.convert_normalized(id, purpose, opening)
+    }
+
+    fn convert_normalized(&self, id: &str, purpose: i32, opening: &str) -> Result<Volume, ApiFailure> {
         let values = [
             self.start_xy_mm[0],
             self.start_xy_mm[1],
@@ -143,7 +159,7 @@ impl AxisPrism {
             end_bottom_zmm: self.bottom_end_mm,
             start_top_zmm: self.top_start_mm,
             end_top_zmm: self.top_end_mm,
-            thickness_mm: self.left_thickness_mm + self.right_thickness_mm,
+            thickness_mm: crate::precision::mm(self.left_thickness_mm + self.right_thickness_mm),
             purpose_type: purpose,
             opening_type: opening.into(),
             is_outside: false,
@@ -171,12 +187,18 @@ impl ExchangeRequest {
     }
 
     pub fn to_layout_request(&self) -> Result<LayoutRequest, ApiFailure> {
-        if self.format != "fb-layout/1" || self.kind != "layout_request" {
+        if self.format != "fb-layout/1" || !matches!(self.kind.as_str(),"layout_request"|"blocks_layout_request"|"lamella_layout_request") {
             return Err(error(
                 "UNSUPPORTED_VERSION",
                 "Ожидается запрос fb-layout/1",
                 None,
             ));
+        }
+        if self.kind!="lamella_layout_request"&&self.model.saved_blocks.is_some() {
+            return Err(error("INVALID_EXCHANGE","saved_blocks допустимы только при отдельной раскладке ламелей",None));
+        }
+        if self.kind=="lamella_layout_request"&&self.model.saved_blocks.is_none() {
+            return Err(error("INVALID_EXCHANGE","Для отдельной раскладки ламелей требуется массив saved_blocks",None));
         }
         if !valid_id(&self.request_id)
             || self.snapshot_hash.len() != 64
@@ -320,6 +342,14 @@ impl ExchangeRequest {
                     Some(&beam.id),
                 ));
             }
+            let mut beam = beam.clone();
+            beam.start_mm = beam.start_mm.map(crate::precision::mm);
+            beam.end_mm = beam.end_mm.map(crate::precision::mm);
+            beam.width_mm = crate::precision::mm(beam.width_mm);
+            beam.height_mm = crate::precision::mm(beam.height_mm);
+            if beam.start_mm == beam.end_mm || beam.width_mm <= 0.0 || beam.height_mm <= 0.0 {
+                return Err(error("INVALID_BEAM_FRAME", "Балка вырождается на сетке 0,01 мм", Some(&beam.id)));
+            }
             beams.push(Beam {
                 guid: beam.id.clone(),
                 start_xmm: beam.start_mm[0],
@@ -343,7 +373,7 @@ impl ExchangeRequest {
             project_name: String::new(),
             project_id: None,
             snapshot_hash: self.snapshot_hash.clone(),
-            z0_mm: self.coordinate_system.z0_mm,
+            z0_mm: crate::precision::mm(self.coordinate_system.z0_mm),
             wall_volumes: walls,
             opening_volumes: openings,
             beams,
@@ -469,6 +499,7 @@ pub fn from_layout_request(
                     ],
                 })
                 .collect(),
+            saved_blocks: None,
         },
     };
     converted.to_layout_request()?;
@@ -476,9 +507,11 @@ pub fn from_layout_request(
 }
 
 fn result_envelope(request: &ExchangeRequest) -> Value {
-    json!({"format":"fb-layout/1", "kind":"layout_result", "request_id":request.request_id,
+    let mut result = json!({"format":"fb-layout/1", "kind":"layout_result", "request_id":request.request_id,
         "snapshot_hash":request.snapshot_hash, "coordinate_system":request.coordinate_system,
-        "profile":request.profile, "catalog":request.catalog, "scope":request.scope})
+        "profile":request.profile, "catalog":request.catalog, "scope":request.scope});
+    crate::precision::normalize_result(&mut result);
+    result
 }
 pub fn success_result(
     request: &ExchangeRequest,
@@ -489,6 +522,7 @@ pub fn success_result(
     result["status"] = json!("success");
     result["blocks"] = json!(blocks);
     result["beam_adjustments"] = json!(beam_adjustments);
+    crate::precision::normalize_result(&mut result);
     result
 }
 pub fn success_result_with_warnings(

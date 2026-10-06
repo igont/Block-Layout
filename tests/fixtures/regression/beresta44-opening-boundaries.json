@@ -1,0 +1,542 @@
+{
+  "format": "fb-layout/1",
+  "kind": "blocks_layout_request",
+  "request_id": "project98-opening-row-regression",
+  "snapshot_hash": "b1b61b9261911152cb85bc084d43b9dfa1bd0a23694095733ee1947afe146b76",
+  "coordinate_system": {
+    "id": "snapshot-world",
+    "units": "mm",
+    "coordinate_quantum_mm": 0.01,
+    "z0_mm": -251.99999999999844
+  },
+  "profile": {
+    "id": "banya-prototype",
+    "revision": "2"
+  },
+  "catalog": {
+    "id": "ForestBrick-compatibility-study",
+    "revision": "2"
+  },
+  "scope": {
+    "mode": "full"
+  },
+  "model": {
+    "wall_volumes": [
+      {
+        "id": "cedba2e4-59b2-4e06-84bd-6427528d0989",
+        "purpose": "fb_wall",
+        "volume": {
+          "start_xy_mm": [
+            0,
+            0
+          ],
+          "end_xy_mm": [
+            0,
+            2560.75
+          ],
+          "bottom_start_mm": -251.99999999999844,
+          "bottom_end_mm": -251.99999999999844,
+          "top_start_mm": 3171,
+          "top_end_mm": 4305.000050000001,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "ed410dbd-de6b-47cf-9b4c-93b9457b1696",
+        "purpose": "fb_wall",
+        "volume": {
+          "start_xy_mm": [
+            0,
+            2560.75
+          ],
+          "end_xy_mm": [
+            0,
+            5120
+          ],
+          "bottom_start_mm": -251.99999999999844,
+          "bottom_end_mm": -251.99999999999844,
+          "top_start_mm": 4305.000050000001,
+          "top_end_mm": 3171,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "cbb45405-08b7-476b-8daf-93cb58d898b3",
+        "purpose": "fb_wall",
+        "volume": {
+          "start_xy_mm": [
+            0,
+            5120
+          ],
+          "end_xy_mm": [
+            9920,
+            5120
+          ],
+          "bottom_start_mm": -251.99999999999844,
+          "bottom_end_mm": -251.99999999999844,
+          "top_start_mm": 2961,
+          "top_end_mm": 2961,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "c352844e-b15f-48d5-8cb6-b0acf7592257",
+        "purpose": "fb_wall",
+        "volume": {
+          "start_xy_mm": [
+            7040,
+            5120
+          ],
+          "end_xy_mm": [
+            7040,
+            2560.75
+          ],
+          "bottom_start_mm": -251.99999999999844,
+          "bottom_end_mm": -251.99999999999844,
+          "top_start_mm": 3171,
+          "top_end_mm": 4305.000050000001,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "a93a3c60-4b0f-4c78-ac90-41a7837cb110",
+        "purpose": "fb_wall",
+        "volume": {
+          "start_xy_mm": [
+            7040,
+            2560.75
+          ],
+          "end_xy_mm": [
+            7040,
+            -1.7763568394002505e-12
+          ],
+          "bottom_start_mm": -251.99999999999844,
+          "bottom_end_mm": -251.99999999999844,
+          "top_start_mm": 4305.000050000001,
+          "top_end_mm": 3171,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "8d0dd1c4-c2df-46f6-b2e6-94f4f7f1f009",
+        "purpose": "fb_wall",
+        "volume": {
+          "start_xy_mm": [
+            9920,
+            0
+          ],
+          "end_xy_mm": [
+            0,
+            0
+          ],
+          "bottom_start_mm": -251.99999999999844,
+          "bottom_end_mm": -251.99999999999844,
+          "top_start_mm": 2961,
+          "top_end_mm": 2961,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "cef7229d-4060-49a6-b3ab-aaff1459c10c",
+        "purpose": "fb_wall",
+        "volume": {
+          "start_xy_mm": [
+            4800,
+            2560.75
+          ],
+          "end_xy_mm": [
+            4800,
+            5120
+          ],
+          "bottom_start_mm": -251.99999999999844,
+          "bottom_end_mm": -251.99999999999844,
+          "top_start_mm": 4305.000050000001,
+          "top_end_mm": 3171,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "a8fc8a05-db68-4947-9e57-be70542d4005",
+        "purpose": "fb_wall",
+        "volume": {
+          "start_xy_mm": [
+            9920,
+            5120
+          ],
+          "end_xy_mm": [
+            9920,
+            2560.75
+          ],
+          "bottom_start_mm": -251.99999999999844,
+          "bottom_end_mm": -251.99999999999844,
+          "top_start_mm": 3171,
+          "top_end_mm": 4305.000050000001,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "4d7233b5-9071-44a9-b7dc-69951f3d964f",
+        "purpose": "fb_wall",
+        "volume": {
+          "start_xy_mm": [
+            9920,
+            2560.75
+          ],
+          "end_xy_mm": [
+            9920,
+            -1.7763568394002505e-12
+          ],
+          "bottom_start_mm": -251.99999999999844,
+          "bottom_end_mm": -251.99999999999844,
+          "top_start_mm": 4305.000050000001,
+          "top_end_mm": 3171,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "72b62907-5e7b-4381-9e4b-e8c89ba9fac8",
+        "purpose": "fb_wall",
+        "volume": {
+          "start_xy_mm": [
+            0,
+            2880
+          ],
+          "end_xy_mm": [
+            7040,
+            2880
+          ],
+          "bottom_start_mm": -251.99999999999844,
+          "bottom_end_mm": -251.99999999999844,
+          "top_start_mm": 3969,
+          "top_end_mm": 3969,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "3174e51c-174e-4997-8979-9f0318ffab00",
+        "purpose": "fb_wall",
+        "volume": {
+          "start_xy_mm": [
+            4800,
+            2560.75
+          ],
+          "end_xy_mm": [
+            4800,
+            -1.7763568394002505e-12
+          ],
+          "bottom_start_mm": -251.99999999999844,
+          "bottom_end_mm": -251.99999999999844,
+          "top_start_mm": 4305.000050000001,
+          "top_end_mm": 3171,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "0173648c-6d36-4785-a3a6-704b02d7a2fb",
+        "purpose": "fb_console",
+        "volume": {
+          "start_xy_mm": [
+            10716.500000716447,
+            5120
+          ],
+          "end_xy_mm": [
+            9920,
+            5120
+          ],
+          "bottom_start_mm": 2583.0021400000014,
+          "bottom_end_mm": 2583.0021400000014,
+          "top_start_mm": 2961,
+          "top_end_mm": 2961,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "ebdc4fd1-b995-432e-876d-ed495932f2e2",
+        "purpose": "fb_console",
+        "volume": {
+          "start_xy_mm": [
+            10716.500000716447,
+            1.224646790373425e-14
+          ],
+          "end_xy_mm": [
+            9920,
+            0
+          ],
+          "bottom_start_mm": 2583.0021400000014,
+          "bottom_end_mm": 2583.0021400000014,
+          "top_start_mm": 2961,
+          "top_end_mm": 2961,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      }
+    ],
+    "openings": [
+      {
+        "id": "e935d09a-6be4-429d-87cc-0ca9a355cf0e",
+        "purpose": "opening",
+        "is_outside": true,
+        "volume": {
+          "start_xy_mm": [
+            9920,
+            3520
+          ],
+          "end_xy_mm": [
+            9920,
+            1600
+          ],
+          "bottom_start_mm": 756.0000000000016,
+          "bottom_end_mm": 756.0000000000016,
+          "top_start_mm": 2331.000000000002,
+          "top_end_mm": 2331.000000000002,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "504972ed-6b2a-418d-aacd-94be714647d6",
+        "purpose": "opening",
+        "is_outside": true,
+        "volume": {
+          "start_xy_mm": [
+            2560,
+            5120
+          ],
+          "end_xy_mm": [
+            3520.0000000000005,
+            5120
+          ],
+          "bottom_start_mm": 1323.0000000000016,
+          "bottom_end_mm": 1323.0000000000016,
+          "top_start_mm": 2142.000000000002,
+          "top_end_mm": 2142.000000000002,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "50fd5024-42dd-4cf4-a420-24222bff4a1f",
+        "purpose": "opening",
+        "is_outside": true,
+        "volume": {
+          "start_xy_mm": [
+            3840,
+            0
+          ],
+          "end_xy_mm": [
+            640.0000000000006,
+            0
+          ],
+          "bottom_start_mm": 1.5543122344752192e-12,
+          "bottom_end_mm": 1.5543122344752192e-12,
+          "top_start_mm": 2331.0000000000023,
+          "top_end_mm": 2331.0000000000023,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "1aa2347b-fde4-4612-b0f7-02287b96d9d5",
+        "purpose": "opening",
+        "is_outside": true,
+        "volume": {
+          "start_xy_mm": [
+            8320,
+            0
+          ],
+          "end_xy_mm": [
+            7360,
+            0
+          ],
+          "bottom_start_mm": 756.0000000000016,
+          "bottom_end_mm": 756.0000000000016,
+          "top_start_mm": 2331.000000000002,
+          "top_end_mm": 2331.000000000002,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "b5dba79e-2260-46bc-85dd-961886116075",
+        "purpose": "opening",
+        "is_outside": true,
+        "volume": {
+          "start_xy_mm": [
+            0,
+            320
+          ],
+          "end_xy_mm": [
+            0,
+            1920
+          ],
+          "bottom_start_mm": 1.5543122344752192e-12,
+          "bottom_end_mm": 1.5543122344752192e-12,
+          "top_start_mm": 2331.0000000000023,
+          "top_end_mm": 2331.0000000000023,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "7cb05781-922d-479f-a361-a06b25d76699",
+        "purpose": "opening",
+        "is_outside": true,
+        "volume": {
+          "start_xy_mm": [
+            5439.999999999999,
+            5120
+          ],
+          "end_xy_mm": [
+            6080,
+            5120
+          ],
+          "bottom_start_mm": 1008.0000000000016,
+          "bottom_end_mm": 1008.0000000000016,
+          "top_start_mm": 2142.000000000002,
+          "top_end_mm": 2142.000000000002,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "e594bb79-babf-4ad3-8bf6-0659e6a90843",
+        "purpose": "opening",
+        "is_outside": false,
+        "volume": {
+          "start_xy_mm": [
+            5439.999999999999,
+            2880
+          ],
+          "end_xy_mm": [
+            6400,
+            2880
+          ],
+          "bottom_start_mm": 1.5543122344752192e-12,
+          "bottom_end_mm": 1.5543122344752192e-12,
+          "top_start_mm": 2142.0000000000023,
+          "top_end_mm": 2142.0000000000023,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "880028af-a98f-4340-8d8f-36615cdc9303",
+        "purpose": "opening",
+        "is_outside": true,
+        "volume": {
+          "start_xy_mm": [
+            6400,
+            -1.7763568394002505e-12
+          ],
+          "end_xy_mm": [
+            5440,
+            -1.7763568394002505e-12
+          ],
+          "bottom_start_mm": 1.5543122344752192e-12,
+          "bottom_end_mm": 1.5543122344752192e-12,
+          "top_start_mm": 2331.0000000000023,
+          "top_end_mm": 2331.0000000000023,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "59e34b1b-1185-4146-ba3d-ef80c2355fc6",
+        "purpose": "opening",
+        "is_outside": false,
+        "volume": {
+          "start_xy_mm": [
+            7040,
+            2560
+          ],
+          "end_xy_mm": [
+            7040,
+            1600
+          ],
+          "bottom_start_mm": 1.5543122344752192e-12,
+          "bottom_end_mm": 1.5543122344752192e-12,
+          "top_start_mm": 2142.0000000000023,
+          "top_end_mm": 2142.0000000000023,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "cdea5271-1165-4f7e-ac32-8461ae5c89a7",
+        "purpose": "partition_opening",
+        "is_outside": false,
+        "volume": {
+          "start_xy_mm": [
+            2240,
+            3498
+          ],
+          "end_xy_mm": [
+            2240,
+            4262
+          ],
+          "bottom_start_mm": 1.5543122344752192e-12,
+          "bottom_end_mm": 1.5543122344752192e-12,
+          "top_start_mm": 2016.0000000000018,
+          "top_end_mm": 2016.0000000000018,
+          "left_thickness_mm": 47.5,
+          "right_thickness_mm": 47.5
+        }
+      },
+      {
+        "id": "8af9a9fe-d8be-4447-9b61-a37f8420f474",
+        "purpose": "opening",
+        "is_outside": false,
+        "volume": {
+          "start_xy_mm": [
+            4800,
+            2560
+          ],
+          "end_xy_mm": [
+            4800,
+            1599.9999999999998
+          ],
+          "bottom_start_mm": 1.5543122344752192e-12,
+          "bottom_end_mm": 1.5543122344752192e-12,
+          "top_start_mm": 2142.0000000000023,
+          "top_end_mm": 2142.0000000000023,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      },
+      {
+        "id": "2b9fcaf7-a6ed-49f2-8fea-487cdabc1213",
+        "purpose": "opening",
+        "is_outside": false,
+        "volume": {
+          "start_xy_mm": [
+            2560,
+            2880
+          ],
+          "end_xy_mm": [
+            3520.0000000000005,
+            2880
+          ],
+          "bottom_start_mm": 1.5543122344752192e-12,
+          "bottom_end_mm": 1.5543122344752192e-12,
+          "top_start_mm": 2142.0000000000023,
+          "top_end_mm": 2142.0000000000023,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      }
+    ],
+    "beams": []
+  }
+}

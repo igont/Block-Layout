@@ -62,7 +62,7 @@ fn opening_kinds_and_every_source_volume_survive_neutral_conversion() {
 }
 
 #[test]
-fn neutral_input_preserves_source_geometry_without_application_metadata() {
+fn neutral_input_preserves_source_and_normalizes_working_geometry() {
     let request = parse_request(REQUEST).unwrap();
     let internal = request.to_layout_request().unwrap();
     assert_eq!(internal.request_id, "example-single-course");
@@ -74,14 +74,14 @@ fn neutral_input_preserves_source_geometry_without_application_metadata() {
     assert_eq!(internal.metadata, Value::Null);
     let input =
         mutated(|v| v["model"]["wall_volumes"][0]["volume"]["end_xy_mm"][0] = json!(440.001));
+    let source = parse_request(&input).unwrap();
+    assert_eq!(source.model.wall_volumes[0].volume.end_xy_mm[0], 440.001);
     assert_eq!(
-        parse_request(&input)
-            .unwrap()
-            .to_layout_request()
+        source.to_layout_request()
             .unwrap()
             .wall_volumes[0]
             .end_xmm,
-        440.001
+        440.0
     );
 }
 

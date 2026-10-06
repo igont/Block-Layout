@@ -271,6 +271,16 @@ pub fn export_codes(
     blocks: &[Block],
     warnings: &[ApiFailure],
 ) -> Result<Value, ApiFailure> {
+    export_internal(standard,request,profile,blocks,warnings,true)
+}
+
+pub fn export_blocks(standard:&ExchangeRequest,request:&LayoutRequest,profile:&Profile,blocks:&[Block],warnings:&[ApiFailure])->Result<Value,ApiFailure> {
+    export_internal(standard,request,profile,blocks,warnings,false)
+}
+
+fn export_internal(standard:&ExchangeRequest,request:&LayoutRequest,profile:&Profile,blocks:&[Block],warnings:&[ApiFailure],include_lamellas:bool)->Result<Value,ApiFailure> {
+    let normalized = request.normalized();
+    let request = &normalized;
     let prepared = crate::offcut_plan::prepare(request, profile, blocks)?;
     let mut ordered: Vec<_> = prepared.blocks.iter().collect();
     ordered.sort_by(|a, b| a.id.cmp(&b.id));
@@ -284,8 +294,17 @@ pub fn export_codes(
         prepared.annotate(&mut value);
         values.push(value);
     }
-    let mut result = exchange::success_result_with_warnings(standard, values, crate::effective_geometry::beam_adjustments(request), warnings);
+    let mut lamella_plan = if include_lamellas {crate::lamella::calculate(request, profile, &prepared.blocks)?}
+        else{crate::lamella::LamellaPlan {lamellas:Vec::new(),warnings:Vec::new()}};
+    crate::lamella::quantize_solids(&mut lamella_plan.lamellas);
+    if include_lamellas {crate::lamella::add_recesses(&mut values, &prepared.blocks, &lamella_plan.lamellas, request);}
+    let mut all_warnings = warnings.to_vec();
+    all_warnings.extend(lamella_plan.warnings);
+    let mut result = exchange::success_result_with_warnings(standard, values, crate::effective_geometry::beam_adjustments(request), &all_warnings);
     result["format"] = json!("fb-layout-codes/1");
+    result["lamellas"] = serde_json::to_value(lamella_plan.lamellas).map_err(|e|
+        ApiFailure::new("LAMELLA_EXPORT_FAILED", e.to_string(), None))?;
+    crate::precision::normalize_result(&mut result);
     Ok(result)
 }
 

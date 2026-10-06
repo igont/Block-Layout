@@ -1171,7 +1171,7 @@ fn grid_issue_for_choice(
     issue
 }
 
-fn ordinary_residue(
+pub(crate) fn ordinary_residue(
     run: &crate::domain::WallRun,
     course_index: i64,
     profile: &Profile,
@@ -5328,12 +5328,15 @@ mod tests {
         for (available, expected) in [(4, vec![2, 4]), (6, vec![2, 4, 6])] {
             let (mut parts, constraints, p, e, t) = lintel_packet_fixture(available);
             block_lintel_packet_course(&mut parts, &e, 1);
+            let lower_row: Vec<_> = parts.iter().filter(|part| part.course_index == 1).cloned().collect();
             let completed = merge_t_lintels(&mut parts, &t, &constraints, &p);
             let expected_completed = expected.iter().map(|course| (course - 1, "opening".into())).collect();
             assert_eq!(completed, expected_completed);
             assert_eq!(parts.iter().filter(|b| b.is_bridge).map(|b| b.course_index)
                 .collect::<Vec<_>>(), expected);
             assert_eq!(parts.iter().filter(|b| !b.is_bridge && b.course_index == 3).count(), 4);
+            assert_eq!(parts.iter().filter(|part| part.course_index == 1).cloned().collect::<Vec<_>>(), lower_row,
+                "Moving lintels up must preserve the entire lower row");
         }
     }
 

@@ -132,6 +132,33 @@ pub enum LayoutResponse<T: Serialize> {
 }
 
 impl LayoutRequest {
+    /// Рабочая копия на сетке 0,01 мм; исходный снимок и его хэш сохраняются.
+    pub fn normalized(&self) -> Self {
+        let mut result = self.clone();
+        result.z0_mm = crate::precision::mm(result.z0_mm);
+        for volume in result.wall_volumes.iter_mut().chain(&mut result.opening_volumes) {
+            for value in [
+                &mut volume.start_xmm, &mut volume.start_ymm,
+                &mut volume.end_xmm, &mut volume.end_ymm,
+                &mut volume.start_bottom_zmm, &mut volume.end_bottom_zmm,
+                &mut volume.start_top_zmm, &mut volume.end_top_zmm,
+                &mut volume.thickness_mm,
+            ] {
+                *value = crate::precision::mm(*value);
+            }
+        }
+        for beam in &mut result.beams {
+            for value in [
+                &mut beam.start_xmm, &mut beam.start_ymm, &mut beam.start_zmm,
+                &mut beam.end_xmm, &mut beam.end_ymm, &mut beam.end_zmm,
+                &mut beam.geometry.width_mm, &mut beam.geometry.height_mm,
+            ] {
+                *value = crate::precision::mm(*value);
+            }
+        }
+        result
+    }
+
     pub fn validate(&self) -> Result<(), ApiFailure> {
         if self.schema_version != 1 {
             return Err(ApiFailure::new(

@@ -1097,8 +1097,11 @@ pub fn build_constraints_with_policy(
         .map(|mut opening| {
             let z0 = topology.z0 as f64;
             let step = course_height as f64;
-            let floor = |z: f64| (z0 + ((z * SCALE - z0) / step).floor() * step) / SCALE;
-            let ceil = |z: f64| (z0 + ((z * SCALE - z0) / step).ceil() * step) / SCALE;
+            // Normalize to the coordinate quantum before expanding to courses:
+            // source roundoff at a course boundary must not clear another row.
+            let relative = |z: f64| crate::precision::centimm(z) - z0;
+            let floor = |z: f64| (z0 + (relative(z) / step).floor() * step) / SCALE;
+            let ceil = |z: f64| (z0 + (relative(z) / step).ceil() * step) / SCALE;
             opening.bottom_start_mm = floor(opening.bottom_start_mm);
             opening.bottom_end_mm = floor(opening.bottom_end_mm);
             opening.top_start_mm = ceil(opening.top_start_mm);
@@ -1250,7 +1253,10 @@ pub fn build_constraints_with_policy(
                     .fold(f64::NEG_INFINITY, f64::max);
                 // Ряды перемычек чередуются через венец: 1/3/5 для
                 // проёма до метра, 1/3/5/7/9 для более широкого проёма.
-                let row = ((course.z as f64 - max_top) / course_height as f64).floor();
+                // Interpolation/scaling can reintroduce roundoff even for a
+                // two-decimal input. Select a row only on the centimm grid.
+                let top_centimm = max_top.round_ties_even();
+                let row = ((course.z as f64 - top_centimm) / course_height as f64).floor();
                 let opening_width = (opening.end.x_mm - opening.start.x_mm)
                     .hypot(opening.end.y_mm - opening.start.y_mm)
                     * SCALE;
@@ -1260,7 +1266,7 @@ pub fn build_constraints_with_policy(
                     5
                 };
                 let flat_top = (opening.top_start_mm - opening.top_end_mm).abs() <= EPS;
-                if course.z as f64 + EPS >= max_top
+                if course.z as f64 >= top_centimm
                     && opening_width <= 150_000.0 + EPS
                     && row >= 0.0
                     && ((flat_top && row < (row_count * 2) as f64 && row as i64 % 2 == 0)
@@ -1831,6 +1837,65 @@ mod tests {
                 .unwrap(),
             Exclusion::FullVoid { .. }
         ));
+    }
+
+    #[test]
+    fn opening_boundary_roundoff_does_not_clear_an_extra_course() {
+        let mut topology = topology();
+        topology.z0 = -25_200;
+        for course in &mut topology.courses {
+            course.z -= 25_200;
+        }
+        let mut exact = opening();
+        exact.bottom_start_mm = -52.0;
+        exact.bottom_end_mm = -52.0;
+        exact.top_start_mm = 148.0;
+        exact.top_end_mm = 148.0;
+        let expected = build_constraints(&topology, &[exact.clone()], &[], 200.0, 300.0).unwrap();
+        assert_eq!(expected.masks.iter().map(|m| m.course_index).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(expected.lintel_candidates[0].course_index, 2);
+        for noise in [-2e-12, 2e-12] {
+            let mut input = exact.clone();
+            input.bottom_start_mm += noise;
+            input.bottom_end_mm += noise;
+            input.top_start_mm += noise;
+            input.top_end_mm += noise;
+            let original = input.clone();
+            let actual = build_constraints(&topology, std::slice::from_ref(&input), &[], 200.0, 300.0).unwrap();
+            assert_eq!(actual.masks, expected.masks, "noise {noise}");
+            assert_eq!(actual.lintel_candidates, expected.lintel_candidates, "noise {noise}");
+            assert_eq!(input, original);
+        }
+        // A real displacement of one coordinate quantum still expands outwards.
+        exact.bottom_start_mm -= 0.01;
+        exact.bottom_end_mm -= 0.01;
+        exact.top_start_mm += 0.01;
+        exact.top_end_mm += 0.01;
+        let expanded = build_constraints(&topology, &[exact], &[], 200.0, 300.0).unwrap();
+        assert_eq!(expanded.masks.iter().map(|m| m.course_index).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(expanded.lintel_candidates[0].course_index, 3);
+    }
+
+    #[test]
+    fn decimal_course_origin_does_not_lose_the_first_lintel_row() {
+        let mut topology = topology();
+        topology.z0 = 193_101;
+        for course in &mut topology.courses { course.z += topology.z0; }
+        for wall in &mut topology.walls {
+            wall.bottom_start += topology.z0;
+            wall.bottom_end += topology.z0;
+            wall.top_start += topology.z0;
+            wall.top_end += topology.z0;
+        }
+        let mut opening = opening();
+        opening.bottom_start_mm = 2131.01;
+        opening.bottom_end_mm = 2131.01;
+        opening.top_start_mm = 2331.01;
+        opening.top_end_mm = 2331.01;
+        // Even a two-decimal input becomes 233101.00000000003 when scaled.
+        assert!(opening.top_start_mm * SCALE > 233_101.0);
+        let result = build_constraints(&topology, &[opening], &[], 200.0, 300.0).unwrap();
+        assert_eq!(result.lintel_candidates[0].course_index, 2);
     }
 
     #[test]

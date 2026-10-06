@@ -7,6 +7,8 @@ pub mod exchange;
 pub mod end_state;
 pub mod effective_geometry;
 pub mod grid;
+pub mod lamella;
+pub mod lamella_saved;
 pub mod layout;
 pub mod materialize;
 pub mod node_assembly;
@@ -16,6 +18,7 @@ pub mod node_shapes;
 pub mod offcut_plan;
 pub mod product_catalog;
 pub mod production_plan;
+pub mod precision;
 pub mod solid_geometry;
 pub mod topology;
 pub mod vertical;
@@ -66,7 +69,7 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
         return failure(vec![error]);
     }
     // Единая локальная копия нужна и ограничениям, и окончательной подрезке узлов.
-    let mut effective = request.clone();
+    let mut effective = request.normalized();
     effective_geometry::normalize_beams(&mut effective);
     for opening in &mut effective.opening_volumes {
         if !opening.is_outside && opening.start_bottom_zmm.abs() < 0.01
