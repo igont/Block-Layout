@@ -1,0 +1,70 @@
+{
+  "format": "fb-layout/1",
+  "kind": "layout_request",
+  "request_id": "sloped-window",
+  "snapshot_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "coordinate_system": {
+    "id": "example-world",
+    "units": "mm",
+    "coordinate_quantum_mm": 0.01,
+    "z0_mm": 0
+  },
+  "profile": {
+    "id": "banya-prototype",
+    "revision": "2"
+  },
+  "catalog": {
+    "id": "ForestBrick-compatibility-study",
+    "revision": "2"
+  },
+  "scope": {
+    "mode": "full"
+  },
+  "model": {
+    "wall_volumes": [
+      {
+        "id": "wall",
+        "purpose": "fb_wall",
+        "volume": {
+          "start_xy_mm": [
+            0,
+            0
+          ],
+          "end_xy_mm": [
+            1920,
+            0
+          ],
+          "bottom_start_mm": 0,
+          "bottom_end_mm": 0,
+          "top_start_mm": 630,
+          "top_end_mm": 630,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      }
+    ],
+    "openings": [
+      {
+        "id": "sloped-window",
+        "purpose": "window",
+        "volume": {
+          "start_xy_mm": [
+            640,
+            0
+          ],
+          "end_xy_mm": [
+            1280,
+            0
+          ],
+          "bottom_start_mm": 0,
+          "bottom_end_mm": 0,
+          "top_start_mm": 126,
+          "top_end_mm": 441,
+          "left_thickness_mm": 96.5,
+          "right_thickness_mm": 96.5
+        }
+      }
+    ],
+    "beams": []
+  }
+}

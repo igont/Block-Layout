@@ -1104,8 +1104,10 @@ pub fn build_constraints_with_policy(
             let ceil = |z: f64| (z0 + (relative(z) / step).ceil() * step) / SCALE;
             opening.bottom_start_mm = floor(opening.bottom_start_mm);
             opening.bottom_end_mm = floor(opening.bottom_end_mm);
-            opening.top_start_mm = ceil(opening.top_start_mm);
-            opening.top_end_mm = ceil(opening.top_end_mm);
+            if (opening.top_start_mm - opening.top_end_mm).abs() <= EPS {
+                opening.top_start_mm = ceil(opening.top_start_mm);
+                opening.top_end_mm = ceil(opening.top_end_mm);
+            }
             opening
         })
         .collect();
@@ -1222,7 +1224,7 @@ pub fn build_constraints_with_policy(
                 );
                 if let Some((from, to)) = bounds(&occupied) {
                     if let Some(coarse) = outer_interval(from, to, frame.length) {
-                        // Any intersected course is cleared through its full height.
+                        // Any occupied axial interval removes a full-height piece.
                         let interval = coarse;
                         let coverage = MaskCoverage::FullSectionVoid;
                         result.masks.push(Mask {
@@ -1269,8 +1271,7 @@ pub fn build_constraints_with_policy(
                 if course.z as f64 >= top_centimm
                     && opening_width <= 150_000.0 + EPS
                     && row >= 0.0
-                    && ((flat_top && row < (row_count * 2) as f64 && row as i64 % 2 == 0)
-                        || (!flat_top && row == 0.0))
+                    && flat_top && row < (row_count * 2) as f64 && row as i64 % 2 == 0
                 {
                     if let Some(span) = interval(lo, hi, frame.length) {
                         let left_support = (lo + EPS >= support as f64)
@@ -1899,7 +1900,7 @@ mod tests {
     }
 
     #[test]
-    fn sloped_top_expands_to_courses_and_clears_their_height() {
+    fn sloped_top_clears_full_height_only_in_occupied_axial_intervals() {
         let mut opening = opening();
         opening.top_start_mm = 300.0;
         opening.top_end_mm = 500.0;
@@ -1907,10 +1908,10 @@ mod tests {
         assert!(result.masks.iter().any(|m| m.course_index == 2
             && m.interval
                 == Interval {
-                    start: 100_000,
+                    start: 150_000,
                     end: 200_000
                 }));
-        assert_eq!(result.lintel_candidates[0].course_index, 3);
+        assert!(result.lintel_candidates.is_empty());
         let masks: Vec<_> = result
             .masks
             .iter()

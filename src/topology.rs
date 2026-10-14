@@ -185,6 +185,25 @@ fn crossing(a: &NormalizedWall, b: &NormalizedWall) -> Result<Option<Point>, Str
             .filter(|v| on_segment(a.start, a.end, *v) && on_segment(b.start, b.end, *v))
             .collect::<BTreeSet<_>>();
         if common.len() > 1 {
+            // The shared plan interval can belong to different height ranges.
+            // Profiles are affine, so separation at both interval ends proves
+            // separation throughout it, including a shared sloping boundary.
+            let separated = |lower: &NormalizedWall, upper: &NormalizedWall| {
+                common.iter().all(|point| {
+                    let lower_len = axis_len(lower) as i128;
+                    let upper_len = axis_len(upper) as i128;
+                    let top = lower.top_start as i128 * lower_len
+                        + (lower.top_end - lower.top_start) as i128
+                            * position(lower, *point) as i128;
+                    let bottom = upper.bottom_start as i128 * upper_len
+                        + (upper.bottom_end - upper.bottom_start) as i128
+                            * position(upper, *point) as i128;
+                    top * upper_len <= bottom * lower_len
+                })
+            };
+            if separated(a, b) || separated(b, a) {
+                return Ok(None);
+            }
             return Err(format!(
                 "{} и {}: неоднозначное коллинеарное наложение",
                 a.id, b.id
@@ -293,6 +312,11 @@ fn wall_interval(w: &NormalizedWall, z: i64) -> Option<(i64, i64)> {
     let lo = a.max(c);
     let hi = b.min(d);
     (lo < hi).then_some((lo, hi))
+}
+
+/// Ось стены на отметке венца; одинаковая граница для рядовых и типовых деталей.
+pub(crate) fn wall_course_axis(w: &NormalizedWall, z: i64) -> Option<(Point, Point)> {
+    wall_interval(w, z).map(|(from, to)| (at(w, from), at(w, to)))
 }
 
 fn floor_div(a: i64, b: i64) -> i64 {
@@ -662,6 +686,79 @@ mod tests {
                 wall("a", (0.0, 0.0), (100.0, 0.0), 0.0, 63.0),
                 wall("b", (50.0, 0.0), (150.0, 0.0), 0.0, 63.0),
             ],
+        })
+        .unwrap();
+        assert!(build_topology(n).unwrap_err().contains("наложение"));
+    }
+
+    #[test]
+    fn stacked_collinear_walls_keep_their_course_sources() {
+        let lower = wall("lower", (3520.0, 9920.0), (3520.0, 9600.0), -252.0, 2772.0);
+        let upper = wall("upper", (3520.0, 6400.0), (3520.0, 9920.0), 2772.0, 7056.0);
+        let t = build_topology(
+            normalize_building(RawBuilding {
+                z0_mm: -252.0,
+                walls: vec![upper, lower],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(t.walls.len(), 2);
+        assert_eq!(t.courses.len(), 116);
+        for course in &t.courses {
+            let (id, length) = if course.z < 277_200 {
+                ("lower", 32_000)
+            } else {
+                ("upper", 352_000)
+            };
+            assert_eq!(course.edges.len(), 1);
+            assert_eq!(course.edges[0].wall_id, id);
+            assert_eq!(course.runs.len(), 1);
+            assert_eq!(course.runs[0].length, length);
+            assert_eq!(course.runs[0].sources[0].wall_id, id);
+        }
+    }
+
+    #[test]
+    fn collinear_sloping_boundaries_may_touch_or_have_a_gap() {
+        for gap in [0.0, 0.01, 63.0] {
+            let mut lower = wall("lower", (0.0, 0.0), (1260.0, 1260.0), 0.0, 126.0);
+            lower.top_end_mm = 252.0;
+            let mut upper = wall("upper", (945.0, 945.0), (315.0, 315.0), 220.5 + gap, 504.0);
+            upper.bottom_end_mm = 157.5 + gap;
+            let t = topology(vec![lower, upper]);
+            assert!(t
+                .courses
+                .iter()
+                .any(|c| c.edges.iter().any(|e| e.wall_id == "lower")));
+            assert!(t
+                .courses
+                .iter()
+                .any(|c| c.edges.iter().any(|e| e.wall_id == "upper")));
+        }
+    }
+
+    #[test]
+    fn collinear_height_overlap_is_rejected_between_course_levels() {
+        let lower = wall("lower", (0.0, 0.0), (100.0, 0.0), 0.0, 62.0);
+        let upper = wall("upper", (50.0, 0.0), (150.0, 0.0), 61.99, 126.0);
+        let n = normalize_building(RawBuilding {
+            z0_mm: 0.0,
+            walls: vec![lower, upper],
+        })
+        .unwrap();
+        assert!(build_topology(n).unwrap_err().contains("наложение"));
+    }
+
+    #[test]
+    fn collinear_profiles_crossing_only_in_the_middle_are_rejected() {
+        let mut rising = wall("rising", (0.0, 0.0), (100.0, 0.0), 0.0, 63.0);
+        rising.bottom_end_mm = 252.0;
+        rising.top_end_mm = 315.0;
+        let level = wall("level", (0.0, 0.0), (100.0, 0.0), 126.0, 189.0);
+        let n = normalize_building(RawBuilding {
+            z0_mm: 0.0,
+            walls: vec![rising, level],
         })
         .unwrap();
         assert!(build_topology(n).unwrap_err().contains("наложение"));

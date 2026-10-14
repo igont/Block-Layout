@@ -1,5 +1,5 @@
 //! Геометрия готовых деталей после осевых разрезов; снятие шипов зависит от происхождения торца.
-use crate::api::{ApiFailure, LayoutRequest, Volume};
+use crate::api::{ApiFailure, LayoutRequest};
 use crate::layout::{Block, Profile};
 use crate::solid_geometry::{self as solid, Mesh, Plane};
 use serde::Serialize;
@@ -24,40 +24,6 @@ fn plane(n: V, point: V) -> Plane {
         normal: n,
         offset: dot(n, point),
     }
-}
-struct Obstacle { planes: Vec<Plane> }
-fn prism(v: &Volume, width: f64, extend_ends: f64) -> Obstacle {
-    let len = (v.end_xmm - v.start_xmm).hypot(v.end_ymm - v.start_ymm);
-    let x = [
-        (v.end_xmm - v.start_xmm) / len,
-        (v.end_ymm - v.start_ymm) / len,
-        0.0,
-    ];
-    let y = [-x[1], x[0], 0.0];
-    let start = [v.start_xmm, v.start_ymm, 0.0];
-    let bottom_slope = (v.end_bottom_zmm - v.start_bottom_zmm) / len;
-    let top_slope = (v.end_top_zmm - v.start_top_zmm) / len;
-    let mut planes = vec![
-        plane(scale(x, -1.0), add(start, scale(x, -extend_ends))),
-        plane(x, add(start, scale(x, len + extend_ends))),
-        plane(scale(y, -1.0), add(start, scale(y, -width / 2.0))),
-        plane(y, add(start, scale(y, width / 2.0))),
-        plane(
-            [x[0] * bottom_slope, x[1] * bottom_slope, -1.0],
-            [v.start_xmm, v.start_ymm, v.start_bottom_zmm],
-        ),
-        plane(
-            [-x[0] * top_slope, -x[1] * top_slope, 1.0],
-            [v.start_xmm, v.start_ymm, v.start_top_zmm],
-        ),
-    ];
-    Obstacle { planes: std::mem::take(&mut planes) }
-}
-fn clip_all(mut mesh: Mesh, planes: &[Plane]) -> Option<Mesh> {
-    for p in planes {
-        mesh = solid::clip(&mesh, p)?;
-    }
-    Some(mesh)
 }
 fn combine(parts: &[Mesh]) -> Mesh {
     let mut result = Mesh {
@@ -321,50 +287,7 @@ fn materialize_parts(
                 cuts.push(local_plane_cut(p, origin, axes, &sources));
             }
         }
-        // Union of the source wall volumes preserves sloping roof surfaces and floor starts.
-        let mut in_walls = Vec::new();
-        let mut remaining = bodies;
-        for w in &walls {
-            let shape = prism(
-                w,
-                w.thickness_mm,
-                if block.kind.starts_with("node_") {
-                    width / 2.0
-                } else {
-                    0.0
-                },
-            );
-            let mut rest = Vec::new();
-            for m in remaining {
-                if let Some(inside) = clip_all(m.clone(), &shape.planes) {
-                    in_walls.push(inside);
-                }
-                rest.extend(solid::subtract(&m, &shape.planes));
-            }
-            remaining = rest;
-        }
-        bodies = in_walls;
-        // A per-wall cap is expressible as a plane only for one source wall.
-        if walls.len() == 1 {
-            let p = prism(
-                primary,
-                width,
-                if block.kind.starts_with("node_") {
-                    width / 2.0
-                } else {
-                    0.0
-                },
-            );
-            for cap in &p.planes[4..] {
-                if stock
-                    .vertices
-                    .iter()
-                    .any(|v| dot(cap.normal, *v) > cap.offset + 1e-6)
-                {
-                    cuts.push(local_plane_cut(*cap, origin, axes, &sources));
-                }
-            }
-        }
+        // Высота и профиль готовой детали сохранены; длину определил finalize_parts.
         if bodies.is_empty() {
             continue;
         }

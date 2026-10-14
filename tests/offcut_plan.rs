@@ -273,6 +273,36 @@ fn stock_is_consumed_once_and_missing_saw_allowance_prevents_replacement() {
 }
 
 #[test]
+fn inclined_sill_dobor_side_follows_the_course_boundary_not_the_source_midpoint() {
+    let (mut request, profile, mut blocks) = fixture(&[(32000, false, false), (44800, false, false)]);
+    request.opening_volumes = vec![serde_json::from_value(json!({
+        "guid":"sloped-sill", "startXmm":0, "endXmm":1280,
+        "startYmm":0, "endYmm":0, "startBottomZmm":0, "endBottomZmm":1260,
+        "startTopZmm":2000, "endTopZmm":2000, "thicknessMm":193, "openingType":"WINDOW"
+    })).unwrap()];
+    for (i, block) in blocks.iter_mut().enumerate() {
+        request.wall_volumes[i].start_ymm = 0.0;
+        request.wall_volumes[i].end_ymm = 0.0;
+        block.start.y = 0;
+        block.end.y = 0;
+        block.z_centimm = 6300;
+        block.course_index = 1;
+    }
+    blocks[0].start.x = -32000;
+    blocks[0].end.x = 0;
+    // At the top of this course (126 mm), the sill ends at X=128 mm.
+    let result = codes(&request, &profile, &blocks);
+    let child = result["blocks"].as_array().unwrap().iter()
+        .find(|b| b["is_dobor"] == true).expect("opposite offcut remains usable");
+    assert_eq!(child["dobor_group"], json!({"source_id":"sloped-sill", "side":"positive"}));
+    assert_eq!(child["placement"]["origin_mm"], json!([128.0, 0.0, 63.0]));
+    assert_eq!(child["length_mm"], 320.0);
+    assert_eq!(child["cut_from_block_id"], "block-0");
+    assert!(child["placement"]["origin_mm"][0].as_f64().unwrap()
+        + child["length_mm"].as_f64().unwrap() / 2.0 < 640.0);
+}
+
+#[test]
 fn inclined_opening_without_short_parts_on_high_side_uses_low_side() {
     let (mut request, profile, blocks) = shared_fixture(&[(8000, false, true), (54000, true, false)]);
     request.opening_volumes[0].start_top_zmm = 9000.0;
@@ -314,6 +344,52 @@ fn typed_long_stock_supplies_plain_reversed_offcut() {
     blocks[1].cuts = vec!["Type6:p30000:y1:run-1".into()];
     blocks[1].product_key = Some("Type6".into());
     assert!(prepare(&request, &profile, &blocks).unwrap().parents.is_empty());
+}
+
+#[test]
+fn type6_and_type7_1_donors_keep_the_catalog_profile_and_export_plain_offcuts() {
+    for (kind, product) in [("Type6", "6"), ("Type7_1", "7.1")] {
+        let (request, profile, mut blocks) = shared_fixture(&[(21000, false, true), (41700, true, false)]);
+        blocks[0].ends = fb_layout::end_state::EndStates::from_flags(false, true, true, false);
+        blocks[0].ends.record_cut(false, 21000, fb_layout::end_state::CutSource::Opening("shared".into())).unwrap();
+        let donor = &mut blocks[1];
+        donor.kind = "node_T".into();
+        donor.product_key = Some(kind.into());
+        donor.start.x = 106000;
+        donor.end.x = 64300;
+        donor.rotation_deg = 180;
+        donor.ends = fb_layout::end_state::EndStates::from_flags(false, true, true, false);
+        donor.cuts = vec![format!("{kind}:p32000:y1:run-1")];
+        donor.ends.record_cut(false, 41700, fb_layout::end_state::CutSource::Opening("shared".into())).unwrap();
+
+        // The actual Type6 / Type7.1 processing ends at 416.50 mm, inside the donor.
+        let result = codes(&request, &profile, &blocks);
+        assert_eq!(result["status"], "success");
+        let child = &result["blocks"][0];
+        let parent = &result["blocks"][1];
+        assert_eq!(child["cut_from_block_id"], "block-1");
+        assert_eq!(child["code1"], "П210");
+        assert_eq!(child["code2"], "П210");
+        assert_eq!(child["product_type"], "Рядовой");
+        assert_eq!(child["node_cuts"], json!([]));
+        assert_eq!(child["trims"], json!([]));
+        assert_eq!(parent["code1"], format!("П417 [Н-320-Тип {product}]"));
+        assert_eq!(parent["product_type"], format!("Тип {product}"));
+        let plan = &parent["stock_cut_plan"];
+        assert_eq!(plan["stock_code"], format!("П640 [Н-320-Тип {product}]"));
+        assert_eq!(plan["parts"], json!([
+            {"block_id":"block-1","interval_mm":[0.0,417.0],"stock_end":"left"},
+            {"block_id":"block-0","interval_mm":[430.0,640.0],"stock_end":"right","reversed":true}
+        ]));
+        assert_eq!(plan["saw_cuts_mm"], json!([[417.0,422.0],[425.0,430.0]]));
+        assert_eq!(plan["waste_intervals_mm"], json!([[422.0,425.0]]));
+
+        let finalized = fb_layout::layout::finalize_parts(&request, &profile, &blocks).unwrap();
+        let physical = fb_layout::materialize::materialize(&request, &finalized, &profile).unwrap().physical;
+        let child_body = physical.blocks.iter().find(|b| b.id == "block-0").unwrap();
+        let volume: f64 = child_body.bodies.iter().map(fb_layout::solid_geometry::volume).sum();
+        assert!((volume - 210.0 * 193.0 * 63.0).abs() < 1e-6);
+    }
 }
 
 #[test]

@@ -241,3 +241,51 @@ fn nominal_beam_contact_keeps_natural_end_origin_without_beam_extension() {
     assert_eq!(rendered.exchange_blocks[0]["natural_end_left"], true);
     assert_eq!(r.beams[0].end_xmm, 0.0);
 }
+
+#[test]
+fn sloped_window_shortens_full_height_blocks_in_both_axis_directions() {
+    for (ux, uy) in [(1.0, 0.0), (0.0, 1.0)] {
+    for descending in [false, true] {
+    for reversed in [false, true] {
+        let mut r = request(640.0, json!([]));
+        let mut o = opening("WINDOW", 0.0, 640.0);
+        o.start_bottom_zmm = -63.0;
+        o.end_bottom_zmm = -63.0;
+        o.start_top_zmm = -31.5;
+        o.end_top_zmm = 31.5;
+        if descending { std::mem::swap(&mut o.start_top_zmm, &mut o.end_top_zmm); }
+        if reversed {
+            std::mem::swap(&mut o.start_xmm, &mut o.end_xmm);
+            std::mem::swap(&mut o.start_top_zmm, &mut o.end_top_zmm);
+        }
+        r.opening_volumes = vec![o];
+        for v in r.wall_volumes.iter_mut().chain(&mut r.opening_volumes) {
+            v.start_ymm = v.start_xmm * uy; v.start_xmm *= ux;
+            v.end_ymm = v.end_xmm * uy; v.end_xmm *= ux;
+        }
+        let candidate = fb_layout::inspect_request(&r, &profile());
+        assert!(!candidate.blocks.is_empty(), "{:?}", candidate.diagnostics);
+        assert_eq!(candidate.blocks.len(), 1);
+        assert_eq!(candidate.blocks[0].length_centimm, 32_000);
+        assert!(candidate.blocks[0].cuts.iter().all(|cut| !cut.starts_with("opening_slope:")));
+        let rendered = render_final_parts(&r, &candidate.blocks, &profile()).unwrap();
+        assert!(!rendered.physical.blocks.is_empty());
+        assert!(rendered.physical.blocks.iter().all(|b| !b.is_dobor));
+        assert!(rendered.exchange_blocks.iter().all(|b| b["cuts"].as_array().unwrap().iter()
+            .all(|cut| cut["kind"] != "convex_cut")));
+        let actual: f64 = rendered.physical.blocks.iter().flat_map(|b| &b.bodies).map(volume).sum();
+        // Both 320 mm grid ends are factory ends with spikes removed by 5 mm.
+        assert!((actual - 310.0 * 193.0 * 63.0).abs() < 0.1, "volume={actual}");
+        for mesh in rendered.physical.blocks.iter().flat_map(|b| &b.bodies) {
+            assert!(mesh.vertices.iter().all(|v| {
+                let x = v[0]*ux + v[1]*uy;
+                let retained = if descending { x >= 320.0 - 0.001 } else { x <= 320.0 + 0.001 };
+                retained && (v[2].abs() < 0.001 || (v[2]-63.0).abs() < 0.001)
+            }));
+            assert_eq!(mesh.vertices.iter().map(|v| v[2]).fold(f64::INFINITY, f64::min), 0.0);
+            assert_eq!(mesh.vertices.iter().map(|v| v[2]).fold(f64::NEG_INFINITY, f64::max), 63.0);
+        }
+    }
+}
+}
+}

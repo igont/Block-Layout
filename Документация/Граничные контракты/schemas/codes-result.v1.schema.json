@@ -135,12 +135,6 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "source_wall_id"],
-          "properties": {"kind": {"const": "wall_boundary"}, "source_wall_id": {"$ref": "#/$defs/id"}}
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
           "required": ["kind", "description", "source_run_id"],
           "properties": {
             "kind": {"const": "arm_end_trim"},

@@ -124,7 +124,7 @@ pub(crate) fn export_block(
                 node_cut["x"] = json!(x);
             }
             node_cuts.push(node_cut);
-        } else if cut.starts_with("opening_volume:") || cut.starts_with("beam_volume:") {
+        } else if cut.starts_with("opening_slope:") || cut.starts_with("opening_volume:") || cut.starts_with("beam_volume:") {
             return Err(issue(block, "Объёмный разрез не завершён до экспорта детали"));
         } else {
             let mut trim = json!({"description":cut});
@@ -183,29 +183,6 @@ pub(crate) fn export_block(
         .filter(|w| block.source_ids.contains(&format!("wall:{}", w.guid)))
         .collect();
     let wall_ids: BTreeSet<_> = walls.iter().map(|w| w.guid.clone()).collect();
-    for wall in &walls {
-        let dx = wall.end_xmm - wall.start_xmm;
-        let dy = wall.end_ymm - wall.start_ymm;
-        let axis_squared = dx * dx + dy * dy;
-        if axis_squared <= 0.0 {
-            continue;
-        }
-        let points = std::iter::once(block.start)
-            .chain(std::iter::once(block.end))
-            .chain(block.arms.iter().flat_map(|arm| [arm.start, arm.end]));
-        let requires_trim = points.into_iter().any(|point| {
-            let t = (((mm(point.x) - wall.start_xmm) * dx + (mm(point.y) - wall.start_ymm) * dy)
-                / axis_squared)
-                .clamp(0.0, 1.0);
-            let bottom = wall.start_bottom_zmm + (wall.end_bottom_zmm - wall.start_bottom_zmm) * t;
-            let top = wall.start_top_zmm + (wall.end_top_zmm - wall.start_top_zmm) * t;
-            mm(block.z_centimm) < bottom - 1e-8
-                || mm(block.z_centimm + profile.index_centimm) > top + 1e-8
-        });
-        if requires_trim {
-            trims.push(json!({"kind":"wall_boundary","source_wall_id":wall.guid}));
-        }
-    }
     let width = walls
         .first()
         .map(|w| w.thickness_mm)
@@ -512,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn actual_trim_exports_finished_length_and_declares_sup_wall_boundary_work() {
+    fn actual_trim_exports_finished_length_without_sup_wall_geometry() {
         let standard = parse_request(include_str!(
             "../Документация/Граничные контракты/examples/layout-request.v1.json"
         ))
@@ -534,7 +511,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|t| t["kind"] == "wall_boundary"));
+            .all(|t| t["kind"] != "wall_boundary"));
     }
 
     #[test]

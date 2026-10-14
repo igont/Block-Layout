@@ -228,11 +228,13 @@ pub fn finalize_parts(
         }
         pending.extend(part.components.iter().map(|child| (child, depth + 1)));
     }
+    let walls = crate::topology::normalize_building(request.raw_building())
+        .map_err(|message| crate::api::ApiFailure::new("INVALID_WALL_PROFILE", message, None))?.walls;
     let mut work = 0;
-    let nominal = finalize_parts_inner(request, profile, blocks, 0, &mut work, &[])?;
+    let nominal = finalize_parts_inner(request, profile, blocks, 0, &mut work, &[], &walls)?;
     let reveals = finished_opening_reveals(request, profile, &nominal, &mut work)?;
     if reveals.is_empty() { return Ok(nominal); }
-    finalize_parts_inner(request, profile, &nominal, 0, &mut work, &reveals)
+    finalize_parts_inner(request, profile, &nominal, 0, &mut work, &reveals, &walls)
 }
 
 /// Натуральные скрытые торцы задают общую готовую плоскость обсады.
@@ -285,6 +287,7 @@ fn finalize_parts_inner(
     depth: usize,
     work: &mut usize,
     reveals: &[(usize, bool, i64)],
+    walls: &[crate::domain::NormalizedWall],
 ) -> Result<Vec<Block>, crate::api::ApiFailure> {
     if blocks.len() > MAX_BLOCKS || depth > 16 {
         return Err(crate::api::ApiFailure::new("GEOMETRY_LIMIT",
@@ -401,6 +404,25 @@ fn finalize_parts_inner(
             }
             let mut low = (a.min(b) * 100.0).round() as i64;
             let mut high = (a.max(b) * 100.0).round() as i64;
+            if (opening.start_top_zmm - opening.end_top_zmm).abs() > 1e-7 {
+                // Любое пересечение проёма с венцом укорачивает деталь на всю высоту.
+                let za = opening.start_top_zmm;
+                let zb = opening.end_top_zmm;
+                if bottom >= za.max(zb) { continue; }
+                if bottom > za.min(zb) {
+                    let crossing = ((a + (b - a) * (bottom - za) / (zb - za)) * 100.0).round() as i64;
+                    if (zb > za) == (b > a) { low = crossing; } else { high = crossing; }
+                }
+            }
+            if (opening.start_bottom_zmm - opening.end_bottom_zmm).abs() > 1e-7 {
+                let za = opening.start_bottom_zmm;
+                let zb = opening.end_bottom_zmm;
+                if top <= za.min(zb) { continue; }
+                if top < za.max(zb) {
+                    let crossing = ((a + (b - a) * (top - za) / (zb - za)) * 100.0).round() as i64;
+                    if (zb > za) == (b > a) { high = high.min(crossing); } else { low = low.max(crossing); }
+                }
+            }
             for &(index, is_start, reference_length) in reveals {
                 if index != opening_index || original.length_centimm >= reference_length { continue; }
                 let boundary = ((if is_start { a } else { b }) * 100.0).round() as i64;
@@ -413,23 +435,33 @@ fn finalize_parts_inner(
             }
             exclusions.push((low, high, format!("opening:{}", opening.guid)));
         }
-        let mut stock_span = Span { start: 0, end: original.length_centimm };
+        let mut spans = vec![Span { start: 0, end: original.length_centimm }];
+        let mut wall_boundaries = Vec::new();
         if original.kind.starts_with("node_") {
-            let wall_spans: Vec<_> = request.wall_volumes.iter().filter(|wall| {
-                owns_wall(&wall.guid)
-            }).filter_map(|wall| {
-                let (a, av) = project(wall.start_xmm, wall.start_ymm);
-                let (b, bv) = project(wall.end_xmm, wall.end_ymm);
-                ((bv - av).abs() < 0.02).then_some((a.min(b), a.max(b)))
+            let axial_walls: Vec<_> = walls.iter().filter(|wall| owns_wall(&wall.id)).filter(|wall| {
+                let (_, av) = project(wall.start.x as f64 / 100.0, wall.start.y as f64 / 100.0);
+                let (_, bv) = project(wall.end.x as f64 / 100.0, wall.end.y as f64 / 100.0);
+                (bv - av).abs() < 0.02
             }).collect();
-            if !wall_spans.is_empty() {
-                stock_span.start = (wall_spans.iter().map(|s| s.0).fold(f64::INFINITY, f64::min) * 100.0).round() as i64;
-                stock_span.end = (wall_spans.iter().map(|s| s.1).fold(f64::NEG_INFINITY, f64::max) * 100.0).round() as i64;
-                stock_span.start = stock_span.start.max(0);
-                stock_span.end = stock_span.end.min(original.length_centimm);
+            if !axial_walls.is_empty() {
+                let mut allowed: Vec<_> = axial_walls.into_iter().filter_map(|wall|
+                    crate::topology::wall_course_axis(wall, original.z_centimm).map(|axis| (wall, axis))).map(|(wall, (a, b))| {
+                    let a = project(a.x as f64 / 100.0, a.y as f64 / 100.0).0;
+                    let b = project(b.x as f64 / 100.0, b.y as f64 / 100.0).0;
+                    let start = (a.min(b) * 100.0).round() as i64;
+                    let end = (a.max(b) * 100.0).round() as i64;
+                    wall_boundaries.push((start, end, wall.id.clone()));
+                    Span { start: start.max(0), end: end.min(original.length_centimm) }
+                }).filter(|span| span.len() > 0).collect();
+                allowed.sort_by_key(|span| span.start);
+                spans.clear();
+                for span in allowed {
+                    if let Some(last) = spans.last_mut().filter(|last| last.end >= span.start) {
+                        last.end = last.end.max(span.end);
+                    } else { spans.push(span); }
+                }
             }
         }
-        let mut spans = vec![stock_span];
         for &(start, end, _) in &exclusions {
             *work = work.saturating_add(spans.len());
             if *work > MAX_BLOCKS * 256 {
@@ -482,7 +514,10 @@ fn finalize_parts_inner(
             }).collect();
             let cut_source = |left| exclusions.iter().find_map(|(start, end, source)|
                 ((left && *end == span.start) || (!left && *start == span.end))
-                    .then(|| CutSource::from_obstacle(source))).unwrap_or(CutSource::Stock);
+                    .then(|| CutSource::from_obstacle(source)))
+                .or_else(|| wall_boundaries.iter().find_map(|(start, end, id)|
+                    ((left && *start == span.start) || (!left && *end == span.end))
+                        .then(|| CutSource::Wall(id.clone())))).unwrap_or(CutSource::Stock);
             part.ends = original.ends.slice(span.start, span.end, original.length_centimm,
                 cut_source(true), cut_source(false));
             let free_end = |point: Point| {
@@ -521,7 +556,7 @@ fn finalize_parts_inner(
                 part.ends.record_cut(false, part.length_centimm, CutSource::Wall(wall_id)).map_err(|e| plane_conflict(false, e))?;
             }
             part.cuts.retain(|cut| !cut.starts_with("beam_volume:")
-                && !cut.starts_with("opening_volume:") && cut != "left" && cut != "right"
+                && !cut.starts_with("opening_volume:") && !cut.starts_with("opening_slope:") && cut != "left" && cut != "right"
                 && !(cut.starts_with("arm:") && cut.ends_with(":distal")));
             // Причина открытого торца переживает разделение и экспорт. Короткая
             // длина сама по себе не разрешает использовать деталь как добор.
@@ -552,7 +587,7 @@ fn finalize_parts_inner(
                 continue;
             }
             if !original.components.is_empty() {
-                let components = finalize_parts_inner(request, profile, &original.components, depth + 1, work, reveals)?;
+                let components = finalize_parts_inner(request, profile, &original.components, depth + 1, work, reveals, walls)?;
                 part.components = components.into_iter().filter(|child| {
                     let a = project(child.start.x as f64 / 100.0, child.start.y as f64 / 100.0).0 * 100.0;
                     let b = project(child.end.x as f64 / 100.0, child.end.y as f64 / 100.0).0 * 100.0;
@@ -6041,6 +6076,48 @@ mod tests {
         }
         let error = finalize_parts(&request, &profile(), &[nested]).unwrap_err();
         assert_eq!(error.code, "GEOMETRY_LIMIT");
+    }
+
+    #[test]
+    fn gable_shortens_typed_stock_at_the_same_course_boundary_in_every_direction() {
+        for rotation in [0, 90, 180, 270] {
+            for rising in [false, true] {
+                let (dx, dy) = match rotation { 0 => (640, 0), 90 => (0, 640),
+                    180 => (-640, 0), _ => (0, -640) };
+                let request: crate::api::LayoutRequest = serde_json::from_value(serde_json::json!({
+                    "schema_version":1,"request_id":"typed-gable","snapshot_hash":"e".repeat(64),"z0_mm":0,
+                    "wall_volumes":[{"guid":"w","startXmm":0,"startYmm":0,"endXmm":dx,"endYmm":dy,
+                        "startBottomZmm":-63,"endBottomZmm":-63,
+                        "startTopZmm":if rising {0} else {252},"endTopZmm":if rising {252} else {0},
+                        "thicknessMm":193,"purposeType":1}]
+                })).unwrap();
+                let e = edge("e", "w", (0, 0), (dx * 100, dy * 100));
+                let mut input = block(&e, 1, 6300, Span {start:0,end:64000}, 64000, "node_T", false,
+                    vec!["Type6:x2:y1:w".into()], vec!["wall:w".into()]);
+                input.product_key = Some("Type6".into());
+                let p = profile();
+                let parts = finalize_parts(&request, &p, &[input]).unwrap();
+                assert_eq!(parts.len(), 1);
+                let part = &parts[0];
+                // Topology uses top > course bottom on the common 0.01 mm grid.
+                assert_eq!(part.length_centimm, 47999);
+                assert_eq!(part.z_centimm, 6300);
+                assert!(part.cuts.iter().any(|cut| cut.starts_with(if rising {"Type6:p15999:"} else {"Type6:p32000:"})));
+                assert_eq!(finalize_parts(&request, &p, &parts).unwrap(), parts);
+                let standard = crate::exchange::from_layout_request(&request, &p).unwrap();
+                let codes = crate::code_result::export_blocks(&standard, &request, &p, &parts, &[]).unwrap();
+                let product = &codes["blocks"][0];
+                assert_eq!(product["length_mm"], 479.99);
+                assert_eq!(product["height_mm"], 63.0);
+                assert_eq!(product["node_cuts"].as_array().unwrap().len(), 1);
+                assert!(product["trims"].as_array().unwrap().iter().all(|trim|
+                    trim["kind"] != "wall_boundary" && trim["kind"] != "opening_slope"));
+                let physical = crate::materialize::materialize(&request, &parts, &p).unwrap();
+                assert!(!physical.physical.blocks.is_empty());
+                assert!(physical.physical.blocks.iter().flat_map(|b| &b.bodies).flat_map(|m| &m.vertices)
+                    .all(|v| (v[2] - 63.0).abs() < 1e-7 || (v[2] - 126.0).abs() < 1e-7));
+            }
+        }
     }
 
     #[test]
