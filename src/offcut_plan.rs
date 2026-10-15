@@ -122,6 +122,24 @@ fn obstacle_zones(block: &Block, request: &LayoutRequest) -> Vec<String> {
         .collect()
 }
 
+fn has_opening_head_cut(block: &Block, request: &LayoutRequest) -> bool {
+    block.obstacle_ends().iter().any(|end| {
+        let Some(id) = end.source_id.strip_prefix("opening:") else { return false; };
+        let Some(opening) = request.opening_volumes.iter().find(|o| o.guid == id) else { return false; };
+        let bottom = block.z_centimm as f64 / 100.0;
+        let rise = opening.end_top_zmm - opening.start_top_zmm;
+        if rise.abs() <= 1e-7 { return false; }
+        let t = (bottom - opening.start_top_zmm) / rise;
+        // At the original endpoints this remains a side reveal, not a head cut.
+        if !(0.0 < t && t < 1.0) { return false; }
+        let point = if end.left { block.start } else { block.end };
+        let x = opening.start_xmm + (opening.end_xmm - opening.start_xmm) * t;
+        let y = opening.start_ymm + (opening.end_ymm - opening.start_ymm) * t;
+        // Finalization rounds the axial cut to the exchange's 0.01 mm grid.
+        (point.x as f64 / 100.0 - x).hypot(point.y as f64 / 100.0 - y) <= 0.01 + 1e-7
+    })
+}
+
 fn section(block: &Block, request: &LayoutRequest, profile: &Profile) -> Option<(i64, i64)> {
     let mut width = None;
     for wall in request
@@ -168,7 +186,7 @@ fn candidate(
 ) -> Option<((i64, i64), Candidate)> {
     let typed = block.kind.starts_with("node_") && matches!(block.product_key.as_deref(),
         Some("Type5_1" | "Type6" | "Type7_1" | "Type8" | "Type8_1"));
-    if block.is_bridge || !block.components.is_empty()
+    if block.is_bridge || !block.components.is_empty() || has_opening_head_cut(block, request)
         || !typed && (block.kind != "ordinary" || block.product_key.is_some()
             || !block.arms.is_empty() || !block.cuts.is_empty())
         || typed && block.cuts.iter().any(|cut| !cut.starts_with("Type")) {

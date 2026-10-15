@@ -421,12 +421,12 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
         if width > 1500. || (opening.top_start_mm - opening.top_end_mm).abs() > 0.01 { continue; }
         let required = if width <= 1000. { 3 } else { 5 };
         let source = format!("opening:{}", opening.id);
-        let available = blocks.iter().filter(|block| block.is_bridge
+        let available = blocks.iter().filter(|block| block.lintel_is_valid()
             && (block.source_ids.contains(&source) || block.source_ids.contains(&opening.id)))
             .map(|block| block.course_index).collect::<std::collections::BTreeSet<_>>().len();
         if available < required {
             let mut note = ApiFailure::new("LINTEL_ROWS_INCOMPLETE",
-                format!("Для проёма выпущено {available} из {required} требуемых рядов перемычек; набор неполный"),
+                format!("Для проёма корректны {available} из {required} требуемых рядов перемычек; сохранённые верхние ряды с нарушениями требуют уточнения"),
                 Some(opening.id.clone()));
             note.source_ids.push(source);
             diagnostics.push(note);
@@ -682,7 +682,7 @@ mod opening_tests {
         );
     }
     #[test]
-    fn real_t_conflict_shifts_available_layers_and_warns_about_the_missing_upper_layer() {
+    fn real_t_conflict_keeps_the_review_upper_row_and_counts_only_valid_layers() {
         let mut r = request(0.);
         r.wall_volumes[0].end_xmm = 3200.;
         r.wall_volumes[0].start_top_zmm = 441.;
@@ -702,7 +702,7 @@ mod opening_tests {
         let profile: Profile = serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
         let result = inspect_request(&r, &profile);
         assert!(!result.blocks.is_empty(), "{:?}", result.diagnostics);
-        let courses: std::collections::BTreeSet<_> = result.blocks.iter().filter(|block| block.is_bridge)
+        let courses: std::collections::BTreeSet<_> = result.blocks.iter().filter(|block| block.lintel_is_valid())
             .map(|block| block.course_index).collect();
         assert_eq!(courses, std::collections::BTreeSet::from([3, 5]), "{:?}", result.diagnostics);
         let warning = result.diagnostics.iter().find(|note| note.code == "LINTEL_ROWS_INCOMPLETE").unwrap();

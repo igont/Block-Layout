@@ -127,19 +127,30 @@ fn opening_cut_at_one_end_preserves_other_end_and_exact_length() {
 }
 
 #[test]
-fn inclined_beam_axis_or_height_direction_does_not_cut_parts() {
+fn inclined_beam_axis_or_height_direction_shortens_only_at_vertical_planes() {
     let block = block(640);
-    for (end_z, height_x) in [(20.0, 0.0), (0.0, 0.1)] {
+    let tilted_length=1000.0_f64.hypot(20.0);
+    for (end_z, height_x, height_y, height_z) in [
+        (20.0, 0.0, -20.0/tilted_length, 1000.0/tilted_length),
+        (0.0, 0.1, 0.0, 0.99_f64.sqrt()),
+    ] {
         let r = request(
             640.0,
             json!([{"guid":"beam","startXmm":320,"startYmm":-500,"startZmm":0,
             "endXmm":320,"endYmm":500,"endZmm":end_z,
-            "geometry":{"widthMm":160,"heightMm":63,"heightDirectionX":height_x,"heightDirectionY":0,"heightDirectionZ":1}}]),
+            "geometry":{"widthMm":160,"heightMm":63,"heightDirectionX":height_x,"heightDirectionY":height_y,"heightDirectionZ":height_z}}]),
         );
         let rendered = materialize(&r, &[block.clone()], &profile()).unwrap();
         let actual: f64 = rendered.physical.blocks.iter().flat_map(|b| &b.bodies).map(volume).sum();
-        assert!((actual - 630.0 * 193.0 * 63.0).abs() < 1e-4);
-        assert_eq!(rendered.physical.blocks.len(), 1);
+        let half_width_x=if height_x==0.0 {80.0} else {80.0*height_z};
+        let low=((320.0-half_width_x)*100.0).floor()/100.0;
+        let high=((320.0+half_width_x+63.0*height_x)*100.0).ceil()/100.0;
+        assert!((actual - (630.0-(high-low)) * 193.0 * 63.0).abs() < 1e-4);
+        assert_eq!(rendered.physical.blocks.len(), 2);
+        assert_eq!(rendered.exchange_blocks[0]["natural_end_right"], false);
+        assert_eq!(rendered.exchange_blocks[1]["natural_end_left"], false);
+        assert!(rendered.physical.blocks.iter().flat_map(|b| &b.bodies).flat_map(|m| &m.vertices)
+            .all(|p| p[2].abs()<1e-7 || (p[2]-63.0).abs()<1e-7));
     }
 }
 

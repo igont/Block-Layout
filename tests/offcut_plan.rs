@@ -273,6 +273,73 @@ fn stock_is_consumed_once_and_missing_saw_allowance_prevents_replacement() {
 }
 
 #[test]
+fn sloped_window_head_parts_are_ordinary_while_side_offcuts_remain_usable() {
+    for vertical in [false, true] {
+    for descending in [false, true] {
+    for reversed_source in [false, true] {
+        let (mut request, profile, mut blocks) = shared_fixture(&[
+            (32000, false, true), (32000, true, false),
+            (24000, false, true), (30000, true, false),
+        ]);
+        let opening = &mut request.opening_volumes[0];
+        opening.start_top_zmm = if descending { 441.0 } else { 126.0 };
+        opening.end_top_zmm = if descending { 126.0 } else { 441.0 };
+        if reversed_source {
+            std::mem::swap(&mut opening.start_xmm, &mut opening.end_xmm);
+            std::mem::swap(&mut opening.start_top_zmm, &mut opening.end_top_zmm);
+        }
+        for i in 0..2 {
+            blocks[i].z_centimm = 0;
+            blocks[i].course_index = 0;
+        }
+        for i in 2..4 {
+            blocks[i].z_centimm = 31500;
+            blocks[i].course_index = 5;
+        }
+        let (head_start, side_start) = if descending { (44800, 2000) } else { (27200, 64000) };
+        for (i, start, length, left_cut) in [
+            (2, head_start, 24000, descending), (3, side_start, 30000, !descending),
+        ] {
+            blocks[i].start.x = start;
+            blocks[i].end.x = start + length;
+            blocks[i].ends = fb_layout::end_state::EndStates::from_flags(left_cut, !left_cut, !left_cut, left_cut);
+            blocks[i].ends.record_cut(left_cut, if left_cut { 0 } else { length },
+                fb_layout::end_state::CutSource::Opening("shared".into())).unwrap();
+        }
+        if vertical {
+            for volume in request.wall_volumes.iter_mut().chain(&mut request.opening_volumes) {
+                std::mem::swap(&mut volume.start_xmm, &mut volume.start_ymm);
+                std::mem::swap(&mut volume.end_xmm, &mut volume.end_ymm);
+            }
+            for block in &mut blocks {
+                std::mem::swap(&mut block.start.x, &mut block.start.y);
+                std::mem::swap(&mut block.end.x, &mut block.end.y);
+                block.rotation_deg = 90;
+            }
+        }
+        let result = codes(&request, &profile, &blocks);
+        assert_eq!(result["status"], "success");
+        let rows = result["blocks"].as_array().unwrap();
+        let head = rows.iter().find(|b| b["id"] == "block-2").unwrap();
+        assert_eq!(head["product_type"], "Рядовой");
+        assert_eq!(head["length_mm"], 240.0);
+        assert_eq!(head["is_dobor"], false);
+        assert!(head["cut_from_block_id"].is_null());
+        assert!(head.get("dobor_group").is_none());
+        assert!(head.get("stock_cut_plan").is_none());
+        for plan in rows.iter().filter_map(|b| b.get("stock_cut_plan")) {
+            assert!(plan["parts"].as_array().unwrap().iter().all(|p| p["block_id"] != "block-2"));
+        }
+        assert!(rows.iter().any(|b| b["is_dobor"] == true));
+        assert!(rows.iter().any(|b| b.get("stock_cut_plan").is_some()));
+        let prepared = prepare(&request, &profile, &blocks).unwrap();
+        assert!(prepared.zones.contains_key("block-3"), "The upper side reveal remains eligible");
+    }
+    }
+    }
+}
+
+#[test]
 fn inclined_sill_dobor_side_follows_the_course_boundary_not_the_source_midpoint() {
     let (mut request, profile, mut blocks) = fixture(&[(32000, false, false), (44800, false, false)]);
     request.opening_volumes = vec![serde_json::from_value(json!({

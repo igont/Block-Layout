@@ -67,7 +67,11 @@ fn normalize_wall(raw: RawWall) -> Result<NormalizedWall, String> {
         thickness: scaled(raw.thickness_mm, "thickness")?,
     };
     direction(wall.start, wall.end).map_err(|e| format!("{}: {e}", wall.id))?;
-    if wall.thickness <= 0 || wall.bottom_start >= wall.top_start || wall.bottom_end >= wall.top_end
+    // A gable may taper to zero at one endpoint; its interior still has height.
+    if wall.thickness <= 0
+        || wall.bottom_start > wall.top_start
+        || wall.bottom_end > wall.top_end
+        || (wall.bottom_start == wall.top_start && wall.bottom_end == wall.top_end)
     {
         return Err(format!(
             "{}: несовместимая толщина или высотный профиль",

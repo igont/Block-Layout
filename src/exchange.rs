@@ -134,8 +134,10 @@ impl AxisPrism {
         ];
         if values.iter().any(|v| !v.is_finite())
             || self.start_xy_mm == self.end_xy_mm
-            || self.top_start_mm <= self.bottom_start_mm
-            || self.top_end_mm <= self.bottom_end_mm
+            || self.top_start_mm < self.bottom_start_mm
+            || self.top_end_mm < self.bottom_end_mm
+            || (self.top_start_mm == self.bottom_start_mm
+                && self.top_end_mm == self.bottom_end_mm)
             || self.left_thickness_mm < 0.0
             || self.right_thickness_mm < 0.0
             || self.left_thickness_mm + self.right_thickness_mm <= 0.0

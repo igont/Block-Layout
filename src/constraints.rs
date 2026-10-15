@@ -632,6 +632,35 @@ fn positive_volume(points: &[Local3]) -> bool {
         > EPS * normal.norm()
 }
 
+/// Project an actual beam/course collision onto the block axis. The points
+/// describe the collision only; the returned interval splits whole FB parts.
+/// No clipped material or sloping FB face is produced by this operation.
+pub(crate) fn beam_block_interval(
+    beam: &RawBeam,
+    start: Point,
+    direction: (f64, f64),
+    length_centimm: i64,
+    width_mm: f64,
+    bottom_mm: f64,
+    top_mm: f64,
+) -> Result<Option<Interval>, ConstraintError> {
+    if beam_axes(beam).is_none() || !beam.width_mm.is_finite() || beam.width_mm <= 0.0
+        || !beam.height_mm.is_finite() || beam.height_mm <= 0.0 {
+        return Err(error(&beam.id, "Некорректные оси исходной балки для укорочения FB"));
+    }
+    let frame = Frame {
+        start,
+        ux: direction.0,
+        uy: direction.1,
+        length: length_centimm as f64,
+        half_thickness: width_mm * SCALE / 2.0,
+    };
+    let points = clipped_beam(&frame, beam, 0.0, frame.length,
+        -frame.half_thickness, frame.half_thickness, bottom_mm * SCALE, top_mm * SCALE);
+    if !positive_volume(&points) { return Ok(None); }
+    Ok(bounds3(&points).and_then(|(low, high)| outer_interval(low, high, frame.length)))
+}
+
 fn beam_contains(frame: &Frame, beam: &RawBeam, point: Local3) -> bool {
     let (axis, height, width, axis_length) = beam_axes(beam).unwrap();
     let origin = Vec3 {
@@ -1704,6 +1733,40 @@ mod tests {
             height_direction_y: 0.0,
             height_direction_z: 1.0,
         }
+    }
+
+    #[test]
+    fn inclined_collision_interval_uses_source_height_frame_and_ignores_contact() {
+        let mut source = beam(raw(0.0, 0.0), raw(640.0, 0.0), 100.0);
+        let axis_length = 640.0_f64.hypot(200.0);
+        source.bottom_start_mm = -100.0;
+        source.bottom_end_mm = 100.0;
+        source.height_mm = 50.0;
+        source.height_direction_x = -200.0/axis_length;
+        source.height_direction_z = 640.0/axis_length;
+        let interval = |b: &RawBeam| beam_block_interval(b, Point {x:0,y:0},
+            (1.0, 0.0), 64_000, 193.0, 0.0, 63.0);
+        let expected = interval(&source).unwrap();
+        assert!(expected.is_some());
+        let mut inverted = source.clone();
+        inverted.start.x_mm += source.height_direction_x*source.height_mm;
+        inverted.end.x_mm += source.height_direction_x*source.height_mm;
+        inverted.bottom_start_mm += source.height_direction_z*source.height_mm;
+        inverted.bottom_end_mm += source.height_direction_z*source.height_mm;
+        inverted.height_direction_x *= -1.0;
+        inverted.height_direction_z *= -1.0;
+        assert_eq!(interval(&inverted).unwrap(), expected);
+        let mut touching = source.clone();
+        touching.bottom_start_mm = 63.0;
+        touching.bottom_end_mm = 263.0;
+        assert_eq!(interval(&touching).unwrap(), None);
+        let mut outside = source.clone();
+        outside.start.y_mm = 200.0;
+        outside.end.y_mm = 200.0;
+        assert_eq!(interval(&outside).unwrap(), None);
+        let mut invalid = source.clone();
+        invalid.height_direction_z = 0.0;
+        assert_eq!(interval(&invalid).unwrap_err().source_id, "beam");
     }
 
     #[test]

@@ -15,6 +15,11 @@ use crate::vertical::{self, JointEvidence, VerticalError, VerticalVerdict};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod lintel_plan;
+
+const LINTEL_REVIEW_REQUIRED: &str = "lintel_review_required:";
+const LINTEL_REVIEW_PLACEHOLDER: &str = "lintel_review_required:missing_material:";
+
 const MAX_BLOCKS: usize = 100_000;
 const MAX_SEARCH_STATES: usize = 100_000;
 
@@ -72,6 +77,7 @@ pub enum DiagnosticCode {
     UnsupportedGeometry,
     InvalidMask,
     InvalidSupport,
+    LintelReviewRequired,
     UnsupportedNodeCut,
     NodeCollision,
     PhaseConflict,
@@ -185,6 +191,10 @@ pub struct Block {
 }
 
 impl Block {
+    pub fn lintel_is_valid(&self) -> bool {
+        self.is_bridge && !self.catalog_status.starts_with(LINTEL_REVIEW_REQUIRED)
+    }
+
     pub fn hide_spikes_left(&self) -> bool { self.ends.left().cut() }
     pub fn hide_spikes_right(&self) -> bool { self.ends.right().cut() }
     pub fn natural_end_left(&self) -> bool { self.ends.left().natural() }
@@ -310,6 +320,12 @@ fn finalize_parts_inner(
         if original.length_centimm <= 0 {
             continue;
         }
+        // A diagnostic placement explicitly records absent material. Cutting it
+        // away again would silently lose the upper row requested by the user.
+        if original.is_bridge && original.catalog_status.starts_with(LINTEL_REVIEW_PLACEHOLDER) {
+            result.push(original.clone());
+            continue;
+        }
         let angle = f64::from(original.rotation_deg).to_radians();
         let (ux, uy) = (angle.cos(), angle.sin());
         let origin = (original.start.x as f64 / 100.0, original.start.y as f64 / 100.0);
@@ -333,6 +349,23 @@ fn finalize_parts_inner(
             if !column && ((beam.end_zmm - beam.start_zmm).abs() > 1e-7
                 || beam.geometry.height_direction_x.abs() > 1e-7
                 || beam.geometry.height_direction_y.abs() > 1e-7) {
+                let raw = crate::constraints::RawBeam {
+                    id: beam.guid.clone(),
+                    start: crate::domain::RawPoint { x_mm: beam.start_xmm, y_mm: beam.start_ymm },
+                    end: crate::domain::RawPoint { x_mm: beam.end_xmm, y_mm: beam.end_ymm },
+                    bottom_start_mm: beam.start_zmm, bottom_end_mm: beam.end_zmm,
+                    top_start_mm: beam.start_zmm + beam.geometry.height_mm * beam.geometry.height_direction_z,
+                    top_end_mm: beam.end_zmm + beam.geometry.height_mm * beam.geometry.height_direction_z,
+                    width_mm: beam.geometry.width_mm, height_mm: beam.geometry.height_mm,
+                    height_direction_x: beam.geometry.height_direction_x,
+                    height_direction_y: beam.geometry.height_direction_y,
+                    height_direction_z: beam.geometry.height_direction_z,
+                };
+                if let Some(interval) = crate::constraints::beam_block_interval(&raw, original.start,
+                    (ux, uy), original.length_centimm, width, bottom, top).map_err(|e|
+                        crate::api::ApiFailure::new("INVALID_BEAM_GEOMETRY", e.message, Some(e.source_id)))? {
+                    exclusions.push((interval.start, interval.end, format!("beam:{}", beam.guid)));
+                }
                 continue;
             }
             let other_z = if column { beam.end_zmm } else {
@@ -1584,7 +1617,8 @@ fn validate_vertical_plan(
         for (part_index, block) in blocks
             .iter()
             .enumerate()
-            .filter(|(_, b)| b.course_index == course.index)
+            .filter(|(_, b)| b.course_index == course.index
+                && (!b.is_bridge || b.lintel_is_valid()))
         {
             let arms: Vec<_> = if block.arms.is_empty() {
                 vec![(block.edge_id.as_str(), block.start, block.end)]
@@ -2578,68 +2612,86 @@ fn glued_lintel_segments(
     Some(segments)
 }
 
-/// Все штатные слои связанных проёмов образуют один пакет. Отсутствующий
-/// слой не восстанавливается; только конструктивный конфликт допускает
-/// общий подъём существующих слоёв на один венец.
+/// Совместный подбор фаз соседних наборов сохраняет максимум корректных рядов.
 fn merge_t_lintels(
     blocks: &mut Vec<Block>,
     topology: &Topology,
     constraints: &Constraints,
     profile: &Profile,
 ) -> BTreeSet<(i64, String)> {
-    let mut completed = BTreeSet::new();
-    let mut pending: BTreeSet<String> = constraints.lintel_candidates.iter()
-        .map(|candidate| candidate.opening_id.clone()).collect();
-    // Resolve neighbours in spatial order, independent of GUIDs and input
-    // order. The left packet can then use the alternate phase if the right
-    // packet owns their shared stock in a pier split into several runs.
-    while let Some(first) = pending.iter().find(|id| constraints.console_axes.contains_key(*id)).cloned()
-        .or_else(|| pending.iter().max_by_key(|id| {
-        constraints.opening_axis(id).map(|(a, b)|
-            ((a.x_mm.min(b.x_mm) * 100.).round() as i64,
-             (a.y_mm.min(b.y_mm) * 100.).round() as i64))
-    }).cloned()) {
-        let mut opening_ids = BTreeSet::from([first]);
-        loop {
-            let previous = opening_ids.len();
-            for candidate in &constraints.lintel_candidates {
-                for group in lintel_groups(constraints, &candidate.run_id, candidate.course_index) {
-                    if group.iter().any(|item| opening_ids.contains(&item.opening_id)) {
-                        opening_ids.extend(group.iter().map(|item| item.opening_id.clone()));
-                    }
-                }
-            }
-            if opening_ids.len() == previous { break; }
+    lintel_plan::merge(blocks, topology, constraints, profile)
+}
+
+/// Верхний ряд остаётся видимым при конструктивном нарушении. Его материал
+/// не участвует в оценке корректных рядов и не забирается у выбранных перемычек.
+fn preserve_upper_lintel_rows(
+    blocks: &mut Vec<Block>,
+    topology: &Topology,
+    constraints: &Constraints,
+    profile: &Profile,
+    offset: i64,
+) {
+    let mut missing = constraints.clone();
+    missing.lintel_candidates.retain(|candidate| !blocks.iter().any(|part|
+        part.is_bridge && part.course_index == candidate.course_index + offset
+            && (part.source_ids.contains(&candidate.opening_id)
+                || part.source_ids.contains(&format!("opening:{}", candidate.opening_id)))));
+    if missing.lintel_candidates.is_empty() { return; }
+    let constraints = &missing;
+    let placed = merge_t_lintels_at_offset_policy(blocks, constraints, profile, offset,
+        &mut BTreeSet::new(), &mut false, true);
+    for candidate in &constraints.lintel_candidates {
+        if placed.contains(&(candidate.course_index, candidate.opening_id.clone())) { continue; }
+        let Some((a, b)) = constraints.opening_axis(&candidate.opening_id) else { continue; };
+        let (dx, dy) = (b.x_mm - a.x_mm, b.y_mm - a.y_mm);
+        let width = dx.hypot(dy);
+        if width <= 0. { continue; }
+        let (ux, uy) = (dx / width, dy / width);
+        let support = (profile.lintel_support_mm.max(150.) * 100.).round() as i64;
+        let required = Span { start: -support, end: (width * 100.).round() as i64 + support };
+        let project = |p: Point| ((p.x as f64 - a.x_mm * 100.) * ux
+            + (p.y as f64 - a.y_mm * 100.) * uy).round() as i64;
+        let on_axis = |p: Point| ((p.x as f64 - a.x_mm * 100.) * uy
+            - (p.y as f64 - a.y_mm * 100.) * ux).abs() <= 1.;
+        let course = candidate.course_index + offset;
+        let status = format!("{LINTEL_REVIEW_REQUIRED}для верхнего ряда нет непрерывного материала с требуемым опиранием и допустимыми узлами");
+        let mut retained = false;
+        for part in blocks.iter_mut().filter(|part| part.course_index == course && !part.is_bridge) {
+            let points: Vec<_> = if part.arms.is_empty() { vec![part.start, part.end] }
+                else { part.arms.iter().flat_map(|arm| [arm.start, arm.end]).collect() };
+            if !points.iter().all(|point| on_axis(*point)) { continue; }
+            let span = Span { start: points.iter().map(|p| project(*p)).min().unwrap_or(0),
+                end: points.iter().map(|p| project(*p)).max().unwrap_or(0) };
+            if span.len() <= 0 || !span.intersects(required) { continue; }
+            part.is_bridge = true;
+            part.catalog_status = status.clone();
+            part.source_ids.push(candidate.opening_id.clone());
+            part.source_ids.sort(); part.source_ids.dedup();
+            retained = true;
         }
-        pending.retain(|id| !opening_ids.contains(id));
-        let mut packet = constraints.clone();
-        packet.lintel_candidates.retain(|candidate| opening_ids.contains(&candidate.opening_id)
-            && lintel_course_has_wall_height(topology, constraints, candidate, profile, 0));
-        let mut current = blocks.clone();
-        let mut eligible = BTreeSet::new();
-        let mut conflict = false;
-        let placed = merge_t_lintels_at_offset(&mut current, &packet, profile, 0, &mut eligible, &mut conflict);
-        if !conflict {
-            *blocks = current;
-            completed.extend(placed);
-            continue;
-        }
-        // Unavailable rows are removed before trying the common shift, so height
-        // cannot introduce a replacement for a missing requested layer.
-        packet.lintel_candidates.retain(|candidate|
-            eligible.contains(&(candidate.course_index, candidate.opening_id.clone()))
-                && lintel_course_has_wall_height(topology, constraints, candidate, profile, 1));
-        let required_shifted: BTreeSet<_> = packet.lintel_candidates.iter()
-            .map(|candidate| (candidate.course_index, candidate.opening_id.clone())).collect();
-        let mut shifted = blocks.clone();
-        let shifted_placed = merge_t_lintels_at_offset(&mut shifted, &packet, profile, 1,
-            &mut BTreeSet::new(), &mut false);
-        if required_shifted.is_subset(&shifted_placed) {
-            *blocks = shifted;
-            completed.extend(shifted_placed);
-        }
+        if retained { continue; }
+        // A missing upper wall course still needs a diagnostic placement. Source
+        // identity comes from the opening's original run, never from another wall.
+        let Some(reference) = topology.courses.iter().min_by_key(|c|
+            (c.index - candidate.course_index).abs()) else { continue; };
+        let source = topology.courses.iter().flat_map(|c| &c.runs)
+            .find(|run| run.id == candidate.run_id);
+        let wall_id = source.and_then(|run| run.sources.first()).map(|s| s.wall_id.clone())
+            .unwrap_or_else(|| candidate.run_id.clone());
+        let point = |u: i64| Point { x: (a.x_mm * 100. + u as f64 * ux).round() as i64,
+            y: (a.y_mm * 100. + u as f64 * uy).round() as i64 };
+        let edge = CourseEdge { edge_id: candidate.run_id.clone(), wall_id: wall_id.clone(),
+            start: point(required.start), end: point(required.end) };
+        let length = required.len();
+        let mut part = block(&edge, course, reference.z + (course - reference.index) * profile.index_centimm,
+            Span { start: 0, end: length }, length, "bridge", true, Vec::new(),
+            vec![candidate.opening_id.clone(), format!("wall:{wall_id}")]);
+        part.id = format!("c{course}:lintel:{}:review", candidate.opening_id);
+        part.catalog_status = format!("{LINTEL_REVIEW_PLACEHOLDER}в выбранном венце отсутствует материал верхней перемычки; размещение может пересекать препятствие");
+        part.catalog_nominal_centimm = profile.bridge_nominal_lengths_centimm.iter().copied()
+            .filter(|nominal| *nominal >= length).min();
+        blocks.push(part);
     }
-    completed
 }
 
 /// Height availability comes from the source walls, before beams, joints or
@@ -2770,6 +2822,18 @@ fn merge_t_lintels_at_offset(
     eligible: &mut BTreeSet<(i64, String)>,
     conflict: &mut bool,
 ) -> BTreeSet<(i64, String)> {
+    merge_t_lintels_at_offset_policy(blocks, constraints, profile, offset, eligible, conflict, false)
+}
+
+fn merge_t_lintels_at_offset_policy(
+    blocks: &mut Vec<Block>,
+    constraints: &Constraints,
+    profile: &Profile,
+    offset: i64,
+    eligible: &mut BTreeSet<(i64, String)>,
+    conflict: &mut bool,
+    preserve_invalid: bool,
+) -> BTreeSet<(i64, String)> {
     let mut completed = BTreeSet::new();
     let mut visited = BTreeSet::new();
     let maximum = profile
@@ -2841,6 +2905,7 @@ fn merge_t_lintels_at_offset(
         {
             continue;
         }
+        let mut review_reasons = Vec::new();
         let mut placement: Option<(i64, Vec<(usize, Span)>, Span, Vec<Span>)> = None;
         for offset in std::iter::once(offset) {
             if console && offset != 0 { continue; }
@@ -2869,7 +2934,8 @@ fn merge_t_lintels_at_offset(
             }
             let mut selected: Vec<_> = coverage
                 .into_iter()
-                .filter(|(index, part_span)| part_span.intersects(required) && (!console ||
+                .filter(|(index, part_span)| part_span.intersects(required)
+                    && (!preserve_invalid || !blocks[*index].is_bridge) && (!console ||
                     (!blocks[*index].is_bridge && console_glueable_profiles(&blocks[*index]))))
                 .collect();
             selected.sort_by_key(|(_, part_span)| part_span.start);
@@ -2885,12 +2951,16 @@ fn merge_t_lintels_at_offset(
                 continue;
             };
             let span = Span { start: first.start, end: last.end };
-            if span.start > required.start || span.end < required.end {
-                continue;
+            let insufficient_support = span.start > required.start || span.end < required.end;
+            let gap = selected.windows(2).any(|pair| pair[0].1.end != pair[1].1.start);
+            if !preserve_invalid && (insufficient_support || gap) { continue; }
+            if insufficient_support {
+                let left = openings.first().unwrap().1.start - span.start;
+                let right = span.end - openings.last().unwrap().1.end;
+                review_reasons.push(format!("опирание {:.2}/{:.2} мм при требуемых {:.2} мм",
+                    left as f64 / 100., right as f64 / 100., support as f64 / 100.));
             }
-            if selected.windows(2).any(|pair| pair[0].1.end != pair[1].1.start) {
-                continue;
-            }
+            if gap { review_reasons.push("материал разделён вырезом под препятствие".into()); }
             for item in &group {
                 eligible.insert((item.course_index, item.opening_id.clone()));
             }
@@ -2916,20 +2986,26 @@ fn merge_t_lintels_at_offset(
                         && part.product_key.as_deref() != Some("Type5_1")
                 });
             if transverse_blocked {
-                *conflict = true;
-                continue;
+                if !preserve_invalid { *conflict = true; continue; }
+                review_reasons.push("внутри перемычки находится запрещённый поперечный узел".into());
             }
-            if selected
-                    .windows(2)
-                    .any(|pair| pair[0].1.end != pair[1].1.start)
-                || selected.iter().any(|(i, _)| blocks[*i].is_bridge)
-            {
-                continue;
-            }
-            let segments = glued_lintel_segments(&selected, &openings, maximum, support);
-            let Some(segments) = segments else {
-                if group.len() > 1 { *conflict = true; }
-                continue;
+            let segments = if preserve_invalid {
+                // Retain actual material and its existing joints. Beam gaps remain
+                // gaps, and another opening's selected bridge keeps its stock.
+                let mut segments: Vec<Span> = Vec::new();
+                for (_, part) in &selected {
+                    if let Some(last) = segments.last_mut().filter(|last|
+                        last.end == part.start && part.end - last.start <= maximum) {
+                        last.end = part.end;
+                    } else { segments.push(*part); }
+                }
+                segments
+            } else {
+                let Some(segments) = glued_lintel_segments(&selected, &openings, maximum, support) else {
+                    if group.len() > 1 { *conflict = true; }
+                    continue;
+                };
+                segments
             };
             placement = Some((course, selected, span, segments));
         }
@@ -2978,6 +3054,12 @@ fn merge_t_lintels_at_offset(
                 "c{course}:lintel:{}:{}-{}",
                 candidate.opening_id, span.start, span.end
             );
+            if preserve_invalid {
+                let reason = if review_reasons.is_empty() {
+                    "ряд не вошёл в корректный вариант из-за общей заготовки, каталога или высоты стены".into()
+                } else { review_reasons.join("; ") };
+                merged.catalog_status = format!("{LINTEL_REVIEW_REQUIRED}{reason}");
+            }
             let mut cuts_valid = true;
             for (i, used) in &selected {
                 let part = &blocks[*i];
@@ -3555,9 +3637,13 @@ pub fn calculate_candidate(
             }
         }
         for (i, edge) in edges.iter().enumerate() {
-            if lengths[i] > 64_000 || arms[i].0 == 0 || arms[i].1 == 0 {
+            if lengths[i] > 64_000 || arms[i].0 == 0 || arms[i].1 == 0
+                || arms[i].0 + arms[i].1 <= lengths[i]
+            {
                 continue;
             }
+            // As in paired_tilable_between, shared stock resolves overlapping
+            // reservations only. Touching parts retain their selected joint.
             let candidates: Vec<_> = node_blocks.iter().enumerate()
                 .filter(|(_, part)| part.arms.iter().any(|a| a.edge_id == edge.edge_id))
                 .map(|(index, _)| index).collect();
@@ -4057,7 +4143,7 @@ pub fn calculate_candidate(
                 warning.source_ids.extend(run.sources.iter().map(|s| format!("wall:{}", s.wall_id)));
             }
             warning.source_ids.sort(); warning.source_ids.dedup();
-            warning.message=format!("Перемычка требует уточнения: {}. В просмотре сохранён материал ряда обычными деталями",warning.message);
+            warning.message=format!("Перемычка требует уточнения: {}. Доступные ряды сохранены; нарушения верхних перемычек указаны отдельно",warning.message);
             support_warnings.push(warning);false
         } else {true}
     });
@@ -4106,6 +4192,17 @@ pub fn calculate_candidate(
         )]);
     }
     vertical_errors.extend(support_warnings);
+    for part in blocks.iter().filter(|part| part.is_bridge) {
+        if let Some(reason) = part.catalog_status.strip_prefix(LINTEL_REVIEW_REQUIRED) {
+            let reason = reason.strip_prefix("missing_material:").unwrap_or(reason);
+            let mut warning = diagnostic(DiagnosticCode::LintelReviewRequired,
+                format!("Верхняя перемычка в венце {} сохранена с нарушением: {reason}", part.course_index), None,
+                Some(part.course_index));
+            warning.source_ids = part.source_ids.clone();
+            warning.source_ids.push(part.id.clone());
+            vertical_errors.push(warning);
+        }
+    }
     for (&(course, _), node) in &selected_nodes {
         for arm in &node.geometry.arms {
             if !arm
@@ -5331,13 +5428,13 @@ mod tests {
     }
 
     #[test]
-    fn short_wall_keeps_only_existing_requested_lintel_courses() {
+    fn short_wall_keeps_valid_courses_and_preserves_the_upper_review_row() {
         for (available, expected) in [(4, vec![1, 3]), (5, vec![1, 3, 5])] {
             let (mut parts, constraints, p, _, t) = lintel_packet_fixture(available);
             assert_eq!(constraints.lintel_candidates.iter().map(|c| c.course_index)
                 .collect::<Vec<_>>(), expected);
             merge_t_lintels(&mut parts, &t, &constraints, &p);
-            let courses: Vec<_> = parts.iter().filter(|b| b.is_bridge)
+            let courses: Vec<_> = parts.iter().filter(|b| b.lintel_is_valid())
                 .map(|b| b.course_index).collect();
             assert_eq!(courses, expected);
             assert_eq!(parts.iter().filter(|b| !b.is_bridge && b.course_index == 4).count(), 4);
@@ -5353,7 +5450,7 @@ mod tests {
                 "ordinary", false, Vec::new(), Vec::new()));
         }
         merge_t_lintels(&mut parts, &t, &constraints, &p);
-        assert_eq!(parts.iter().filter(|b| b.is_bridge).map(|b| b.course_index)
+        assert_eq!(parts.iter().filter(|b| b.lintel_is_valid()).map(|b| b.course_index)
             .collect::<Vec<_>>(), vec![1, 3, 5]);
         assert_eq!(parts.iter().filter(|b| b.course_index == 2).count(), 3);
     }
@@ -5367,7 +5464,7 @@ mod tests {
             let completed = merge_t_lintels(&mut parts, &t, &constraints, &p);
             let expected_completed = expected.iter().map(|course| (course - 1, "opening".into())).collect();
             assert_eq!(completed, expected_completed);
-            assert_eq!(parts.iter().filter(|b| b.is_bridge).map(|b| b.course_index)
+            assert_eq!(parts.iter().filter(|b| b.lintel_is_valid()).map(|b| b.course_index)
                 .collect::<Vec<_>>(), expected);
             assert_eq!(parts.iter().filter(|b| !b.is_bridge && b.course_index == 3).count(), 4);
             assert_eq!(parts.iter().filter(|part| part.course_index == 1).cloned().collect::<Vec<_>>(), lower_row,
@@ -5376,7 +5473,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_shift_omits_only_the_layer_above_local_wall_height() {
+    fn packet_shift_retains_the_upper_layer_above_local_wall_height_for_review() {
         let (mut parts, constraints, p, e, mut t) = lintel_packet_fixture(5);
         block_lintel_packet_course(&mut parts, &e, 1);
         // Another wall can supply a global upper course, but not material here.
@@ -5387,20 +5484,23 @@ mod tests {
         let upper_original: Vec<_> = parts.iter().filter(|part| part.course_index == 5).cloned().collect();
         let completed = merge_t_lintels(&mut parts, &t, &constraints, &p);
         assert_eq!(completed, BTreeSet::from([(1, "opening".into()), (3, "opening".into())]));
-        assert_eq!(parts.iter().filter(|part| part.is_bridge).map(|part| part.course_index)
+        assert_eq!(parts.iter().filter(|part| part.lintel_is_valid()).map(|part| part.course_index)
             .collect::<Vec<_>>(), vec![2, 4]);
         assert_eq!(serde_json::to_value(parts.iter().filter(|part| part.course_index == 5)
             .collect::<Vec<_>>()).unwrap(), serde_json::to_value(&upper_original).unwrap());
     }
 
     #[test]
-    fn packet_shift_that_hits_another_conflict_preserves_all_parts() {
+    fn packet_shift_keeps_valid_rows_when_another_row_conflicts() {
         let (mut parts, constraints, p, e, t) = lintel_packet_fixture(6);
         block_lintel_packet_course(&mut parts, &e, 1);
         block_lintel_packet_course(&mut parts, &e, 4);
-        let original = serde_json::to_value(&parts).unwrap();
-        assert!(merge_t_lintels(&mut parts, &t, &constraints, &p).is_empty());
-        assert_eq!(serde_json::to_value(&parts).unwrap(), original);
+        let completed = merge_t_lintels(&mut parts, &t, &constraints, &p);
+        assert_eq!(completed, BTreeSet::from([(1, "opening".into()), (5, "opening".into())]));
+        assert_eq!(parts.iter().filter(|part| part.lintel_is_valid())
+            .map(|part| part.course_index).collect::<Vec<_>>(), vec![2, 6]);
+        assert!(parts.iter().any(|part| part.is_bridge && !part.lintel_is_valid()
+            && part.course_index == 4));
     }
 
     #[test]
@@ -5414,31 +5514,36 @@ mod tests {
         assert!(!lintel_course_has_wall_height(&t, &constraints, upper, &p, 1));
         block_lintel_packet_course(&mut parts, &e, 1);
         merge_t_lintels(&mut parts, &t, &constraints, &p);
-        assert_eq!(parts.iter().filter(|part| part.is_bridge).map(|part| part.course_index)
+        assert_eq!(parts.iter().filter(|part| part.lintel_is_valid()).map(|part| part.course_index)
             .collect::<Vec<_>>(), vec![2, 4]);
     }
 
     #[test]
-    fn incomplete_original_course_is_skipped_without_relocating_it() {
+    fn upper_row_with_insufficient_wall_height_is_retained_in_place() {
         let (mut parts, constraints, p, _, mut t) = lintel_packet_fixture(5);
         t.walls[0].top_start = 35_000;
         t.walls[0].top_end = 35_000;
         let original: Vec<_> = parts.iter().filter(|part| part.course_index == 5).cloned().collect();
         merge_t_lintels(&mut parts, &t, &constraints, &p);
-        assert_eq!(parts.iter().filter(|part| part.is_bridge).map(|part| part.course_index)
+        assert_eq!(parts.iter().filter(|part| part.lintel_is_valid()).map(|part| part.course_index)
             .collect::<Vec<_>>(), vec![1, 3]);
-        assert_eq!(serde_json::to_value(parts.iter().filter(|part| part.course_index == 5)
-            .collect::<Vec<_>>()).unwrap(), serde_json::to_value(&original).unwrap());
+        assert_eq!(parts.iter().filter(|part| part.course_index == 5)
+            .map(|part| part.length_centimm).sum::<i64>(),
+            original.iter().map(|part| part.length_centimm).sum::<i64>());
+        assert!(parts.iter().any(|part| part.course_index == 5 && part.is_bridge && !part.lintel_is_valid()));
     }
 
     #[test]
-    fn packet_shift_does_not_classify_a_construction_gap_as_missing_height() {
+    fn packet_shift_keeps_an_upper_gap_for_review_without_losing_other_rows() {
         let (mut parts, constraints, p, e, t) = lintel_packet_fixture(6);
         parts.retain(|part| !(part.course_index == 4 && part.start.x == 128_000));
         block_lintel_packet_course(&mut parts, &e, 1);
-        let original = serde_json::to_value(&parts).unwrap();
-        assert!(merge_t_lintels(&mut parts, &t, &constraints, &p).is_empty());
-        assert_eq!(serde_json::to_value(&parts).unwrap(), original);
+        let completed = merge_t_lintels(&mut parts, &t, &constraints, &p);
+        assert_eq!(completed, BTreeSet::from([(1, "opening".into()), (5, "opening".into())]));
+        assert_eq!(parts.iter().filter(|part| part.lintel_is_valid())
+            .map(|part| part.course_index).collect::<Vec<_>>(), vec![2, 6]);
+        assert!(parts.iter().any(|part| part.is_bridge && !part.lintel_is_valid()
+            && part.course_index == 4));
     }
 
     #[test]
@@ -5608,7 +5713,7 @@ mod tests {
         };
         let mut blocked = parts(1, "Type10_1");
         assert!(merge_t_lintels(&mut blocked, &t, &c, &p).is_empty());
-        assert!(blocked.iter().all(|b| !b.is_bridge));
+        assert!(blocked.iter().all(|b| !b.lintel_is_valid()));
         for offset in [0, 1] {
             let mut blocks = if offset == 0 {
                 parts(1, "Type5_1")
@@ -5671,11 +5776,12 @@ mod tests {
         let mut too_high = chain(3, &[105_000, 215_000]);
         let mut first_candidate = c.clone();
         first_candidate.lintel_candidates.retain(|candidate| candidate.course_index == 1);
-        assert!(merge_t_lintels(&mut too_high, &t, &first_candidate, &p).is_empty());
+        assert!(!merge_t_lintels(&mut too_high, &t, &first_candidate, &p).contains(&(1, "o".into())));
+        assert!(too_high.iter().all(|part| !part.lintel_is_valid() || part.course_index != 1));
 
         // Обычная перемычка проходит тот же путь склейки после раскладки.
-        let output = calculate(&t, &c, &p).unwrap();
-        let bridge = output.blocks.iter().find(|b| b.is_bridge).unwrap();
+        let output = calculate_candidate(&t, &c, &p).unwrap();
+        let bridge = output.layout.blocks.iter().find(|b| b.lintel_is_valid()).unwrap();
         assert!(bridge.start.x <= 105_000 && bridge.end.x >= 215_000);
         assert!(bridge.length_centimm > 110_000);
 
@@ -5690,8 +5796,8 @@ mod tests {
             }),
             &[], 63.0, 150.0,
         ).unwrap();
-        let output = calculate(&t, &nearby, &p).unwrap();
-        let bridges: Vec<_> = output.blocks.iter().filter(|block| block.is_bridge).collect();
+        let output = calculate_candidate(&t, &nearby, &p).unwrap();
+        let bridges: Vec<_> = output.layout.blocks.iter().filter(|block| block.lintel_is_valid()).collect();
         assert!(!bridges.is_empty());
         assert!(bridges.iter().all(|block| block.source_ids.contains(&"left".into())
             && block.source_ids.contains(&"right".into())));
@@ -5699,7 +5805,7 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_packets_across_runs_shift_all_left_layers_independently_of_ids_and_order() {
+    fn adjacent_packets_across_runs_choose_complementary_phases_independently_of_ids_and_order() {
         use crate::constraints::{build_constraints, RawOpening};
         use crate::domain::{NormalizedWall, RawPoint};
         let e = edge("axis", "wall", (0, 0), (1_280_000, 0));
@@ -5738,7 +5844,7 @@ mod tests {
                 .filter(|part| part.course_index == course).map(|part| part.length_centimm).sum::<i64>())).collect();
             if reverse { parts.reverse(); constraints.lintel_candidates.reverse(); }
             assert_eq!(merge_t_lintels(&mut parts, &t, &constraints, &p).len(), 8);
-            for (id, expected) in [(left_id, vec![2, 4, 6, 8, 10]), (right_id, vec![1, 3, 5])] {
+            for (id, expected) in [(left_id, vec![1, 3, 5, 7, 9]), (right_id, vec![2, 4, 6])] {
                 let mut bridges: Vec<_> = parts.iter().filter(|part| part.is_bridge && part.source_ids.contains(&id.into())).collect();
                 bridges.sort_by_key(|part| part.course_index);
                 assert_eq!(bridges.iter().map(|part| part.course_index).collect::<Vec<_>>(), expected);
@@ -5755,7 +5861,7 @@ mod tests {
     }
 
     #[test]
-    fn real_640_pier_moves_connected_lintels_to_the_next_phase_existing_joint() {
+    fn real_640_pier_optimizes_independent_sets_without_splitting_shared_stock() {
         use crate::constraints::{build_constraints, RawOpening};
         use crate::domain::{NormalizedWall, RawPoint};
         let e = edge("e", "wall", (1_408_000, 576_000), (1_408_000, 992_000));
@@ -5794,18 +5900,18 @@ mod tests {
         p.lintel_support_mm = 150.0;
         p.bridge_nominal_lengths_centimm = vec![275_000];
         let mut current = parts(38, &[576_000, 640_000, 704_000, 768_000, 832_000, 896_000, 960_000, 992_000]);
-        assert!(merge_t_lintels(&mut current, &t, &constraints, &p).is_empty());
-        assert!(current.iter().all(|block| !block.is_bridge));
-        let mut blocks = current;
+        assert_eq!(merge_t_lintels(&mut current, &t, &constraints, &p).len(), 1);
+        assert_eq!(current.iter().filter(|block| block.lintel_is_valid()).count(), 1);
+        let mut blocks = parts(38, &[576_000, 640_000, 704_000, 768_000, 832_000, 896_000, 960_000, 992_000]);
         blocks.extend(parts(39, &[576_000, 608_000, 672_000, 736_000, 800_000, 864_000, 928_000, 992_000]));
         let completed = merge_t_lintels(&mut blocks, &t, &constraints, &p);
         assert_eq!(completed, BTreeSet::from([(38, "lower".into()), (38, "upper".into())]));
-        let bridges: Vec<_> = blocks.iter().filter(|block| block.is_bridge).collect();
+        let bridges: Vec<_> = blocks.iter().filter(|block| block.lintel_is_valid()).collect();
         assert_eq!(bridges.len(), 2);
-        assert!(bridges.iter().all(|block| block.course_index == 39));
-        assert_eq!(bridges[0].end, bridges[1].start);
-        assert_eq!(bridges[0].end.y, 736_000);
-        assert_eq!(covered(&blocks, "e"), 832_000);
+        assert_eq!(bridges.iter().map(|block| block.course_index).collect::<BTreeSet<_>>(),
+            BTreeSet::from([38, 39]));
+        assert_eq!(blocks.iter().filter(|part| part.course_index <= 39)
+            .map(|part| part.length_centimm).sum::<i64>(), 832_000);
     }
 
     #[test]
@@ -6000,6 +6106,45 @@ mod tests {
         assert!(parts[1].natural_end_right() && parts[1].hide_spikes_right());
         assert!(parts.iter().all(|p| p.catalog_nominal_centimm == Some(p.length_centimm) && p.cuts.is_empty()));
         assert_eq!(finalize_parts(&request, &profile(), &parts).unwrap(), parts);
+    }
+
+    #[test]
+    fn inclined_beam_collision_shortens_full_height_parts_in_every_direction() {
+        for degrees in [0_i32, 90, 180, 270] {
+            let angle = f64::from(degrees).to_radians();
+            let (ux, uy) = (angle.cos().round(), angle.sin().round());
+            let axis_length = 640.0_f64.hypot(200.0);
+            let hx = -200.0 / axis_length;
+            let hz = 640.0 / axis_length;
+            let request: crate::api::LayoutRequest = serde_json::from_value(serde_json::json!({
+                "schema_version":1,"request_id":"inclined-split","snapshot_hash":"a".repeat(64),"z0_mm":0,
+                "wall_volumes":[{"guid":"w","startXmm":0,"startYmm":0,"endXmm":640.0*ux,"endYmm":640.0*uy,
+                    "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":63,"endTopZmm":63,"thicknessMm":193,"purposeType":1}],
+                "beams":[{"guid":"b","startXmm":0,"startYmm":0,"startZmm":-100,
+                    "endXmm":640.0*ux,"endYmm":640.0*uy,"endZmm":100,
+                    "geometry":{"widthMm":100,"heightMm":50,"heightDirectionX":hx*ux,"heightDirectionY":hx*uy,"heightDirectionZ":hz}}]
+            })).unwrap();
+            let e = edge("e", "w", (0, 0), ((64_000.0*ux) as i64, (64_000.0*uy) as i64));
+            let input = block(&e, 0, 0, Span {start:0,end:64_000}, 64_000, "ordinary", false,
+                Vec::new(), vec!["wall:w".into()]);
+            let parts = finalize_parts(&request, &profile(), &[input]).unwrap();
+            assert_eq!(parts.len(), 2, "direction {degrees}");
+            // Plane z=0 first meets the beam's upper surface; plane z=63
+            // last meets its lower surface. Round outward to the 0.01 mm grid.
+            let first = ((320.0 + 50.0*(hx-hz*640.0/200.0))*100.0).floor() as i64;
+            let last = 52_160;
+            assert_eq!(parts[0].length_centimm, first);
+            assert_eq!(parts[1].length_centimm, 64_000-last);
+            assert_eq!(parts[0].end, Point {x:(first as f64*ux) as i64,y:(first as f64*uy) as i64});
+            assert_eq!(parts[1].start, Point {x:(last as f64*ux) as i64,y:(last as f64*uy) as i64});
+            assert!(!parts[0].natural_end_right() && parts[0].hide_spikes_right());
+            assert!(!parts[1].natural_end_left() && parts[1].hide_spikes_left());
+            assert!(parts.iter().all(|part| part.cuts.is_empty() && part.z_centimm==0));
+            assert_eq!(finalize_parts(&request, &profile(), &parts).unwrap(), parts);
+            let physical=crate::materialize::materialize(&request, &parts, &profile()).unwrap();
+            assert!(physical.physical.blocks.iter().flat_map(|b| &b.bodies).flat_map(|m| &m.vertices)
+                .all(|v| v[2].abs()<1e-7 || (v[2]-63.0).abs()<1e-7));
+        }
     }
 
     #[test]

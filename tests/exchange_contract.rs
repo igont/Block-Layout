@@ -137,7 +137,7 @@ fn units_quantum_scope_hash_and_source_identity_are_checked() {
             "UNSUPPORTED_GEOMETRY",
         ),
         (
-            mutated(|v| v["model"]["wall_volumes"][0]["volume"]["top_start_mm"] = json!(-252)),
+            mutated(|v| v["model"]["wall_volumes"][0]["volume"]["top_start_mm"] = json!(-252.01)),
             "INVALID_GEOMETRY",
         ),
         (
