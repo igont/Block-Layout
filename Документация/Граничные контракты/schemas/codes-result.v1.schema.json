@@ -34,6 +34,19 @@
       },
       "description": "Virtual calculation section; source beam remains nominal. start/end_z_mm are the SUP section axes, shifted down for -Z to preserve both physical bottom faces. No additive face offset or repeated reduction."
     },
+    "rectangularCut": {
+      "type": "object", "additionalProperties": false,
+      "required": ["side", "offset_mm", "bottom_mm", "width_mm", "height_mm", "depth_mm", "source_beam_id"],
+      "properties": {
+        "side": {"enum": ["left", "right"], "description": "Грань детали: left на +Y, right на −Y."},
+        "offset_mm": {"type": "number", "minimum": 0, "description": "Начало чашки вдоль +X от placement.origin_mm."},
+        "bottom_mm": {"type": "number", "minimum": 0, "description": "Начало чашки от низа детали вдоль +Z."},
+        "width_mm": {"type": "number", "exclusiveMinimum": 0},
+        "height_mm": {"type": "number", "exclusiveMinimum": 0},
+        "depth_mm": {"type": "number", "exclusiveMinimum": 0},
+        "source_beam_id": {"$ref": "#/$defs/id"}
+      }
+    },
     "doborGroup": {"type": "object", "additionalProperties": false, "required": ["source_id", "side"], "properties": {"source_id": {"$ref": "#/$defs/id"}, "side": {"enum": ["negative", "positive"]}}},
     "cutSource": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind", "id"], "properties": {"kind": {"enum": ["opening", "beam", "wall"]}, "id": {"$ref": "#/$defs/id"}}}, {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"enum": ["stock", "imported"]}}}]},
     "cutFace": {"type": "object", "additionalProperties": false, "required": ["plane_centimm", "sources"], "properties": {"plane_centimm": {"type": "integer", "description": "Опорная плоскость вдоль оси номинального тела заготовки, 0,01 мм; угловые выступы и сдвиг placement.origin_mm не входят в эту систему отсчёта. Потребитель не выполняет распил повторно."}, "sources": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/cutSource"}}}},
@@ -82,22 +95,12 @@
       "properties": {"center_mm": {"$ref": "#/$defs/vec3"}, "x_axis": {"$ref": "#/$defs/vec3"}, "y_axis": {"$ref": "#/$defs/vec3"}, "z_axis": {"$ref": "#/$defs/vec3"}},
       "description": "Правая ортонормированная система: X вдоль длины, Y вдоль толщины, Z вдоль высоты. center_mm находится внутри готового тела; для прямоугольной детали это центр габарита, для подрезанного тела - среднее его вершин."
     },
-    "lamellaSolid": {
-      "type": "object", "additionalProperties": false,
-      "required": ["vertices", "faces"],
-      "properties": {
-        "vertices": {"type": "array", "minItems": 4, "items": {"$ref": "#/$defs/vec3"}},
-        "faces": {"type": "array", "minItems": 4, "items": {"type": "array", "minItems": 3, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}}}
-      },
-      "description": "Точное замкнутое выпуклое тело в мировых миллиметрах. Грани имеют наружный обход, индексы относятся к vertices. При наличии заменяет прямоугольный габарит в физической геометрии."
-    },
     "lamella": {
       "type": "object", "additionalProperties": false,
       "required": ["id", "placement", "length_mm", "thickness_mm", "height_mm", "course_index", "side", "wall_ids", "beam_ids", "source_ids"],
       "properties": {
         "id": {"$ref": "#/$defs/id"},
         "placement": {"$ref": "#/$defs/centeredFrame"},
-        "solid": {"$ref": "#/$defs/lamellaSolid"},
         "length_mm": {"$ref": "#/$defs/positive"},
         "thickness_mm": {"const": 15},
         "height_mm": {"type": "number", "exclusiveMinimum": 0, "maximum": 63},
@@ -116,7 +119,6 @@
         "kind": {"const": "lamella_recess"},
         "lamella_id": {"$ref": "#/$defs/id"},
         "placement": {"$ref": "#/$defs/centeredFrame"},
-        "solid": {"$ref": "#/$defs/lamellaSolid"},
         "length_mm": {"$ref": "#/$defs/positive"},
         "thickness_mm": {"const": 15},
         "height_mm": {"type": "number", "exclusiveMinimum": 0, "maximum": 63}
@@ -171,6 +173,7 @@
         "hide_spikes_left": {"type": "boolean"},
         "hide_spikes_right": {"type": "boolean"},
         "node_cuts": {"type": "array", "items": {"$ref": "#/$defs/nodeCut"}},
+        "rectangular_cuts": {"type": "array", "items": {"$ref": "#/$defs/rectangularCut"}},
         "trims": {"type": "array", "items": {"$ref": "#/$defs/trim"}},
         "natural_end_left": {"type": "boolean", "default": true},
         "natural_end_right": {"type": "boolean", "default": true},

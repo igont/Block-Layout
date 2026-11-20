@@ -64,71 +64,14 @@ fn saved_geometry_roundoff_does_not_change_lamella_output() {
     b.grid_start_mm.as_mut().unwrap()[0] += 2e-12;
     for mesh in &mut b.solids {
         for p in &mut mesh.vertices {
-            for v in p { *v += 2e-12; }
+            for v in p {
+                *v += 2e-12;
+            }
         }
     }
     let source = serde_json::to_value(&r).unwrap();
     assert_eq!(lamella_saved::export(&r, &profile()).unwrap(), expected);
     assert_eq!(serde_json::to_value(&r).unwrap(), source);
-}
-
-#[test]
-fn beresta44_export_keeps_sloped_course_closed_after_rounding_collapsed_edges() {
-    let request: exchange::ExchangeRequest = serde_json::from_str(include_str!(
-        "fixtures/regression/beresta44-lamella-quantized-edge.json"
-    )).unwrap();
-    let before = serde_json::to_value(&request).unwrap();
-    let plan = lamella_saved::calculate(&request, &profile()).unwrap();
-    assert!(plan.lamellas.iter().filter_map(|l| l.solid.as_ref()).any(|mesh| {
-        let rounded: Vec<_> = mesh.vertices.iter().map(|p| p.map(fb_layout::precision::mm)).collect();
-        rounded.iter().enumerate().any(|(i, p)| rounded[..i].contains(p))
-    }), "Реальный срез должен схлопывать короткое ребро при округлении");
-    let result = lamella_saved::export(&request, &profile()).unwrap();
-    assert_eq!(serde_json::to_value(&request).unwrap(), before);
-    assert_eq!(result["blocks"], json!([]));
-    assert_eq!(result["lamellas"].as_array().unwrap().len(), 16);
-    let mut exact = 0;
-    for lamella in result["lamellas"].as_array().unwrap() {
-        let Some(solid) = lamella.get("solid") else { continue; };
-        let mesh: Mesh = serde_json::from_value(solid.clone()).unwrap();
-        assert_eq!(lamella["course_index"], 68);
-        assert_eq!(lamella["length_mm"], 615.72);
-        assert_eq!(lamella["height_mm"], 63.0);
-        assert_eq!(mesh.vertices.len(), 8);
-        assert_eq!(mesh.faces.len(), 6);
-        let mut edges = std::collections::BTreeMap::new();
-        for (i, vertex) in mesh.vertices.iter().enumerate() {
-            assert!(!mesh.vertices[..i].contains(vertex));
-        }
-        for face in &mesh.faces {
-            assert!(face.len() >= 3);
-            for i in 0..face.len() {
-                let a = face[i];
-                let b = face[(i + 1) % face.len()];
-                assert_ne!(a, b);
-                assert!(edges.insert((a, b), ()).is_none());
-            }
-        }
-        for &(a, b) in edges.keys() { assert!(edges.contains_key(&(b, a))); }
-        assert!(solid_geometry::volume(&mesh) > 0.0);
-        exact += 1;
-    }
-    assert_eq!(exact, 2);
-}
-
-#[test]
-fn sloping_saved_face_remains_usable_after_coordinate_quantization() {
-    let mut r = request();
-    r.model.beams.clear();
-    let mut block = saved(640.0);
-    for p in &mut block.solids[0].vertices {
-        if p[2] > 0.0 { p[2] += 0.0173 * p[0] + 0.02353 * p[1]; }
-    }
-    r.model.saved_blocks = Some(vec![block]);
-    assert_eq!(lamella_saved::export(&r, &profile()).unwrap()["status"], "success");
-    let mesh = &mut r.model.saved_blocks.as_mut().unwrap()[0].solids[0];
-    mesh.vertices.iter_mut().find(|p| p[2] > 0.0).unwrap()[2] += 1.0;
-    assert_eq!(lamella_saved::export(&r, &profile()).unwrap_err().code, "INVALID_SAVED_BLOCK");
 }
 
 #[test]
@@ -156,22 +99,6 @@ fn short_full_width_remnant_keeps_base_cell_and_authorizes_only_its_recess() {
 }
 
 #[test]
-fn whole_630_and_640_facade_blocks_suppress_the_entire_cell_without_spike_nibbles() {
-    for nominal in [630.0, 640.0] {
-        let mut r = request();
-        r.model.beams[0].start_mm[0] = 0.0;
-        r.model.beams[0].end_mm[0] = 5.0;
-        let mut b = saved(0.0);
-        b.length_mm = nominal;
-        b.grid_end_mm = Some([nominal, 0.0, 0.0]);
-        b.solids = vec![body(5.0, 635.0, 0.0, 193.0)];
-        r.model.saved_blocks = Some(vec![b]);
-        let result = lamella_saved::export(&r, &profile()).unwrap();
-        assert_eq!(result["lamellas"], json!([]), "nominal {nominal}");
-    }
-}
-
-#[test]
 fn third_pass_does_not_cut_neighbor_sides_for_five_mm_end_spikes() {
     let mut r = request();
     r.model.beams[0].start_mm[0] = 650.0;
@@ -190,10 +117,7 @@ fn third_pass_does_not_cut_neighbor_sides_for_five_mm_end_spikes() {
     let result = lamella_saved::export(&r, &profile()).unwrap();
     for l in result["lamellas"].as_array().unwrap() {
         assert_eq!(xbounds(l), (640.0, 1280.0));
-        assert_eq!(
-            l["recess_block_ids"],
-            json!(["manual-guid"])
-        );
+        assert_eq!(l["recess_block_ids"], json!(["manual-guid"]));
     }
     assert_eq!(result["lamellas"].as_array().unwrap().len(), 2);
 }
@@ -207,7 +131,11 @@ fn third_pass_uses_grid_and_course_without_reading_finished_geometry() {
     block.solids = vec![body(640.0, 960.0, 0.0, 193.0)];
     r.model.saved_blocks = Some(vec![block]);
     let mut plan = lamella_saved::calculate(&r, &profile()).unwrap();
-    let expected: Vec<_> = plan.lamellas.iter().map(|l| l.recess_block_ids.clone()).collect();
+    let expected: Vec<_> = plan
+        .lamellas
+        .iter()
+        .map(|l| l.recess_block_ids.clone())
+        .collect();
     assert!(expected.iter().any(|ids| ids.contains("manual-guid")));
     let blocks = r.model.saved_blocks.as_mut().unwrap();
     blocks[0].solids.clear();
@@ -218,12 +146,19 @@ fn third_pass_uses_grid_and_course_without_reading_finished_geometry() {
     for l in &mut plan.lamellas {
         l.placement.center_mm = [9000.0; 3];
         l.length_mm = 1.0;
-        l.solid = Some(Mesh { vertices: vec![[0.0; 3]], faces: vec![] });
+
         l.recess_block_ids.insert("stale-reference".into());
     }
     lamella_saved::assign_grid_recesses(&mut plan.lamellas, blocks);
-    let actual: Vec<_> = plan.lamellas.iter().map(|l| l.recess_block_ids.clone()).collect();
-    assert_eq!(actual, expected, "Физическое тело не определяет срез стороны по сетке");
+    let actual: Vec<_> = plan
+        .lamellas
+        .iter()
+        .map(|l| l.recess_block_ids.clone())
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "Физическое тело не определяет срез стороны по сетке"
+    );
 }
 
 #[test]
@@ -296,7 +231,7 @@ fn beam_cut_ends_do_not_break_bonded_modules_over_half_blocks() {
         assert_eq!(
             spans,
             if course == 0 {
-                vec![(0.0, 640.0), (640.0, 1280.0)]
+                vec![(-96.5, 640.0), (640.0, 1280.0)]
             } else {
                 vec![(320.0, 960.0)]
             }
@@ -326,7 +261,7 @@ fn course_without_whole_blocks_uses_bond_from_saved_course_above() {
         .map(xbounds)
         .collect();
     spans.sort_by(|a, b| a.0.total_cmp(&b.0));
-    assert_eq!(spans, vec![(0.0, 640.0), (640.0, 1280.0)]);
+    assert_eq!(spans, vec![(-96.5, 640.0), (640.0, 1280.0)]);
 }
 
 #[test]
@@ -349,75 +284,6 @@ fn manual_saved_grid_is_authoritative_and_source_blocks_are_unchanged() {
 }
 
 #[test]
-fn saved_material_is_subtracted_without_emitting_any_block_edits() {
-    let mut r = request();
-    let mut block = saved(420.0);
-    // Real preexisting material occupies the facade only in this 200mm window;
-    // the rest of the saved block keeps its already recessed facade geometry.
-    block.solids.push(body(600.0, 800.0, 0.0, 193.0));
-    r.model.saved_blocks = Some(vec![block]);
-    let before = serde_json::to_value(&r.model.saved_blocks).unwrap();
-    let result = lamella_saved::export(&r, &profile()).unwrap();
-    assert_eq!(result["blocks"], json!([]));
-    assert_eq!(serde_json::to_value(&r.model.saved_blocks).unwrap(), before);
-    let parts = result["lamellas"].as_array().unwrap();
-    assert_eq!(parts.len(), 4);
-    for side in ["left", "right"] {
-        let mut xs: Vec<_> = parts
-            .iter()
-            .filter(|l| l["side"] == side)
-            .map(xbounds)
-            .collect();
-        xs.sort_by(|a, b| a.0.total_cmp(&b.0));
-        assert_eq!(xs, vec![(420.0, 600.0), (800.0, 1060.0)]);
-    }
-    assert!(result["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|w| w["code"] == "LAMELLA_SAVED_MATERIAL_CLIPPED"));
-}
-
-#[test]
-fn partial_thickness_obstacle_does_not_remove_free_ends_when_faces_start_across_skin() {
-    let mut r = request();
-    let mut b = saved(420.0);
-    let mut obstacle = body(600.0, 800.0, 0.0, 183.0);
-    obstacle.faces.rotate_left(2);
-    b.solids.push(obstacle);
-    r.model.saved_blocks = Some(vec![b]);
-    let result = lamella_saved::export(&r, &profile()).unwrap();
-    for side in ["left", "right"] {
-        let mut spans: Vec<_> = result["lamellas"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|l| l["side"] == side)
-            .map(xbounds)
-            .collect();
-        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
-        assert_eq!(spans, vec![(420.0, 600.0), (800.0, 1060.0)]);
-    }
-}
-
-#[test]
-fn partial_skin_thickness_is_not_mislabelled_as_a_15mm_lamella() {
-    let mut r = request();
-    let mut b = saved(420.0);
-    b.solids.push(body(420.0, 1060.0, 84.0, 5.0));
-    r.model.saved_blocks = Some(vec![b]);
-    let result = lamella_saved::export(&r, &profile()).unwrap();
-    let parts = result["lamellas"].as_array().unwrap();
-    assert_eq!(parts.len(), 1);
-    assert_eq!(parts[0]["side"], "right");
-    assert!(result["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|w| w["code"] == "LAMELLA_SAVED_MATERIAL_THIN_FRAGMENT"));
-}
-
-#[test]
 fn saved_joint_endpoints_override_l_stock_extent() {
     let mut r = request();
     let mut b = saved(420.0);
@@ -433,7 +299,7 @@ fn saved_joint_endpoints_override_l_stock_extent() {
 }
 
 #[test]
-fn no_saved_grid_warns_and_missing_array_or_nonconvex_material_fails_explicitly() {
+fn no_saved_grid_warns_and_missing_array_or_invalid_placement_fails_explicitly() {
     let mut r = request();
     let result = lamella_saved::export(&r, &profile()).unwrap();
     assert_eq!(result["blocks"], json!([]));
@@ -445,7 +311,7 @@ fn no_saved_grid_warns_and_missing_array_or_nonconvex_material_fails_explicitly(
     r.model.saved_blocks = None;
     assert_eq!(r.to_layout_request().unwrap_err().code, "INVALID_EXCHANGE");
     let mut b = saved(420.0);
-    b.solids[0].faces.pop();
+    b.width_mm = -1.0;
     r.model.saved_blocks = Some(vec![b]);
     assert_eq!(
         lamella_saved::export(&r, &profile()).unwrap_err().code,
@@ -484,4 +350,72 @@ fn cli_lamella_route_never_runs_solver_or_publishes_candidate_blocks() {
     std::fs::remove_file(&input).unwrap();
     std::fs::remove_file(&result).unwrap();
     std::fs::remove_dir(&folder).unwrap();
+}
+
+#[test]
+fn saved_material_never_cuts_cells_and_block_recesses_remain_authorized() {
+    for material in [
+        vec![],
+        vec![body(420.0, 1060.0, 0.0, 193.0)],
+        vec![body(600.0, 800.0, 0.0, 193.0)],
+        vec![body(420.0, 1060.0, 84.0, 5.0)],
+    ] {
+        let mut r = request();
+        let mut b = saved(420.0);
+        b.solids = material;
+        r.model.saved_blocks = Some(vec![b]);
+        let before = serde_json::to_value(&r).unwrap();
+        let result = lamella_saved::export(&r, &profile()).unwrap();
+        let ls = result["lamellas"].as_array().unwrap();
+        assert_eq!(ls.len(), 2);
+        for l in ls {
+            assert_eq!(xbounds(l), (420.0, 1060.0));
+            assert_eq!(l["height_mm"], 63.0);
+            assert_eq!(l["thickness_mm"], 15.0);
+            assert!(l.get("solid").is_none());
+            assert_eq!(l["recess_block_ids"], json!(["manual-guid"]));
+        }
+        assert_eq!(result["blocks"], json!([]));
+        assert!(result.get("warnings").is_none());
+        assert_eq!(serde_json::to_value(&r).unwrap(), before);
+    }
+}
+
+#[test]
+fn real_sloped_project_with_only_transverse_beams_has_no_lamellas() {
+    let r: exchange::ExchangeRequest = serde_json::from_str(include_str!(
+        "fixtures/regression/beresta44-lamella-quantized-edge.json"
+    ))
+    .unwrap();
+    // This wall runs along Y; both beams run along X.
+    let result = lamella_saved::export(&r, &profile()).unwrap();
+    assert_eq!(result["lamellas"], json!([]));
+}
+
+#[test]
+fn beam_allowance_above_lintel_does_not_authorize_its_side_cut() {
+    let mut r = request();
+    r.model.wall_volumes[0].volume.top_start_mm = 126.0;
+    r.model.wall_volumes[0].volume.top_end_mm = 126.0;
+    r.model.beams[0].start_mm[2] = 58.0;
+    r.model.beams[0].end_mm[2] = 58.0;
+    r.model.beams[0].height_mm = 63.0;
+    let mut lintel = saved(420.0);
+    lintel.id = "lintel".into();
+    let mut upper = saved(100.0);
+    upper.id = "upper".into();
+    upper.course_index = 1;
+    upper.placement.origin_mm[2] = 63.0;
+    upper.grid_start_mm.as_mut().unwrap()[2] = 63.0;
+    upper.grid_end_mm.as_mut().unwrap()[2] = 63.0;
+    r.model.saved_blocks = Some(vec![lintel, upper]);
+    let result = lamella_saved::export(&r, &profile()).unwrap();
+    let ls = result["lamellas"].as_array().unwrap();
+    assert!(!ls.is_empty());
+    for l in ls {
+        assert_eq!(l["course_index"], 1);
+        assert!(!l["recess_block_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.contains(&json!("lintel"))));
+    }
 }

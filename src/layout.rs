@@ -181,6 +181,8 @@ pub struct Block {
     #[serde(flatten)]
     pub ends: EndStates,
     pub cuts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rectangular_cuts: Vec<crate::rectangular_cut::RectangularCut>,
     pub source_ids: Vec<String>,
     pub catalog_nominal_centimm: Option<i64>,
     #[serde(default)]
@@ -217,7 +219,7 @@ pub struct BlockArm {
     pub length_centimm: i64,
 }
 
-/// Окончательные детали: препятствие разделяет всю толщину и высоту изделия.
+/// Окончательные детали с торцевыми пропилами и несквозными чашками.
 /// Вызывается и на границе экспорта для кандидатов, созданных до изменения входа.
 pub fn finalize_parts(
     request: &crate::api::LayoutRequest,
@@ -243,8 +245,10 @@ pub fn finalize_parts(
     let mut work = 0;
     let nominal = finalize_parts_inner(request, profile, blocks, 0, &mut work, &[], &walls)?;
     let reveals = finished_opening_reveals(request, profile, &nominal, &mut work)?;
-    if reveals.is_empty() { return Ok(nominal); }
-    finalize_parts_inner(request, profile, &nominal, 0, &mut work, &reveals, &walls)
+    let finished=if reveals.is_empty() {nominal} else {
+        finalize_parts_inner(request, profile, &nominal, 0, &mut work, &reveals, &walls)?
+    };
+    Ok(finished)
 }
 
 /// Натуральные скрытые торцы задают общую готовую плоскость обсады.
@@ -343,6 +347,8 @@ fn finalize_parts_inner(
         let bottom = original.z_centimm as f64 / 100.0;
         let top = bottom + profile.index_centimm as f64 / 100.0;
         let mut exclusions = Vec::<(i64, i64, String)>::new();
+        let mut pockets = Vec::new();
+        let [leading, trailing] = crate::node_shapes::corner_extensions(original);
         for beam in &request.beams {
             let (dx, dy) = (beam.end_xmm - beam.start_xmm, beam.end_ymm - beam.start_ymm);
             let column = dx.hypot(dy) <= 1e-7 && (beam.end_zmm - beam.start_zmm).abs() > 1e-7;
@@ -386,6 +392,29 @@ fn finalize_parts_inner(
             let axial = (b - a) / beam_length;
             let across = (bv - av) / beam_length;
             let half = beam.geometry.width_mm / 2.0;
+            let pocket = if column { None } else {
+                crate::rectangular_cut::BlindBeamEnd::project((a, av), (b, bv), width / 2.0)
+            };
+            if let Some(end) = pocket {
+                let centimm = |v| crate::precision::centimm(v) as i64;
+                let start_x = centimm(a - half).max(-leading);
+                let end_x = centimm(a + half).min(original.length_centimm + trailing);
+                let bottom_z = centimm(beam.start_zmm.min(other_z) - bottom).max(0);
+                let top_z = centimm(beam.start_zmm.max(other_z) - bottom).min(profile.index_centimm);
+                let depth = centimm(end.depth);
+                if start_x < end_x && bottom_z < top_z && depth > 0 {
+                    pockets.push(crate::rectangular_cut::RectangularCut {
+                        side: end.side,
+                        offset_centimm: start_x,
+                        width_centimm: end_x - start_x,
+                        bottom_centimm: bottom_z,
+                        height_centimm: top_z - bottom_z,
+                        depth_centimm: depth,
+                        source_beam_id: beam.guid.clone(),
+                    });
+                }
+                continue;
+            }
             let corners = [(a - across * half, av + axial * half),
                 (a + across * half, av - axial * half),
                 (b - across * half, bv + axial * half),
@@ -618,6 +647,37 @@ fn finalize_parts_inner(
             if part.kind == "ordinary" && part.arms.is_empty() && original.components.is_empty()
                 && part.length_centimm <= removed_ends * 500 {
                 continue;
+            }
+            let [leading, trailing] = if split {
+                crate::node_shapes::corner_extensions(&part)
+            } else { [leading, trailing] };
+            let finished_start = span.start - leading;
+            let finished_end = span.end + trailing;
+            part.rectangular_cuts = pockets.iter().filter_map(|cut| {
+                let start = cut.offset_centimm.max(finished_start);
+                let end = (cut.offset_centimm + cut.width_centimm).min(finished_end);
+                (end > start).then(|| crate::rectangular_cut::RectangularCut {
+                    offset_centimm: start - finished_start,
+                    width_centimm: end - start,
+                    ..cut.clone()
+                })
+            }).collect();
+            if (leading > 0 || trailing > 0) && !part.rectangular_cuts.is_empty() {
+                // Угловой выступ имеет каталожный профиль. Его габарит сам
+                // по себе не доказывает наличие древесины под чашкой.
+                let stock = crate::block_geometry::stock(&part, width)?;
+                let mut cuts = std::mem::take(&mut part.rectangular_cuts);
+                cuts.retain(|cut| {
+                    let planes = crate::block_geometry::pocket_planes(&part, width, cut);
+                    stock.iter().any(|piece| crate::block_geometry::intersects_pocket(piece, &planes))
+                });
+                part.rectangular_cuts = cuts;
+            }
+            part.rectangular_cuts.sort();
+            part.rectangular_cuts.dedup();
+            for cut in &part.rectangular_cuts {
+                let source = format!("beam:{}", cut.source_beam_id);
+                if !part.source_ids.contains(&source) { part.source_ids.push(source); }
             }
             if !original.components.is_empty() {
                 let components = finalize_parts_inner(request, profile, &original.components, depth + 1, work, reveals, walls)?;
@@ -1101,6 +1161,7 @@ fn choice_products(
                 arms,
                 catalog_nominal_centimm: Some(part.nominal_length_centimm),
                 components: Vec::new(),
+                rectangular_cuts: Vec::new(),
             })
         })
         .collect()
@@ -2499,6 +2560,7 @@ fn block(
         arms: Vec::new(),
         catalog_nominal_centimm: None,
         components: Vec::new(),
+        rectangular_cuts: Vec::new(),
     }
 }
 
@@ -3602,6 +3664,7 @@ pub fn calculate_candidate(
                             arms: part_arms,
                             catalog_nominal_centimm: Some(part.nominal_length_centimm),
                             components: Vec::new(),
+                            rectangular_cuts: Vec::new(),
                                             });
                     }
                 } else {
@@ -3632,6 +3695,7 @@ pub fn calculate_candidate(
                         arms: node_arms,
                         catalog_nominal_centimm: None,
                         components: Vec::new(),
+                        rectangular_cuts: Vec::new(),
                                     });
                 }
             }
@@ -6089,7 +6153,7 @@ mod tests {
             "wall_volumes":[{"guid":"w","startXmm":0,"startYmm":0,"endXmm":640,"endYmm":0,
                 "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":63,"endTopZmm":63,"thicknessMm":193,"purposeType":1}],
             "beams":[{"guid":"b","startXmm":320,"startYmm":-500,"startZmm":20,
-                "endXmm":320,"endYmm":76.5,"endZmm":20,
+                "endXmm":320,"endYmm":96.5,"endZmm":20,
                 "geometry":{"widthMm":160,"heightMm":20,"heightDirectionX":0,"heightDirectionY":0,"heightDirectionZ":1}}]
         })).unwrap();
         let e = edge("e", "w", (0, 0), (64_000, 0));

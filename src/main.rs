@@ -63,6 +63,11 @@ fn run() -> Result<bool, String> {
     }
     let profile: Profile = read_json(&profile_path)?;
     let input: serde_json::Value = read_json(&request_path)?;
+    if input["format"] == "fb-product-codes/1" {
+        let result = fb_layout::code_result::selected_codes(&input)?;
+        publish(&result_path, &result)?;
+        return Ok(true);
+    }
     let (request, standard) = if input.get("format").is_some() {
         let standard: ExchangeRequest = serde_json::from_value(input).map_err(|e| e.to_string())?;
         let converted = standard
@@ -94,7 +99,7 @@ fn run() -> Result<bool, String> {
     if let Some(path) = optional_argument("--candidate") {
         publish(&path, &candidate)?;
     }
-    if candidate.blocks.is_empty() {
+    if candidate.blocks.is_empty() && !candidate.diagnostics.iter().any(|d|d.code=="ROOF_BLOCKS_EXCLUDED") {
         publish(
             &result_path,
             &exchange::failure_result(&standard, &candidate.diagnostics),

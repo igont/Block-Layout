@@ -51,7 +51,7 @@ fn ordinary_cut_exports_finished_stock_without_hidden_geometry() {
 fn transverse_beam_removes_full_wall_thickness_without_its_own_lintel() {
     let r = request(
         640.0,
-        json!([{"guid":"beam","startXmm":320,"startYmm":-500,"startZmm":0,"endXmm":320,"endYmm":76.5,"endZmm":0,
+        json!([{"guid":"beam","startXmm":320,"startYmm":-500,"startZmm":0,"endXmm":320,"endYmm":96.5,"endZmm":0,
         "geometry":{"widthMm":160,"heightMm":320,"heightDirectionX":0,"heightDirectionY":0,"heightDirectionZ":1}}]),
     );
     let rendered = materialize(&r, &[block(640)], &profile()).unwrap();
@@ -70,7 +70,7 @@ fn transverse_beam_removes_full_wall_thickness_without_its_own_lintel() {
         .iter()
         .flat_map(|b| &b.bodies)
         .flat_map(|m| &m.vertices)
-        .any(|p| (p[1] - 76.5).abs() < 1e-6));
+        .any(|p| p[0] > 240.0 && p[0] < 400.0));
     assert_eq!(rendered.physical.blocks.len(), 2);
     assert_eq!(rendered.exchange_blocks[0]["natural_end_right"], false);
     assert_eq!(rendered.exchange_blocks[1]["natural_end_left"], false);

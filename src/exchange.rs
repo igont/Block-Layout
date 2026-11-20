@@ -46,6 +46,8 @@ pub struct Model {
     pub wall_volumes: Vec<WallVolume>,
     pub openings: Vec<Opening>,
     pub beams: Vec<ExchangeBeam>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roof_volumes: Vec<crate::roof::Roof>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_blocks: Option<Vec<crate::lamella::SavedBlock>>,
 }
@@ -380,6 +382,7 @@ impl ExchangeRequest {
             opening_volumes: openings,
             beams,
             metadata: Value::Null,
+            roof_volumes: self.model.roof_volumes.clone(),
         };
         request.validate()?;
         Ok(request)
@@ -502,6 +505,7 @@ pub fn from_layout_request(
                 })
                 .collect(),
             saved_blocks: None,
+            roof_volumes: request.roof_volumes.clone(),
         },
     };
     converted.to_layout_request()?;

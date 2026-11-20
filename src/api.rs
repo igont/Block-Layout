@@ -21,6 +21,8 @@ pub struct LayoutRequest {
     #[serde(default)]
     pub beams: Vec<Beam>,
     #[serde(default)]
+    pub roof_volumes: Vec<crate::roof::Roof>,
+    #[serde(default)]
     pub metadata: serde_json::Value,
 }
 

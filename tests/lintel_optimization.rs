@@ -18,7 +18,7 @@ fn model() -> LayoutRequest {
     };
     let beam = |id: &str, x: f64| {
         json!({
-        "guid":id,"startXmm":x,"startYmm":-1520,"endXmm":x,"endYmm":-243.5,
+        "guid":id,"startXmm":x,"startYmm":-1520,"endXmm":x,"endYmm":-223.5,
         "startZmm":2457,"endZmm":2457,
         "geometry":{"widthMm":160,"heightMm":315,
             "heightDirectionX":0,"heightDirectionY":0,"heightDirectionZ":1}})

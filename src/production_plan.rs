@@ -66,6 +66,7 @@ pub struct ProductionPart {
     pub hide_spikes_right: bool,
     pub source_ids: Vec<String>,
     pub cuts: Vec<ProductionCut>,
+    pub rectangular_cuts: Vec<crate::rectangular_cut::RectangularCut>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -493,6 +494,7 @@ fn validate_part(
         hide_spikes_right: false,
         source_ids: block.source_ids.clone(),
         cuts,
+        rectangular_cuts: block.rectangular_cuts.clone(),
     })
 }
 
@@ -652,6 +654,7 @@ mod tests {
             source_ids: vec!["wall:wall-1".into()],
             catalog_nominal_centimm: Some(64_000),
             components: Vec::new(),
+            rectangular_cuts: Vec::new(),
             arms: vec![crate::layout::BlockArm {
                 wall_id: "wall-1".into(),
                 edge_id: "run-1".into(),

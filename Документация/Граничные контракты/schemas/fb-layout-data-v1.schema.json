@@ -55,13 +55,13 @@
     },
     "savedBlock": {
       "type": "object", "additionalProperties": false,
-      "required": ["id", "placement", "length_mm", "width_mm", "height_mm", "course_index", "wall_ids", "solids"],
+      "required": ["id", "placement", "length_mm", "width_mm", "height_mm", "course_index", "wall_ids"],
       "properties": {
         "id": {"$ref": "#/$defs/id"}, "placement": {"$ref": "#/$defs/savedBlockFrame"},
         "length_mm": {"type": "number", "exclusiveMinimum": 0}, "width_mm": {"type": "number", "exclusiveMinimum": 0}, "height_mm": {"type": "number", "exclusiveMinimum": 0},
         "course_index": {"type": "integer"}, "wall_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
         "grid_start_mm": {"$ref": "#/$defs/vec3"}, "grid_end_mm": {"$ref": "#/$defs/vec3"},
-        "solids": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/savedBlockSolid"}}
+        "solids": {"type": "array", "items": {"$ref": "#/$defs/savedBlockSolid"}}
       },
       "dependentRequired": {"grid_start_mm": ["grid_end_mm"], "grid_end_mm": ["grid_start_mm"]}
     },
@@ -77,6 +77,19 @@
         "height_direction": {"type": "array", "minItems": 3, "maxItems": 3, "prefixItems": [{"type": "number", "minimum": -0.0000001, "maximum": 0.0000001}, {"type": "number", "minimum": -0.0000001, "maximum": 0.0000001}, {"oneOf": [{"type": "number", "minimum": 0.9999999, "maximum": 1.0000001}, {"type": "number", "minimum": -1.0000001, "maximum": -0.9999999}]}]}
       },
       "description": "Virtual calculation section; source beam remains nominal. start/end_z_mm are the SUP section axes, shifted down for -Z to preserve both physical bottom faces. No additive face offset or repeated reduction."
+    },
+    "rectangularCut": {
+      "type": "object", "additionalProperties": false,
+      "required": ["side", "offset_mm", "bottom_mm", "width_mm", "height_mm", "depth_mm", "source_beam_id"],
+      "properties": {
+        "side": {"enum": ["left", "right"], "description": "Грань детали: left на +Y, right на −Y."},
+        "offset_mm": {"type": "number", "minimum": 0, "description": "Начало чашки вдоль +X от placement.origin_mm."},
+        "bottom_mm": {"type": "number", "minimum": 0, "description": "Начало чашки от низа детали вдоль +Z."},
+        "width_mm": {"type": "number", "exclusiveMinimum": 0},
+        "height_mm": {"type": "number", "exclusiveMinimum": 0},
+        "depth_mm": {"type": "number", "exclusiveMinimum": 0},
+        "source_beam_id": {"$ref": "#/$defs/id"}
+      }
     },
     "doborGroup": {"type": "object", "additionalProperties": false, "required": ["source_id", "side"], "properties": {"source_id": {"$ref": "#/$defs/id"}, "side": {"enum": ["negative", "positive"]}}},
     "cutSource": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["kind", "id"], "properties": {"kind": {"enum": ["opening", "beam", "wall"]}, "id": {"$ref": "#/$defs/id"}}}, {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"enum": ["stock", "imported"]}}}]},
@@ -172,12 +185,25 @@
         "height_direction": {"$ref": "#/$defs/vec3"}
       }
     },
+    "roofVolume": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "top_vertices_mm", "top_triangles"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "top_vertices_mm": {"type": "array", "minItems": 3, "items": {"$ref": "#/$defs/vec3"}},
+        "top_triangles": {"type": "array", "minItems": 1, "items": {
+          "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 0}
+        }}
+      }
+    },
     "model": {
       "type": "object", "additionalProperties": false, "required": ["wall_volumes", "openings", "beams"],
       "properties": {
         "wall_volumes": {"type": "array", "items": {"$ref": "#/$defs/wallVolume"}},
         "openings": {"type": "array", "items": {"$ref": "#/$defs/opening"}},
         "beams": {"type": "array", "items": {"$ref": "#/$defs/beam"}},
+        "roof_volumes": {"type": "array", "items": {"$ref": "#/$defs/roofVolume"}},
         "saved_blocks": {"type": "array", "items": {"$ref": "#/$defs/savedBlock"}}
       }
     },
@@ -267,6 +293,7 @@
         "placement": {"$ref": "#/$defs/frame"},
         "stock_shape": {"$ref": "#/$defs/shape"},
         "cuts": {"type": "array", "items": {"$ref": "#/$defs/cut"}},
+        "rectangular_cuts": {"type": "array", "items": {"$ref": "#/$defs/rectangularCut"}},
         "special_origin": {"$ref": "#/$defs/specialOrigin"},
         "is_dobor": {"type": "boolean", "default": false},
         "dobor_group": {"$ref": "#/$defs/doborGroup"},

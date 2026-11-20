@@ -5,6 +5,28 @@ use crate::solid_geometry::{box_mesh, subtract, Mesh, Plane};
 
 type P = [f64; 2];
 const AXES: [[f64; 3]; 3] = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]];
+pub(crate) const CORNER_EXTENSION_CENTIMM: i64 = 9650;
+
+/// Угловые выступы входят в физический габарит детали по X.
+pub(crate) fn corner_extensions(block: &Block) -> [i64; 2] {
+    let mut extensions = [0, 0];
+    for cut in &block.cuts {
+        let mut fields = cut.split(':');
+        if !matches!(fields.next(), Some("Type1" | "Type2" | "Type3" | "Type4")) {
+            continue;
+        }
+        let Some(location) = fields.next() else { continue; };
+        let position = location.strip_prefix('p').and_then(|p| p.parse::<i64>().ok())
+            .or_else(|| location.strip_prefix('x').and_then(|x| x.parse::<i64>().ok())
+                .and_then(|x| x.checked_sub(1)?.checked_mul(32_000)));
+        match position {
+            Some(0) => extensions[0] = CORNER_EXTENSION_CENTIMM,
+            Some(p) if p == block.length_centimm => extensions[1] = CORNER_EXTENSION_CENTIMM,
+            _ => {}
+        }
+    }
+    extensions
+}
 
 /// Предупреждение о доказанном пересечении исходных профилей T1.
 /// Постоянный текст позволяет агрегировать предупреждения по использованным узлам.
@@ -47,22 +69,22 @@ pub(crate) fn relocate_node_cuts(
             location.strip_prefix('p').and_then(|p| p.parse::<i64>().ok())
         }.filter(|p| *p >= 0 && *p <= block.length_centimm)
             .ok_or_else(|| issue("Некорректная координата врезки"))?;
-        if position >= from_centimm && position <= to_centimm {
-            relocated.push(format!("{kind}:p{}:{side}:{sources}", position - from_centimm));
-        } else {
-            // Торцевые профили также могут оставить материал обработки внутри
-            // фрагмента, даже когда сама координата узла уже удалена.
-            let reach = if matches!(kind, "Type6" | "Type7_1") { 9_650 } else { 9_705 };
-            if position.saturating_add(reach) <= from_centimm || position.saturating_sub(reach) >= to_centimm {
-                continue;
-            }
-            return Err(crate::api::ApiFailure::new("NODE_CUT_CROSSES_SPLIT",
-                "Разрез оставляет часть производственной врезки за границей её координаты",
-                Some(block.id.clone())));
+        match relocated_position(kind, position, from_centimm, to_centimm) {
+            Ok(Some(p)) => relocated.push(format!("{kind}:p{p}:{side}:{sources}")),
+            Ok(None) => (),
+            Err(message) => return Err(crate::api::ApiFailure::new("NODE_CUT_CROSSES_SPLIT", message, Some(block.id.clone()))),
         }
     }
     block.cuts = relocated;
     Ok(())
+}
+
+/// A partial profile still intersects the part even if its center was removed.
+pub(crate) fn relocated_position(kind: &str, position: i64, from: i64, to: i64) -> Result<Option<i64>, &'static str> {
+    if (from..=to).contains(&position) { return Ok(Some(position - from)); }
+    let reach = if matches!(kind, "Type6" | "Type7_1") { 9_650 } else { 9_705 };
+    if position.saturating_add(reach) <= from || position.saturating_sub(reach) >= to { return Ok(None); }
+    Err("Разрез оставляет часть производственной врезки за границей её координаты")
 }
 
 #[derive(Clone, Copy)]
@@ -388,17 +410,7 @@ pub fn node_stock(block: &Block, width_mm: f64, height_mm: f64) -> Result<Vec<Me
     }
     let last = ((length / 320.).round() as usize + 1).max(2);
     let cuts = cuts(block, last)?;
-    let is_l = |c: &Cut<'_>| matches!(c.name, "Type1" | "Type2" | "Type3" | "Type4");
-    let begin = if cuts.iter().any(|c| c.slot == 1 && is_l(c)) {
-        96.5
-    } else {
-        0.
-    };
-    let end = if cuts.iter().any(|c| c.slot == last && is_l(c)) {
-        96.5
-    } else {
-        0.
-    };
+    let [begin, end] = corner_extensions(block).map(|value| value as f64 / 100.0);
     // XML CreateBlock:620: simplified lengthConstr-10 для L, иначе nominal.
     let mut meshes = vec![box_mesh(
         [-begin, -96.5, 0.],

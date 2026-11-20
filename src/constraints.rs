@@ -707,6 +707,9 @@ impl ConstraintEvidence {
                     if let Some(envelope) = assembly_envelope {
                         return envelope.classify(solid);
                     }
+                    if perpendicular_cut.is_some() {
+                        return Relation::None;
+                    }
                 }
                 if let Some(cut) = perpendicular_cut {
                     return cut.classify(solid);
@@ -1348,7 +1351,17 @@ pub fn build_constraints_with_policy(
                     0.0
                 };
                 let mut parts = Vec::new();
+                let mut has_cup = false;
                 for (source_frame, from, to) in &source_frames {
+                    let pocket = if orientation == BeamOrientation::Transverse {
+                        let a = source_frame.project(beam.start, 0.0);
+                        let b = source_frame.project(beam.end, 1.0);
+                        crate::rectangular_cut::BlindBeamEnd::project(
+                            (a.u / SCALE, a.v / SCALE),
+                            (b.u / SCALE, b.v / SCALE),
+                            source_frame.half_thickness / SCALE,
+                        ).is_some()
+                    } else { false };
                     let clipped = clipped_beam(
                         source_frame,
                         beam,
@@ -1377,6 +1390,33 @@ pub fn build_constraints_with_policy(
                         continue;
                     }
                     let physical_u = (low_u, high_u);
+                    if pocket {
+                        // Резерв под чашку не разрывает материал в раскладке.
+                        if let Some(piece) = interval(low_u, high_u, frame.length) {
+                            has_cup = true;
+                            result.evidence.push(ConstraintEvidence {
+                                run_id: run.id.clone(),
+                                course_index: course.index,
+                                source: MaskSource::Beam(beam.id.clone()),
+                                coarse_interval: piece,
+                                beam_projection: None,
+                                course_z: course.z,
+                                course_height,
+                                geometry: EvidenceGeometry::Beam {
+                                    beam: beam.clone(),
+                                    frame: *source_frame,
+                                    source_u: Interval { start: *from as i64, end: *to as i64 },
+                                    assembly_envelope: None,
+                                    perpendicular_cut: Some(LocalBox {
+                                        u_low: low_u, u_high: high_u,
+                                        v_low: low_v, v_high: high_v,
+                                        z_low: low_z, z_high: high_z,
+                                    }),
+                                },
+                            });
+                        }
+                        continue;
+                    }
                     if policy.affine_world_joint_spike_compensation
                         && orientation == BeamOrientation::Longitudinal
                     {
@@ -1506,7 +1546,7 @@ pub fn build_constraints_with_policy(
                         }
                     }
                 }
-                if parts.is_empty() {
+                if parts.is_empty() && !has_cup {
                     continue;
                 }
                 if !full_course_clearance {
@@ -2381,7 +2421,7 @@ mod tests {
     }
 
     #[test]
-    fn transverse_pocket_clears_wall_thickness_and_keeps_exact_height() {
+    fn transverse_pocket_keeps_rear_material_and_does_not_mask_layout() {
         let mut topology = topology();
         topology.walls[0].thickness = 19_300;
         let mut transverse = beam(raw(1500.0, -800.0), raw(1500.0, 76.5), 160.0);
@@ -2417,7 +2457,7 @@ mod tests {
                     },
                     v: Interval {
                         start: -9_650,
-                        end: 9_650
+                        end: 7_650
                     },
                     z: Interval {
                         start: 3_000,
@@ -2426,8 +2466,7 @@ mod tests {
                 },
             }]
         );
-        assert_eq!(whole.v.end, cuts[0].volume.v.end);
-        assert!(matches!(
+        assert_eq!(
             constraints
                 .classify_box(
                     "run",
@@ -2441,8 +2480,10 @@ mod tests {
                     }
                 )
                 .unwrap(),
-            Exclusion::Partial { .. }
-        ));
+            Exclusion::None
+        );
+        assert_eq!(constraints.classify_assembly_box("run", 0, whole).unwrap(), Exclusion::None);
+        assert!(constraints.masks.is_empty());
         assert_eq!(
             constraints
                 .classify_box(

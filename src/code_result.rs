@@ -48,6 +48,50 @@ fn token(face: u8, position: i64, length: i64, product: &str) -> String {
     format!(" [{face}-{position}-Тип {product}]")
 }
 
+type Cut = (i64, u8, String);
+
+fn end_extension(cuts: &[Cut], end: i64) -> i64 {
+    if cuts.iter().any(|(pos, _, product)| *pos == end && matches!(product.as_str(), "1" | "2" | "3" | "4")) {
+        crate::node_shapes::CORNER_EXTENSION_CENTIMM
+    } else { 0 }
+}
+
+fn product_codes(length: i64, tokens: &mut [Cut]) -> (String, String) {
+    // Одинаковое положение и грань упорядочиваются как FbProductCodeParser.
+    tokens.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| {
+                let order = |f| match f {
+                    2 => 0,
+                    1 => 1,
+                    _ => 2,
+                };
+                order(a.1).cmp(&order(b.1))
+            })
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    let mut code1 = format!("П{}", number(length));
+    for (position, face, product) in tokens.iter() {
+        code1.push_str(&token(*face, *position, length, product));
+    }
+    let mut mirror: Vec<_> = tokens
+        .iter()
+        .map(|(p, f, t)| (length - p, 4 - f, t))
+        .collect();
+    mirror.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(b.2))
+    });
+    let mut code2 = format!("П{}", number(length));
+    for (position, face, product) in mirror {
+        code2.push_str(&token(face, position, length, product));
+    }
+    (code1, code2)
+}
+
+fn valid_length(length: i64) -> bool { (1..=100_000_000).contains(&length) }
+
 pub(crate) fn validate_end_states(block: &Block) -> Result<(), ApiFailure> {
     if (!block.natural_end_left() && !block.hide_spikes_left())
         || (!block.natural_end_right() && !block.hide_spikes_right())
@@ -67,7 +111,7 @@ pub(crate) fn export_block(
     profile: &Profile,
     block: &Block,
 ) -> Result<Value, ApiFailure> {
-    if block.id.is_empty() || block.length_centimm <= 0 || block.length_centimm > 100_000_000 {
+    if block.id.is_empty() || !valid_length(block.length_centimm) {
         return Err(issue(block, "Некорректная идентичность или длина детали"));
     }
     validate_end_states(block)?;
@@ -147,36 +191,7 @@ pub(crate) fn export_block(
             trims.push(trim);
         }
     }
-    // Одинаковое положение и грань упорядочиваются как FbProductCodeParser.
-    tokens.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| {
-                let order = |f| match f {
-                    2 => 0,
-                    1 => 1,
-                    _ => 2,
-                };
-                order(a.1).cmp(&order(b.1))
-            })
-            .then_with(|| a.2.cmp(&b.2))
-    });
-    let mut code1 = format!("П{}", number(block.length_centimm));
-    for (position, face, product) in &tokens {
-        code1.push_str(&token(*face, *position, block.length_centimm, product));
-    }
-    let mut mirror: Vec<_> = tokens
-        .iter()
-        .map(|(p, f, t)| (block.length_centimm - p, 4 - f, t))
-        .collect();
-    mirror.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(b.2))
-    });
-    let mut code2 = format!("П{}", number(block.length_centimm));
-    for (position, face, product) in mirror {
-        code2.push_str(&token(face, position, block.length_centimm, product));
-    }
+    let (code1, code2) = product_codes(block.length_centimm, &mut tokens);
     let walls: Vec<_> = request
         .wall_volumes
         .iter()
@@ -207,18 +222,9 @@ pub(crate) fn export_block(
     let clean = |v: f64| if v.abs() < 1e-12 { 0.0 } else { v };
     // SUP принимает габарит с L-выступами и начало этого габарита.
     // Код и раскладочная сетка сохраняют длину тела между узлами.
-    let l_extension = |end| {
-        if tokens.iter().any(|(position, _, product)| {
-            *position == end && matches!(product.as_str(), "1" | "2" | "3" | "4")
-        }) {
-            96.5
-        } else {
-            0.0
-        }
-    };
-    let begin_extension = l_extension(0);
-    let physical_length =
-        mm(block.length_centimm) + begin_extension + l_extension(block.length_centimm);
+    let [leading, trailing] = crate::node_shapes::corner_extensions(block);
+    let begin_extension = mm(leading);
+    let physical_length = mm(block.length_centimm + leading + trailing);
     let product_type = match block.product_key.as_deref() {
         _ if block.is_bridge => "Перемычка".into(),
         _ if block.kind == "node_compound" => "Комбинированный".into(),
@@ -228,8 +234,7 @@ pub(crate) fn export_block(
         _ if block.kind == "special_ordinary" => "Специальный".into(),
         _ => "Рядовой".into(),
     };
-    Ok(
-        json!({"id":block.id,"code1":code1,"code2":code2,"product_type":product_type,
+    let mut value = json!({"id":block.id,"code1":code1,"code2":code2,"product_type":product_type,
         "placement":{"origin_mm":[mm(block.start.x)-begin_extension*cos,mm(block.start.y)-begin_extension*sin,mm(block.z_centimm)],
             "x_axis":[clean(cos),clean(sin),0.0],"y_axis":[clean(-sin),clean(cos),0.0],"z_axis":[0.0,0.0,1.0]},
         "length_mm":physical_length,"nominal_length_mm":mm(block.length_centimm),
@@ -237,8 +242,11 @@ pub(crate) fn export_block(
         "source_ids":source_ids,"wall_ids":wall_ids,"hide_spikes_left":block.hide_spikes_left(),"hide_spikes_right":block.hide_spikes_right(),
         "natural_end_left":block.natural_end_left(),"natural_end_right":block.natural_end_right(),
         "left_end":block.ends.left(),"right_end":block.ends.right(),
-        "node_cuts":node_cuts,"trims":trims}),
-    )
+        "node_cuts":node_cuts,"trims":trims});
+    if !block.rectangular_cuts.is_empty() {
+        value["rectangular_cuts"] = json!(block.rectangular_cuts);
+    }
+    Ok(value)
 }
 
 pub fn export_codes(
@@ -271,9 +279,8 @@ fn export_internal(standard:&ExchangeRequest,request:&LayoutRequest,profile:&Pro
         prepared.annotate(&mut value);
         values.push(value);
     }
-    let mut lamella_plan = if include_lamellas {crate::lamella::calculate(request, profile, &prepared.blocks)?}
+    let lamella_plan = if include_lamellas {crate::lamella::calculate(request, profile, &prepared.blocks)?}
         else{crate::lamella::LamellaPlan {lamellas:Vec::new(),warnings:Vec::new()}};
-    crate::lamella::quantize_solids(&mut lamella_plan.lamellas);
     if include_lamellas {crate::lamella::add_recesses(&mut values, &prepared.blocks, &lamella_plan.lamellas, request);}
     let mut all_warnings = warnings.to_vec();
     all_warnings.extend(lamella_plan.warnings);
@@ -283,6 +290,69 @@ fn export_internal(standard:&ExchangeRequest,request:&LayoutRequest,profile:&Pro
         ApiFailure::new("LAMELLA_EXPORT_FAILED", e.to_string(), None))?;
     crate::precision::normalize_result(&mut result);
     Ok(result)
+}
+
+/// Rebuilds product codes from machining facts, using the same formatter and end
+/// geometry as the layout export. Each part has an independent outcome.
+pub fn selected_codes(request: &Value) -> Result<Value, String> {
+    let parts = request["blocks"].as_array().ok_or("Нет деталей для пересчёта")?;
+    let results: Vec<_> = parts.iter().map(|part| {
+        let id = &part["id"];
+        match recode(part) {
+            Ok(mut result) => { result["id"] = id.clone(); result }
+            Err(message) => json!({"id":id,"error":message}),
+        }
+    }).collect();
+    Ok(json!({"format":"fb-product-codes/1","request_id":request["request_id"],"blocks":results}))
+}
+
+fn recode(part: &Value) -> Result<Value, String> {
+    fn units(value: &Value) -> Result<i64, String> {
+        let n = crate::precision::centimm(value.as_f64().ok_or("Отсутствует размер в мм")?);
+        if !n.is_finite() || n.abs() >= (i64::MAX / 4) as f64 { return Err("Размер вне диапазона модели".into()); }
+        Ok(n as i64)
+    }
+    let nominal = units(&part["source_nominal_mm"])?;
+    let actual = units(&part["length_mm"])?;
+    let mut cuts = Vec::new();
+    for cut in part["cuts"].as_array().ok_or("Нет списка врезок")? {
+        let face = match cut["face"].as_str() {
+            Some("Н") => 1, Some("С") => 2, Some("В") => 3, _ => return Err("Неизвестная грань врезки".into())
+        };
+        let key = cut["type"].as_str().ok_or("Нет типа врезки")?;
+        let product = type_number(&format!("Type{key}")).ok_or("Неизвестный тип врезки")?;
+        let position = units(&cut["position_mm"])?;
+        if !(0..=nominal).contains(&position) { return Err("Исходная врезка вне оси детали".into()); }
+        cuts.push((position, face, product));
+    }
+    let leading = end_extension(&cuts, 0);
+    let trailing = end_extension(&cuts, nominal);
+    let source_length = if part["source_length_mm"].is_null() {
+        nominal + leading + trailing
+    } else { units(&part["source_length_mm"])? };
+    let length = nominal + actual - source_length;
+    if nominal <= 0 || source_length <= 0 || actual <= 0 || !valid_length(length) {
+        return Err("Некорректная длина детали".into());
+    }
+    if part["current_facts"] == true && actual != source_length {
+        return Err("Номинальная длина и врезки не соответствуют габариту модели".into());
+    }
+    let shift = if !part["start_shift_mm"].is_null() { units(&part["start_shift_mm"])? }
+        else if cuts.is_empty() || length == nominal { 0 }
+        else { return Err("Для изменённой детали нужна исходная ось или текущие координаты врезок".into()); };
+    let mut relocated = Vec::with_capacity(cuts.len());
+    for (position, face, product) in cuts {
+        let kind = format!("Type{}", product.replace('.', "_"));
+        if let Some(p) = crate::node_shapes::relocated_position(&kind, position, shift, shift + length)? {
+            relocated.push((p, face, product));
+        }
+    }
+    let mut cuts = relocated;
+    if leading != end_extension(&cuts, 0) || trailing != end_extension(&cuts, length) {
+        return Err("Изменился угловой торец. Укажите номинальную длину и текущие врезки".into());
+    }
+    let (code1, code2) = product_codes(length, &mut cuts);
+    Ok(json!({"code1":code1,"code2":code2,"nominal_length_mm":mm(length)}))
 }
 
 #[cfg(test)]
@@ -297,6 +367,41 @@ mod tests {
             "rotation_deg":0,"local_origin":null,"local_rotation_deg":null,"is_bridge":false,
             "hide_spikes_left":false,"hide_spikes_right":false,"cuts":cuts,
             "source_ids":["wall:wall-example","edge:wall-example:0"],"catalog_nominal_centimm":64000,"arms":[]})).unwrap()
+    }
+
+    #[test]
+    fn selected_parts_match_full_export_and_relocate_the_console_joint() {
+        let standard = parse_request(include_str!(
+            "../Документация/Граничные контракты/examples/layout-request.v1.json"
+        )).unwrap();
+        let request = standard.to_layout_request().unwrap();
+        let profile: Profile = serde_json::from_str(include_str!("../profiles/banya-prototype.json")).unwrap();
+        let mut lintel = block("console", "lintel", None, vec!["Type6:p160000:y3:wall"]);
+        lintel.length_centimm = 269650;
+        lintel.is_bridge = true;
+        let exported = export_block(&request, &profile, &lintel).unwrap();
+        let mut facts = json!({"id":"console","source_nominal_mm":2696.5,"length_mm":2696.5,
+            "cuts":[{"type":"6","face":"В","position_mm":1600}]});
+        let before = recode(&facts).unwrap();
+        assert_eq!(before["code1"], exported["code1"]);
+        assert_eq!(before["code2"], exported["code2"]);
+        facts["length_mm"] = json!(2675);
+        assert!(recode(&facts).is_err());
+        facts["start_shift_mm"] = json!(21.5);
+        let after = recode(&facts).unwrap();
+        assert_eq!(after["code1"], "П2675 [В-1578.5-Тип 6]");
+        assert_eq!(after["code2"], "П2675 [Н-1096.5-Тип 6]");
+        lintel.length_centimm = 267500;
+        lintel.cuts = vec!["Type6:p157850:y3:wall".to_string()];
+        let full = export_block(&request, &profile, &lintel).unwrap();
+        assert_eq!(after["code1"], full["code1"]);
+        assert_eq!(after["code2"], full["code2"]);
+        let neighbor = json!({"id":"neighbor","source_nominal_mm":640,"length_mm":661.5,"cuts":[]});
+        let invalid = json!({"id":"invalid","source_nominal_mm":640,"length_mm":600,"start_shift_mm":40,
+            "cuts":[{"position_mm":10,"type":"6","face":"Н"}]});
+        let response = selected_codes(&json!({"blocks":[facts,invalid,neighbor]})).unwrap();
+        assert!(response["blocks"][1]["error"].is_string());
+        assert_eq!(response["blocks"][2]["code1"], "П661.5");
     }
 
     #[test]

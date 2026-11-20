@@ -13,17 +13,8 @@ fn dot(a: V, b: V) -> f64 {
 fn sub(a: V, b: V) -> V {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
-fn add(a: V, b: V) -> V {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
 fn scale(a: V, s: f64) -> V {
     [a[0] * s, a[1] * s, a[2] * s]
-}
-fn plane(n: V, point: V) -> Plane {
-    Plane {
-        normal: n,
-        offset: dot(n, point),
-    }
 }
 fn combine(parts: &[Mesh]) -> Mesh {
     let mut result = Mesh {
@@ -76,6 +67,10 @@ pub struct PhysicalBlock {
     pub source_ids: Vec<String>,
     pub bodies: Vec<Mesh>,
     pub cut: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rectangular_cuts: Vec<crate::rectangular_cut::RectangularCut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<Value>,
     pub is_dobor: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dobor_group: Option<crate::offcut_plan::DoborGroup>,
@@ -216,6 +211,8 @@ fn materialize_parts(
                 source_ids: block.source_ids.clone(),
                 bodies,
                 cut,
+                rectangular_cuts: Vec::new(),
+                placement: None,
             });
             continue;
         }
@@ -234,7 +231,7 @@ fn materialize_parts(
         let width = primary.thickness_mm;
         let height = 63.0;
         let length = block.length_centimm as f64 / 100.0;
-        let origin = [
+        let mut origin = [
             block.start.x as f64 / 100.0,
             block.start.y as f64 / 100.0,
             block.z_centimm as f64 / 100.0,
@@ -245,19 +242,12 @@ fn materialize_parts(
             [-a.sin(), a.cos(), 0.0],
             [0.0, 0.0, 1.0],
         ];
+        if !block.rectangular_cuts.is_empty() {
+            let leading = crate::node_shapes::corner_extensions(block)[0] as f64 / 100.0;
+            origin = sub(origin, scale(axes[0], leading));
+        }
         let nominal = length;
-        let has_node_profile = block.kind.starts_with("node_")
-            || block.cuts.iter().any(|cut| cut.starts_with("Type"));
-        let stocks = if has_node_profile {
-            crate::node_shapes::node_stock(block, width, height)
-                .map_err(|m| ApiFailure::new("UNSUPPORTED_NODE_SHAPE", m, Some(block.id.clone())))?
-        } else {
-            vec![solid::box_mesh(
-                add(origin, scale(axes[1], -width / 2.0)),
-                axes,
-                [nominal, width, height],
-            )]
-        };
+        let stocks = crate::block_geometry::stock(block,width)?;
         let stock = combine(&stocks);
         let mut bodies = stocks;
         let mut cuts = Vec::new();
@@ -273,25 +263,16 @@ fn materialize_parts(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        for (natural, hidden, at_left) in [
-            (block.natural_end_left(), block.hide_spikes_left(), true),
-            (block.natural_end_right(), block.hide_spikes_right(), false),
-        ] {
-            if natural && hidden {
-                let p = if at_left {
-                    plane(scale(axes[0], -1.0), add(origin, scale(axes[0], 5.0)))
-                } else {
-                    plane(axes[0], add(origin, scale(axes[0], length - 5.0)))
-                };
-                bodies = bodies.into_iter().filter_map(|m| solid::clip(&m, &p)).collect();
-                cuts.push(local_plane_cut(p, origin, axes, &sources));
-            }
+        for p in crate::block_geometry::end_cuts(block) {
+            bodies = bodies.into_iter().filter_map(|m| solid::clip(&m, &p)).collect();
+            cuts.push(local_plane_cut(p, origin, axes, &sources));
         }
+        bodies = crate::block_geometry::subtract_rectangular_cuts(bodies, block, width);
         // Высота и профиль готовой детали сохранены; длину определил finalize_parts.
         if bodies.is_empty() {
             continue;
         }
-        let cut = !cuts.is_empty() || !block.cuts.is_empty();
+        let cut = !cuts.is_empty() || !block.cuts.is_empty() || !block.rectangular_cuts.is_empty();
         let product = if block.is_bridge {
             "lintel"
         } else if length > 640.0 {
@@ -310,6 +291,9 @@ fn materialize_parts(
         let mut value = json!({"id":block.id,"source_ids":sources,"wall_ids":walls.iter().map(|w|w.guid.clone()).collect::<Vec<_>>(),"course_index":block.course_index,
             "product":{"category":product,"type_id":code,"code":code,"nominal_size_mm":[nominal,width,height]},"placement":frame_json(origin,axes),
             "stock_shape":{"kind":"mesh","vertices_mm":local.vertices,"faces":local.faces},"cuts":cuts,"spikes_removed":{"left":block.hide_spikes_left(),"right":block.hide_spikes_right()},"natural_end_left":block.natural_end_left(),"natural_end_right":block.natural_end_right(),"left_end":block.ends.left(),"right_end":block.ends.right()});
+        if !block.rectangular_cuts.is_empty() {
+            value["rectangular_cuts"] = json!(block.rectangular_cuts);
+        }
         if product == "special" {
             value["special_origin"] = json!({"rule_id":"minimum_ordinary_span_merge","component_ids":value["source_ids"]});
         }
@@ -324,6 +308,8 @@ fn materialize_parts(
             source_ids: block.source_ids.clone(),
             bodies,
             cut,
+            rectangular_cuts: block.rectangular_cuts.clone(),
+            placement: (!block.rectangular_cuts.is_empty()).then(|| frame_json(origin, axes)),
         });
     }
     if let Some(mut warning) = profile_warning {

@@ -1,4 +1,5 @@
 pub mod api;
+mod block_geometry;
 pub mod choice;
 pub mod code_result;
 pub mod constraints;
@@ -11,6 +12,7 @@ pub mod lamella;
 pub mod lamella_saved;
 pub mod layout;
 pub mod materialize;
+pub mod roof;
 pub mod node_assembly;
 mod node_compound;
 pub mod node_geometry;
@@ -19,6 +21,7 @@ pub mod offcut_plan;
 pub mod product_catalog;
 pub mod production_plan;
 pub mod precision;
+pub mod rectangular_cut;
 pub mod solid_geometry;
 pub mod topology;
 pub mod vertical;
@@ -415,6 +418,13 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
         Ok(blocks) => blocks,
         Err(error) => return failure(vec![error]),
     };
+    let (blocks,removed)=match roof::retain_material(request,blocks) {
+        Ok(result)=>result,Err(error)=>return failure(vec![error]),
+    };
+    if !removed.is_empty() {
+        let mut note=ApiFailure::new("ROOF_BLOCKS_EXCLUDED",format!("Исключено {} деталей целиком выше границы кровли",removed.len()),None);
+        note.source_ids=removed;diagnostics.push(note);
+    }
     for opening in &openings {
         if beam_spanned.iter().any(|(id, _)| *id == opening.id) { continue; }
         let width = (opening.end.x_mm - opening.start.x_mm).hypot(opening.end.y_mm - opening.start.y_mm);
@@ -601,7 +611,7 @@ mod opening_tests {
             }
         }
         let mut clipped_node_request = r.clone();
-        clipped_node_request.beams[0].start_xmm = 1620.0;
+        clipped_node_request.beams[0].start_xmm = 1503.5;
         let clipped_node = inspect_request(&clipped_node_request, &profile);
         assert!(
             clipped_node
