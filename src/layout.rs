@@ -19,6 +19,7 @@ mod lintel_plan;
 
 const LINTEL_REVIEW_REQUIRED: &str = "lintel_review_required:";
 const LINTEL_REVIEW_PLACEHOLDER: &str = "lintel_review_required:missing_material:";
+const MAX_CONSOLE_LINTEL_CENTIMM: i64 = 267_500;
 
 const MAX_BLOCKS: usize = 100_000;
 const MAX_SEARCH_STATES: usize = 100_000;
@@ -454,37 +455,16 @@ fn finalize_parts_inner(
                 format!("beam:{}", beam.guid)));
         }
         for (opening_index, opening) in request.opening_volumes.iter().enumerate() {
-            if !matches!(opening.opening_type.as_str(), "OPENING" | "CONSOLE" | "WINDOW" | "DOOR") {
+            if !crate::effective_geometry::is_fb_opening(opening) {
                 continue;
             }
             let (a, av) = project(opening.start_xmm, opening.start_ymm);
             let (b, bv) = project(opening.end_xmm, opening.end_ymm);
-            if (av - bv).abs() > 0.02 || av.abs() > width / 2.0 + 0.02
-                || top <= opening.start_bottom_zmm.min(opening.end_bottom_zmm) + 1e-7
-                || bottom >= opening.start_top_zmm.max(opening.end_top_zmm) - 1e-7 {
+            let Some((mut low, mut high)) = crate::effective_geometry::opening_course_interval(
+                opening, (a, av), (b, bv), width / 2.0, [bottom, top],
+            ) else {
                 continue;
-            }
-            let mut low = (a.min(b) * 100.0).round() as i64;
-            let mut high = (a.max(b) * 100.0).round() as i64;
-            if (opening.start_top_zmm - opening.end_top_zmm).abs() > 1e-7 {
-                // Любое пересечение проёма с венцом укорачивает деталь на всю высоту.
-                let za = opening.start_top_zmm;
-                let zb = opening.end_top_zmm;
-                if bottom >= za.max(zb) { continue; }
-                if bottom > za.min(zb) {
-                    let crossing = ((a + (b - a) * (bottom - za) / (zb - za)) * 100.0).round() as i64;
-                    if (zb > za) == (b > a) { low = crossing; } else { high = crossing; }
-                }
-            }
-            if (opening.start_bottom_zmm - opening.end_bottom_zmm).abs() > 1e-7 {
-                let za = opening.start_bottom_zmm;
-                let zb = opening.end_bottom_zmm;
-                if top <= za.min(zb) { continue; }
-                if top < za.max(zb) {
-                    let crossing = ((a + (b - a) * (top - za) / (zb - za)) * 100.0).round() as i64;
-                    if (zb > za) == (b > a) { high = high.min(crossing); } else { low = low.max(crossing); }
-                }
-            }
+            };
             for &(index, is_start, reference_length) in reveals {
                 if index != opening_index || original.length_centimm >= reference_length { continue; }
                 let boundary = ((if is_start { a } else { b }) * 100.0).round() as i64;
@@ -2821,6 +2801,31 @@ fn lintel_course_has_wall_height(
     false
 }
 
+pub(crate) fn console_node_at_root(
+    part: &Block,
+    root: crate::domain::RawPoint,
+    tip: crate::domain::RawPoint,
+) -> bool {
+    if part.product_key.as_deref() != Some("Type6")
+        && !part.cuts.iter().any(|cut| cut.starts_with("Type6:"))
+    {
+        return false;
+    }
+    let (dx, dy) = (tip.x_mm - root.x_mm, tip.y_mm - root.y_mm);
+    let length = dx.hypot(dy);
+    if length == 0.0 { return false; }
+    let (ux, uy) = (dx / length, dy / length);
+    let mut span = Span { start: i64::MAX, end: i64::MIN };
+    for point in part.arms.iter().flat_map(|arm| [arm.start, arm.end]) {
+        let (x, y) = (point.x as f64 - root.x_mm * 100.0, point.y as f64 - root.y_mm * 100.0);
+        if (x * uy - y * ux).abs() > 1.0 { return false; }
+        let u = (x * ux + y * uy).round() as i64;
+        span.start = span.start.min(u);
+        span.end = span.end.max(u);
+    }
+    span.start <= 0 && span.end >= 0
+}
+
 fn console_glueable_profiles(part: &Block) -> bool {
     // A factory corner/end profile cannot become an interior profile of a
     // longer bar. Keep that whole node intact as a boundary of penetration.
@@ -2832,12 +2837,10 @@ fn console_glueable_profiles(part: &Block) -> bool {
     })
 }
 
-/// The penetration is a target for whole-block glueing, not a placement veto.
-/// Physical gaps delimit the available material; each remaining console piece
-/// keeps its course and can be a lintel even when the target cannot be reached.
+/// Extend each chain toward the wall only at the existing stock joints.
 fn console_available_segments(
     coverage: &[(usize, Span)],
-    target: Span,
+    tip: i64,
     maximum: i64,
 ) -> (Vec<(usize, Span)>, Vec<Span>) {
     let mut chains: Vec<Vec<(usize, Span)>> = Vec::new();
@@ -2849,9 +2852,7 @@ fn console_available_segments(
     let mut selected = Vec::new();
     let mut segments = Vec::new();
     for chain in chains {
-        if !chain.iter().any(|(_, span)| span.intersects(Span { start: 0, end: target.end })) { continue; }
-        // Start at the free end and include whole neighbours toward the root,
-        // stopping at a physical boundary or the catalogue's product length.
+        if !chain.iter().any(|(_, span)| span.intersects(Span { start: 0, end: tip })) { continue; }
         let mut segment: Option<Span> = None;
         let mut used = Vec::new();
         for part in chain.iter().rev() {
@@ -2867,7 +2868,6 @@ fn console_available_segments(
             }
             segment = Some(Span { start: part.1.start, end: part.1.end.max(end) });
             used.push(*part);
-            if part.1.start <= target.start { break; }
         }
         if let Some(span) = segment { segments.push(span); selected.append(&mut used); }
     }
@@ -2898,7 +2898,7 @@ fn merge_t_lintels_at_offset_policy(
 ) -> BTreeSet<(i64, String)> {
     let mut completed = BTreeSet::new();
     let mut visited = BTreeSet::new();
-    let maximum = profile
+    let catalog_maximum = profile
         .bridge_nominal_lengths_centimm
         .iter()
         .copied()
@@ -2925,13 +2925,18 @@ fn merge_t_lintels_at_offset_policy(
             ((p.x as f64 - a.x_mm * 100.0) * uy - (p.y as f64 - a.y_mm * 100.0) * ux).abs() <= 1.0
         };
         let console = constraints.console_axes.contains_key(&candidate.opening_id);
+        let maximum = if console { catalog_maximum.min(MAX_CONSOLE_LINTEL_CENTIMM) } else { catalog_maximum };
         if console && !blocks.iter().any(|part| {
+            // With a flush beam the root can be part of a continuous wall.
+            // Select the same alternating courses by the stock spanning the root.
+            if part.course_index == candidate.course_index && part.kind == "ordinary"
+                && on_axis(part.start) && on_axis(part.end)
+            {
+                let (a, b) = (project(part.start), project(part.end));
+                if a.min(b) < 0 && a.max(b) > 0 { return true; }
+            }
             part.course_index.rem_euclid(profile.phase_count) == candidate.course_index.rem_euclid(profile.phase_count)
-                && (part.product_key.as_deref() == Some("Type6")
-                    || part.cuts.iter().any(|cut| cut.starts_with("Type6:")))
-                && part.arms.iter().all(|arm| on_axis(arm.start) && on_axis(arm.end))
-                && part.arms.iter().flat_map(|arm| [arm.start, arm.end]).map(project).min().is_some_and(|u| u <= 0)
-                && part.arms.iter().flat_map(|arm| [arm.start, arm.end]).map(project).max().is_some_and(|u| u >= 0)
+                && console_node_at_root(part, a, b)
         }) { continue; }
         let group = lintel_groups(constraints, &candidate.run_id, candidate.course_index)
             .into_iter()
@@ -2952,7 +2957,7 @@ fn merge_t_lintels_at_offset_policy(
         }
         openings.sort_by_key(|(_, span)| span.start);
         let required = if console { Span {
-            start: -((width * 100.0).round() as i64),
+            start: 0,
             end: (width * 100.0).round() as i64,
         }} else { Span {
             start: openings.first().map(|(_, span)| span.start).unwrap_or(0) - support,
@@ -2996,13 +3001,18 @@ fn merge_t_lintels_at_offset_policy(
             }
             let mut selected: Vec<_> = coverage
                 .into_iter()
-                .filter(|(index, part_span)| part_span.intersects(required)
-                    && (!preserve_invalid || !blocks[*index].is_bridge) && (!console ||
-                    (!blocks[*index].is_bridge && console_glueable_profiles(&blocks[*index]))))
+                .filter(|(index, span)| {
+                    let part = &blocks[*index];
+                    if console {
+                        span.start < required.end && !part.is_bridge && console_glueable_profiles(part)
+                    } else {
+                        span.intersects(required) && (!preserve_invalid || !part.is_bridge)
+                    }
+                })
                 .collect();
             selected.sort_by_key(|(_, part_span)| part_span.start);
             if console {
-                let (console_parts, segments) = console_available_segments(&selected, required, maximum);
+                let (console_parts, segments) = console_available_segments(&selected, required.end, maximum);
                 if let (Some((_, first)), Some((_, last))) = (console_parts.first(), console_parts.last()) {
                     placement = Some((course, console_parts.clone(),
                         Span { start: first.start, end: last.end }, segments));
@@ -3078,6 +3088,12 @@ fn merge_t_lintels_at_offset_policy(
             x: (a.x_mm * 100.0 + u as f64 * ux).round() as i64,
             y: (a.y_mm * 100.0 + u as f64 * uy).round() as i64,
         };
+        let oriented_ends = |part: &Block| {
+            let rotation = f64::from(part.rotation_deg).to_radians();
+            if rotation.cos() * ux + rotation.sin() * uy < 0.0 {
+                part.ends.reversed(part.length_centimm)
+            } else { part.ends.clone() }
+        };
         let mut bridges = Vec::new();
         for span in segments {
             let selected: Vec<_> = selected.iter().copied()
@@ -3103,12 +3119,6 @@ fn merge_t_lintels_at_offset_policy(
                 openings.iter().filter(|(_, opening)| opening.intersects(span))
                     .map(|(id, _)| id.clone()).collect(),
             );
-            let oriented_ends = |part: &Block| {
-                let rotation = f64::from(part.rotation_deg).to_radians();
-                if rotation.cos() * ux + rotation.sin() * uy < 0.0 {
-                    part.ends.reversed(part.length_centimm)
-                } else { part.ends.clone() }
-            };
             let (last_index, last_span) = selected[selected.len() - 1];
             merged.ends = EndStates::outer(&oriented_ends(first_block),
                 &oriented_ends(&blocks[last_index]), last_span.start - span.start);
@@ -3192,7 +3202,8 @@ fn merge_t_lintels_at_offset_policy(
                 .bridge_nominal_lengths_centimm
                 .iter()
                 .copied()
-                .filter(|n| *n >= span.len())
+                .chain(console.then_some(maximum))
+                .filter(|n| *n >= span.len() && *n <= maximum)
                 .min();
             bridges.push(merged);
         }
@@ -5520,6 +5531,37 @@ mod tests {
     }
 
     #[test]
+    fn isolated_opening_moves_all_rows_for_fewer_cuts_or_shorter_total_length() {
+        for prefer_fewer_cuts in [true, false] {
+            let (mut parts, constraints, p, e, t) = lintel_packet_fixture(6);
+            let shorter_course = if prefer_fewer_cuts { 1 } else { 2 };
+            parts.retain(|b| b.course_index != shorter_course);
+            for (start, end) in [(100_000, 140_000), (140_000, 180_000), (180_000, 220_000)] {
+                let cuts = match (start == 140_000, prefer_fewer_cuts) {
+                    (true, true) => vec!["Type5_1:x1:y2:run:stem:0".into()],
+                    (true, false) => vec![
+                        "Type5_1:x1:y2:run:stem:0".into(),
+                        "Type5_1:x1:y2:run:other-stem:0".into(),
+                    ],
+                    (false, _) => Vec::new(),
+                };
+                parts.push(block(&e, shorter_course, shorter_course * 6300, Span { start, end },
+                    320_000, "ordinary", false, cuts, Vec::new()));
+            }
+            if !prefer_fewer_cuts {
+                parts.iter_mut().find(|b| b.course_index == 1).unwrap()
+                    .cuts.push("Type5_1:x1:y2:run:stem:0".into());
+            }
+
+            assert_eq!(merge_t_lintels(&mut parts, &t, &constraints, &p).len(), 3);
+            let bridges: Vec<_> = parts.iter().filter(|b| b.lintel_is_valid()).collect();
+            assert_eq!(bridges.iter().map(|b| b.course_index).collect::<Vec<_>>(), [2, 4, 6]);
+            assert_eq!(bridges.iter().map(|b| b.length_centimm).sum::<i64>(),
+                if prefer_fewer_cuts { 384_000 } else { 376_000 });
+        }
+    }
+
+    #[test]
     fn one_real_conflict_moves_all_existing_lintel_layers_together() {
         for (available, expected) in [(4, vec![2, 4]), (6, vec![2, 4, 6])] {
             let (mut parts, constraints, p, e, t) = lintel_packet_fixture(available);
@@ -5834,8 +5876,8 @@ mod tests {
         blocks.extend(chain(2, &[73_000, 105_000, 215_000, 247_000]));
         merge_t_lintels(&mut blocks, &t, &c, &p);
         let bridge = blocks.iter().find(|b| b.is_bridge).unwrap();
-        assert_eq!(bridge.course_index, 1);
-        assert_eq!(bridge.length_centimm, 173_800);
+        assert_eq!(bridge.course_index, 2);
+        assert_eq!(bridge.length_centimm, 110_000);
 
         let mut too_high = chain(3, &[105_000, 215_000]);
         let mut first_candidate = c.clone();

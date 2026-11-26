@@ -54,6 +54,55 @@ fn wide_interior_block(blocks: &[Block]) -> &Block {
 }
 
 #[test]
+fn beam_between_console_faces_keeps_straight_lintels_and_no_embedded_stems() {
+    let (_, profile) = fixture();
+    let wall = |id: &str, start: [f64; 2], end: [f64; 2], kind: &str| {
+        json!({
+            "guid": id, "startXmm": start[0], "startYmm": start[1],
+            "endXmm": end[0], "endYmm": end[1], "openingType": kind,
+            "startBottomZmm": 2961, "endBottomZmm": 2961,
+            "startTopZmm": 3339, "endTopZmm": 3339,
+            "thicknessMm": 193, "purposeType": 1
+        })
+    };
+    let mut request: LayoutRequest = serde_json::from_value(json!({
+        "schema_version": 1, "request_id": "beam-contact-with-consoles",
+        "snapshot_hash": "c".repeat(64), "z0_mm": -252,
+        "wall_volumes": [
+            wall("left", [-6400., -4480.], [-6400., -3200.], ""),
+            wall("right", [-1920., -4480.], [-1920., -3200.], ""),
+            wall("left-console", [-6400., -5376.5], [-6400., -4480.], "CONSOLE"),
+            wall("right-console", [-1920., -5376.5], [-1920., -4480.], "CONSOLE"),
+            wall("between", [-6400., -4480.], [-1920., -4480.], "")
+        ],
+        "beams": [{
+            "guid": "beam", "startXmm": -2016.5, "startYmm": -4480, "startZmm": 2961,
+            "endXmm": -6303.5, "endYmm": -4480, "endZmm": 2961,
+            "geometry": {"widthMm": 160, "heightMm": 315, "heightDirectionZ": 1}
+        }]
+    })).unwrap();
+    for reverse in [false, true] {
+        if reverse {
+            let beam = &mut request.beams[0];
+            std::mem::swap(&mut beam.start_xmm, &mut beam.end_xmm);
+            beam.start_zmm = 3276.0;
+            beam.end_zmm = 3276.0;
+            beam.geometry.height_direction_z = -1.0;
+        }
+        let blocks = layout(&request, &profile);
+        let below_top = blocks.iter().filter(|block| (51..=55).contains(&block.course_index));
+        assert!(below_top.clone().all(|block| block.start.x == block.end.x),
+            "The beam has replaced the transverse wall stock in all five courses");
+        for x in [-640_000, -192_000] {
+            let bridges: Vec<_> = below_top.clone().filter(|block| block.start.x == x && block.is_bridge).collect();
+            assert_eq!(bridges.iter().map(|block| block.course_index).collect::<Vec<_>>(), [51, 53, 55]);
+            assert!(bridges.iter().all(|block| block.cuts.is_empty() && block.rectangular_cuts.is_empty()));
+        }
+        assert!(blocks.iter().any(|block| block.course_index == 56 && block.kind == "node_T"));
+    }
+}
+
+#[test]
 fn central_cup_preserves_layout_and_stock_code_and_removes_actual_volume() {
     let (mut request, profile) = fixture();
     let baseline = layout(&request, &profile);

@@ -96,7 +96,6 @@ fn validate(blocks: &[SavedBlock]) -> Result<(), ApiFailure> {
 pub(crate) fn seams(
     blocks: &[SavedBlock],
     run: &WallRun,
-    wall: &str,
     bottom: f64,
     top: f64,
     course_index: i64,
@@ -117,7 +116,7 @@ pub(crate) fn seams(
     let mut matching_saved = false;
     for b in blocks {
         let p = &b.placement;
-        if !b.wall_ids.is_empty() && !b.wall_ids.iter().any(|id| id == wall) {
+        if !b.wall_ids.is_empty() && !run.sources.iter().any(|s| b.wall_ids.contains(&s.wall_id)) {
             continue;
         }
         if (p.x_axis[0] * u[0] + p.x_axis[1] * u[1]).abs() < 1.0 - 1e-6 {
@@ -258,6 +257,11 @@ pub fn assign_grid_recesses(lamellas: &mut [Lamella], blocks: &[SavedBlock]) {
             }));
             let a = dot(a, axis);
             let b = dot(b, axis);
+            if lamella.recess_limits[0].is_some_and(|limit| a.min(b) < limit - quantum)
+                || lamella.recess_limits[1].is_some_and(|limit| a.max(b) > limit + quantum)
+            {
+                continue;
+            }
             if end.max(start).min(a.max(b)) - end.min(start).max(a.min(b)) > quantum {
                 lamella.recess_block_ids.insert(block.id.clone());
             }

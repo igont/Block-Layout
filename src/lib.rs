@@ -74,13 +74,7 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
     // Единая локальная копия нужна и ограничениям, и окончательной подрезке узлов.
     let mut effective = request.normalized();
     effective_geometry::normalize_beams(&mut effective);
-    for opening in &mut effective.opening_volumes {
-        if !opening.is_outside && opening.start_bottom_zmm.abs() < 0.01
-            && opening.end_bottom_zmm.abs() < 0.01 {
-            opening.start_bottom_zmm = -2.0 * profile.index_centimm as f64 / 100.0;
-            opening.end_bottom_zmm = opening.start_bottom_zmm;
-        }
-    }
+    effective_geometry::normalize_openings(&mut effective, profile.index_centimm as f64 / 100.0);
     let request = &effective;
     let building = match topology::normalize_building(request.raw_building()) {
         Ok(value) => value,
@@ -88,19 +82,15 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
             return failure(vec![ApiFailure::new("NORMALIZATION_FAILED", message, None)])
         }
     };
-    let topology = match topology::build_topology(building) {
+    let abutments = effective_geometry::beam_abutments(request);
+    let topology = match topology::build_topology_with_abutments(building, &abutments) {
         Ok(value) => value,
         Err(message) => return failure(vec![ApiFailure::new("TOPOLOGY_FAILED", message, None)]),
     };
     let openings: Vec<RawOpening> = request
         .opening_volumes
         .iter()
-        .filter(|o| {
-            matches!(
-                o.opening_type.as_str(),
-                "OPENING" | "CONSOLE" | "WINDOW" | "DOOR"
-            )
-        })
+        .filter(|o| effective_geometry::is_fb_opening(o))
         .map(|o| RawOpening {
             id: o.guid.clone(),
             start: RawPoint {
@@ -318,24 +308,14 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
     let mut diagnostics: Vec<ApiFailure> =
         layout.diagnostics.into_iter().map(layout_failure).collect();
     for wall in request.wall_volumes.iter().filter(|w| w.opening_type == "CONSOLE") {
-        if !constraints.console_axes.contains_key(&wall.guid) {
+        let Some(&(root, tip)) = constraints.console_axes.get(&wall.guid) else {
             diagnostics.push(ApiFailure::new("CONSOLE_ROOT_REQUIRED",
                 "Не найден корень консоли на непрерывной стене; материал сохранён", Some(wall.guid.clone())));
             continue;
-        }
-        for part in layout.layout.blocks.iter().filter(|b| !b.is_bridge && (b.product_key.as_deref() == Some("Type6")
-            || b.cuts.iter().any(|cut| cut.starts_with("Type6:")))
-            && b.source_ids.contains(&format!("wall:{}", wall.guid))
-            && constraints.console_axes.get(&wall.guid).is_some_and(|(root, tip)| {
-                let dx = tip.x_mm - root.x_mm;
-                let dy = tip.y_mm - root.y_mm;
-                let on_axis = |point: domain::Point| {
-                    ((point.x as f64 / 100. - root.x_mm) * dy
-                        - (point.y as f64 / 100. - root.y_mm) * dx).abs() <= 0.01 * dx.hypot(dy)
-                };
-                if b.arms.is_empty() { on_axis(b.start) && on_axis(b.end) }
-                else { b.arms.iter().all(|arm| on_axis(arm.start) && on_axis(arm.end)) }
-            })) {
+        };
+        let source = format!("wall:{}", wall.guid);
+        for part in layout.layout.blocks.iter().filter(|b| !b.is_bridge
+            && b.source_ids.contains(&source) && layout::console_node_at_root(b, root, tip)) {
             let mut warning = ApiFailure::new("CONSOLE_LINTEL_UNPLACED",
                 "Не удалось склеить доступные детали консоли в исходном ряду; материал сохранён",
                 Some(wall.guid.clone()));

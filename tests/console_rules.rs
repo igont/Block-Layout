@@ -1,4 +1,4 @@
-use fb_layout::{api::LayoutRequest, exchange, inspect_request, layout::Profile};
+use fb_layout::{api::LayoutRequest, code_result, exchange, inspect_request, layout::Profile};
 use serde_json::json;
 
 fn profile() -> Profile {
@@ -54,7 +54,7 @@ fn consoles_replace_all_type6_rows_without_vertical_shift_and_preserve_exchange(
     for bridge in bridges {
         assert!(320_000 - bridge.start.x > 79_650);
         assert_eq!(bridge.end.x, 399_650);
-        assert!(bridge.length_centimm <= 275_000);
+        assert_eq!(bridge.length_centimm, 239_650);
         assert!(bridge.cuts.iter().any(|c| c.starts_with("Type6:")));
     }
     let mut reversed = r.clone();
@@ -74,7 +74,27 @@ fn consoles_replace_all_type6_rows_without_vertical_shift_and_preserve_exchange(
     );
     assert!(bridges
         .iter()
-        .all(|b| b.start.x == 224_000 && b.end.x == 399_650));
+        .all(|b| b.start.x == 160_000 && b.end.x == 399_650));
+}
+
+#[test]
+fn maximum_length_uses_the_last_existing_joint_within_the_cap() {
+    let p = profile();
+    for (overhang, joint, length) in [(1096.5, 2240.0, 2056.5), (1075.0, 1600.0, 2675.0)] {
+        let r = request(overhang);
+        let result = inspect_request(&r, &p);
+        let standard = exchange::from_layout_request(&r, &p).unwrap();
+        let coded = code_result::export_blocks(&standard, &r, &p, &result.blocks, &result.diagnostics).unwrap();
+        let parts = coded["blocks"].as_array().unwrap();
+        for course in [8, 10, 12] {
+            let bridge = parts.iter().find(|b| b["course_index"] == course && b["product_type"] == "Перемычка").unwrap();
+            assert_eq!(bridge["nominal_length_mm"], length);
+            assert_eq!(bridge["placement"]["origin_mm"][0], joint);
+            assert_eq!(bridge["node_cuts"][0]["position_mm"], 3200.0 - joint);
+            assert!(result.blocks.iter().any(|b| b.course_index == course
+                && b.end.x == (joint * 100.0) as i64 && b.end.y == 0 && b.length_centimm == 64_000));
+        }
+    }
 }
 
 #[test]
@@ -111,7 +131,7 @@ fn overlong_console_uses_available_whole_blocks_within_product_length() {
     assert!(!bridges.is_empty());
     assert_eq!(bridges.iter().map(|b| b.course_index).collect::<std::collections::BTreeSet<_>>(),
         std::collections::BTreeSet::from([8, 10, 12]));
-    assert!(bridges.iter().all(|b| b.length_centimm <= 275_000));
+    assert!(bridges.iter().all(|b| b.length_centimm <= 267_500));
     assert!(result.diagnostics.iter().all(|d| d.code != "CONSOLE_LINTEL_UNPLACED"));
 }
 

@@ -460,7 +460,109 @@ fn course_vertices(runs: &[WallRun]) -> Vec<CourseVertex> {
         .collect()
 }
 
+pub(crate) struct BeamAbutment {
+    start: Point,
+    end: Point,
+    bottom: i64,
+    top: i64,
+}
+
+impl BeamAbutment {
+    pub(crate) fn new(
+        start: crate::domain::RawPoint,
+        end: crate::domain::RawPoint,
+        bottom: f64,
+        top: f64,
+    ) -> Option<Self> {
+        Some(Self {
+            start: point(start).ok()?,
+            end: point(end).ok()?,
+            bottom: scaled(bottom, "beam bottom").ok()?,
+            top: scaled(top, "beam top").ok()?,
+        })
+    }
+}
+
+fn trim_abutting_stems(
+    edges: &mut Vec<CourseEdge>,
+    walls: &BTreeMap<&str, &NormalizedWall>,
+    beam_ends: &BTreeMap<(Point, u16), Vec<(i64, i64)>>,
+    course_z: i64,
+) {
+    let covers_course = |&(bottom, top): &(i64, i64)| {
+        bottom <= course_z && top >= course_z + COURSE_STEP
+    };
+    if !beam_ends.values().flatten().any(covers_course) {
+        return;
+    }
+    let mut incidence = BTreeMap::<Point, Vec<(usize, Point, u16)>>::new();
+    for (index, edge) in edges.iter().enumerate() {
+        if let Ok(axis) = direction(edge.start, edge.end) {
+            incidence.entry(edge.start).or_default().push((index, edge.end, axis));
+            incidence.entry(edge.end).or_default().push((index, edge.start, (axis + 180) % 360));
+        }
+    }
+    for (vertex, rays) in incidence {
+        if rays.len() != 3 {
+            continue;
+        }
+        let Some((stem, tip, axis)) = rays.iter().copied().find(|(_, _, axis)| {
+            !rays.iter().any(|(_, _, other)| *other == (axis + 180) % 360)
+        }) else {
+            continue;
+        };
+        let through: Vec<_> = rays.iter().filter(|(i, _, _)| *i != stem).collect();
+        let stem_width = walls[edges[stem].wall_id.as_str()].thickness;
+        let width = walls[edges[through[0].0].wall_id.as_str()].thickness;
+        if through.iter().any(|(index, end, other)| {
+            other.abs_diff(axis) % 180 != 90
+                || walls[edges[*index].wall_id.as_str()].thickness != width
+                || 2 * metric_distance(vertex, *end) < stem_width
+        }) {
+            continue;
+        }
+
+        let (dx, dy) = ((tip.x - vertex.x) as f64, (tip.y - vertex.y) as f64);
+        let length = dx.hypot(dy);
+        let fraction = width as f64 / (2.0 * length);
+        if fraction > 1.0 {
+            continue;
+        }
+        let face = Point {
+            x: (vertex.x as f64 + dx * fraction).round_ties_even() as i64,
+            y: (vertex.y as f64 + dy * fraction).round_ties_even() as i64,
+        };
+        if !beam_ends.get(&(face, axis)).is_some_and(|ends| ends.iter().any(covers_course)) {
+            continue;
+        }
+
+        // The through wall already owns the volume from the axis to its face.
+        // Only the exterior part of the stem can reserve separate stock.
+        let edge = &mut edges[stem];
+        if edge.start == vertex {
+            edge.start = face;
+        } else {
+            edge.end = face;
+        }
+    }
+    edges.retain(|edge| edge.start < edge.end);
+}
+
 pub fn build_topology(building: NormalizedBuilding) -> Result<Topology, String> {
+    build_topology_with_abutments(building, &[])
+}
+
+pub(crate) fn build_topology_with_abutments(
+    building: NormalizedBuilding,
+    beams: &[BeamAbutment],
+) -> Result<Topology, String> {
+    let mut beam_ends = BTreeMap::<_, Vec<_>>::new();
+    for beam in beams {
+        if let Ok(axis) = direction(beam.start, beam.end) {
+            beam_ends.entry((beam.start, axis)).or_default().push((beam.bottom, beam.top));
+            beam_ends.entry((beam.end, (axis + 180) % 360)).or_default().push((beam.bottom, beam.top));
+        }
+    }
     let mut splits: BTreeMap<String, BTreeSet<Point>> = building
         .walls
         .iter()
@@ -551,6 +653,7 @@ pub fn build_topology(building: NormalizedBuilding) -> Result<Topology, String> 
                     }
                 }
             }
+            trim_abutting_stems(&mut course_edges, &walls_by_id, &beam_ends, z);
             if !course_edges.is_empty() {
                 let runs = wall_runs(&course_edges, &walls_by_id);
                 let vertices = course_vertices(&runs);
@@ -621,6 +724,32 @@ mod tests {
     }
     fn topology(walls: Vec<RawWall>) -> Topology {
         build_topology(normalize_building(RawBuilding { z0_mm: 0.0, walls }).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn only_full_course_contact_at_the_wall_face_absorbs_the_stem() {
+        let building = normalize_building(RawBuilding {
+            z0_mm: 0.0,
+            walls: vec![
+                wall("through", (0.0, -1280.0), (0.0, 1280.0), 0.0, 126.0),
+                wall("stem", (0.0, 0.0), (1280.0, 0.0), 0.0, 126.0),
+            ],
+        }).unwrap();
+        for (x, top, bypasses_stem) in [
+            (100.0, 63.0, true),
+            (100.01, 63.0, false),
+            (99.99, 63.0, false),
+            (100.0, 62.99, false),
+        ] {
+            let end = |x_mm| RawPoint { x_mm, y_mm: 0.0 };
+            let beam = BeamAbutment::new(end(x), end(1100.0), 0.0, top).unwrap();
+            let result = build_topology_with_abutments(building.clone(), &[beam]).unwrap();
+            let has_junction = |course: &Course| course.vertices.iter().any(|v| {
+                v.point == (Point { x: 0, y: 0 }) && v.rays.len() == 3
+            });
+            assert_eq!(has_junction(&result.courses[0]), !bypasses_stem, "{x}, {top}");
+            assert!(has_junction(&result.courses[1]));
+        }
     }
 
     #[test]

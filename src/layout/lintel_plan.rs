@@ -1,9 +1,51 @@
 //! Exact local selection of whole opening sets and their stock ownership.
 use super::*;
+use std::cmp::Reverse;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Cost {
+    cuts: usize,
+    length_centimm: i64,
+}
+
+impl Cost {
+    fn for_bridges(bridges: &[Block]) -> Self {
+        bridges.iter().fold(Self::default(), |total, bridge| {
+            // Count profiled cuts by type, position and face. Source IDs only
+            // describe provenance, and straight end trims are separate operations.
+            let cuts: BTreeSet<_> = bridge
+                .cuts
+                .iter()
+                .filter(|cut| cut.starts_with("Type"))
+                .filter_map(|cut| cut.match_indices(':').nth(2).map(|(end, _)| &cut[..end]))
+                .collect();
+            total.plus(Self {
+                cuts: cuts.len(),
+                length_centimm: bridge.length_centimm,
+            })
+        })
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            cuts: self.cuts + other.cuts,
+            length_centimm: self.length_centimm + other.length_centimm,
+        }
+    }
+
+    fn share(self, index: usize, count: usize) -> Self {
+        let (i, n) = (index as i64, count as i64);
+        Self {
+            cuts: self.cuts / count + usize::from(index < self.cuts % count),
+            length_centimm: self.length_centimm / n + i64::from(i < self.length_centimm % n),
+        }
+    }
+}
 
 struct Variant {
     removed: BTreeSet<String>,
     bridges: Vec<Block>,
+    cost: Cost,
 }
 
 struct Row {
@@ -17,6 +59,7 @@ struct Row {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Score {
     total: usize,
+    cost: Reverse<Cost>,
     fairness: Vec<usize>,
     lower: Vec<usize>,
     unshifted: usize,
@@ -27,11 +70,39 @@ struct Search<'a> {
     rows: &'a [Row],
     indices: &'a [usize],
     opening_count: usize,
-    packet_count: usize,
+    layer_count: usize,
     best: Option<(Score, Vec<Option<usize>>)>,
 }
 
-impl Search<'_> {
+impl<'a> Search<'a> {
+    fn solve(
+        rows: &'a [Row],
+        indices: &'a [usize],
+        opening_count: usize,
+    ) -> Option<(Score, Vec<Option<usize>>)> {
+        let mut search = Self {
+            rows,
+            indices,
+            opening_count,
+            layer_count: indices
+                .iter()
+                .flat_map(|&index| &rows[index].layers)
+                .max()
+                .unwrap_or(&0)
+                + 1,
+            best: None,
+        };
+        search.visit(
+            0,
+            &mut vec![None; opening_count],
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+            Cost::default(),
+        );
+        search.best
+    }
+
     fn optimistic_score(
         &self,
         position: usize,
@@ -39,8 +110,9 @@ impl Search<'_> {
         used: &BTreeSet<String>,
         claimed: &BTreeSet<(usize, usize)>,
         choices: &[Option<usize>],
+        cost: Cost,
     ) -> Score {
-        let mut possible = claimed.clone();
+        let mut cheapest = BTreeMap::<_, Cost>::new();
         let mut spatial: Vec<_> = choices
             .iter()
             .map(|choice| match choice {
@@ -51,52 +123,44 @@ impl Search<'_> {
             .collect();
         for &index in &self.indices[position..] {
             let row = &self.rows[index];
-            let claims: Vec<_> = row
-                .openings
-                .iter()
-                .copied()
-                .zip(row.layers.iter().copied())
-                .collect();
             let mut preference = 0;
-            if !claims.iter().any(|claim| claimed.contains(claim)) {
+            let claims = || row.openings.iter().copied().zip(row.layers.iter().copied());
+            if !claims().any(|claim| claimed.contains(&claim)) {
                 for offset in 0..2 {
                     if row.openings.iter().any(|opening| offsets[*opening].is_some_and(|fixed| fixed != offset)) {
                         continue;
                     }
-                    if row.variants[offset]
+                    if let Some(variant) = row.variants[offset]
                         .as_ref()
-                        .is_some_and(|variant| variant.removed.is_disjoint(used))
+                        .filter(|variant| variant.removed.is_disjoint(used))
                     {
-                        possible.extend(claims.iter().copied());
+                        for (index, claim) in claims().enumerate() {
+                            let share = variant.cost.share(index, row.openings.len());
+                            cheapest.entry(claim).and_modify(|cost| *cost = (*cost).min(share))
+                                .or_insert(share);
+                        }
                         preference = preference.max(if offset == 0 { 2 } else { 1 });
                     }
                 }
             }
             spatial.push(preference);
         }
-        // This union deliberately ignores conflicts between future rows: each
-        // completion is a subset, so every objective field is an upper bound.
-        // Duplicated run representations contribute only one opening layer.
+        // A completion can reach this row count only by covering every claim.
+        // For that count, their cheapest shares bound the cost even for a bridge
+        // serving multiple openings. Each such bridge pays its cost only once.
         let mut counts = vec![0; self.opening_count];
-        let mut lower = vec![
-            0;
-            self.rows
-                .iter()
-                .flat_map(|r| r.layers.iter().copied())
-                .max()
-                .unwrap_or(0)
-                + 1
-        ];
-        for &(opening, layer) in &possible {
+        let mut lower = vec![0; self.layer_count];
+        for &(opening, layer) in claimed.iter().chain(cheapest.keys()) {
             counts[opening] += 1;
             lower[layer] += 1;
         }
         counts.sort();
         Score {
-            total: possible.len(),
+            total: claimed.len() + cheapest.len(),
+            cost: Reverse(cheapest.into_values().fold(cost, Cost::plus)),
             fairness: counts,
             lower,
-            unshifted: self.packet_count
+            unshifted: self.opening_count
                 - offsets.iter().filter(|offset| **offset == Some(1)).count(),
             spatial,
         }
@@ -109,14 +173,13 @@ impl Search<'_> {
         used: &mut BTreeSet<String>,
         claimed: &mut BTreeSet<(usize, usize)>,
         choices: &mut Vec<Option<usize>>,
-        total: usize,
+        cost: Cost,
     ) {
-        let upper = self.optimistic_score(position, offsets, used, claimed, choices);
+        let upper = self.optimistic_score(position, offsets, used, claimed, choices, cost);
         if self.best.as_ref().is_some_and(|(score, _)| upper <= *score) {
             return;
         }
         if position == self.indices.len() {
-            debug_assert_eq!(upper.total, total);
             self.best = Some((upper, choices.clone()));
             return;
         }
@@ -128,7 +191,9 @@ impl Search<'_> {
             .copied()
             .zip(row.layers.iter().copied())
             .collect();
-        for offset in 0..2 {
+        let mut variants = [0, 1];
+        variants.sort_by_key(|&offset| row.variants[offset].as_ref().map(|variant| variant.cost));
+        for offset in variants {
             if row.openings.iter().any(|opening| offsets[*opening].is_some_and(|fixed| fixed != offset)) {
                 continue;
             }
@@ -154,7 +219,7 @@ impl Search<'_> {
                 used,
                 claimed,
                 choices,
-                total + row.openings.len(),
+                cost.plus(variant.cost),
             );
             choices.pop();
             for id in &variant.removed {
@@ -166,7 +231,7 @@ impl Search<'_> {
             for (&opening, previous) in row.openings.iter().zip(previous) { offsets[opening] = previous; }
         }
         choices.push(None);
-        self.visit(position + 1, offsets, used, claimed, choices, total);
+        self.visit(position + 1, offsets, used, claimed, choices, cost);
         choices.pop();
     }
 }
@@ -177,6 +242,35 @@ fn root(parents: &mut [usize], mut index: usize) -> usize {
         index = parents[index];
     }
     index
+}
+
+fn independent_choices(rows: &[Row], indices: &[usize]) -> Option<Vec<Option<usize>>> {
+    let first = &rows[indices[0]];
+    let mut layers = BTreeSet::new();
+    if first.openings.len() != 1 || indices.iter().any(|&index| {
+        let row = &rows[index];
+        row.openings != first.openings || !layers.insert(row.layer)
+    }) {
+        return None;
+    }
+
+    // One opening, with each layer on its own course within a phase. There
+    // are only two whole-set choices and every available layer can be kept.
+    (0..2).map(|offset| {
+        let mut total = 0;
+        let mut cost = Cost::default();
+        let mut lower = vec![false; layers.last().unwrap() + 1];
+        let choices = indices.iter().map(|&index| {
+            let row = &rows[index];
+            row.variants[offset].as_ref().map(|variant| {
+                total += 1;
+                cost = cost.plus(variant.cost);
+                lower[row.layer] = true;
+                offset
+            })
+        }).collect();
+        ((total, Reverse(cost), lower, Reverse(offset)), choices)
+    }).max_by(|(a, _), (b, _)| a.cmp(b)).map(|(_, choices)| choices)
 }
 
 pub(super) fn merge(
@@ -274,7 +368,11 @@ pub(super) fn merge(
             groups.push(group);
         }
     }
-    let original_ids: BTreeSet<_> = blocks.iter().map(|b| b.id.clone()).collect();
+    let mut stock_by_course = BTreeMap::<_, Vec<_>>::new();
+    for block in blocks.iter() {
+        stock_by_course.entry(block.course_index).or_default().push(block);
+    }
+    let mut subset = requested.clone();
     let mut rows = Vec::new();
     for candidates in groups {
         let openings: Vec<_> = candidates
@@ -286,15 +384,20 @@ pub(super) fn merge(
             .map(|c| ((c.course_index - first_courses[opening_index[&c.opening_id]]) / 2) as usize)
             .collect();
         let layer = *layers.iter().min().unwrap();
+        let course = candidates[0].course_index;
+        subset.lintel_candidates.clone_from(&candidates);
         let variants = std::array::from_fn(|offset| {
             if !candidates.iter().all(|c| {
                 lintel_course_has_wall_height(topology, &requested, c, profile, offset as i64)
             }) {
                 return None;
             }
-            let mut subset = requested.clone();
-            subset.lintel_candidates = candidates.clone();
-            let mut trial = blocks.clone();
+            // The trial reads the target course and checks the base course
+            // for an existing lintel. Stock elsewhere cannot affect it.
+            let stock = stock_by_course.range(course..=course + offset as i64)
+                .flat_map(|(_, blocks)| blocks.iter().copied());
+            let mut remaining: BTreeSet<_> = stock.clone().map(|part| part.id.as_str()).collect();
+            let mut trial: Vec<_> = stock.cloned().collect();
             let placed = merge_t_lintels_at_offset(
                 &mut trial,
                 &subset,
@@ -309,13 +412,13 @@ pub(super) fn merge(
             {
                 return None;
             }
-            let retained: BTreeSet<_> = trial.iter().map(|b| b.id.clone()).collect();
-            let removed = original_ids.difference(&retained).cloned().collect();
-            let bridges = trial
+            let bridges: Vec<_> = trial
                 .into_iter()
-                .filter(|b| !original_ids.contains(&b.id))
+                .filter(|b| !remaining.remove(b.id.as_str()))
                 .collect();
-            Some(Variant { removed, bridges })
+            let removed = remaining.into_iter().map(str::to_owned).collect();
+            let cost = Cost::for_bridges(&bridges);
+            Some(Variant { removed, bridges, cost })
         });
         rows.push(Row {
             candidates,
@@ -326,11 +429,14 @@ pub(super) fn merge(
         });
     }
     rows.sort_by_key(|row| (row.openings.iter().copied().min().unwrap(), row.layer));
-    // Components share either a whole-set phase or a stock piece in any phase.
+    // Only feasible rows can link openings through a shared phase or stock.
     let mut components: Vec<_> = (0..rows.len()).collect();
     let mut stock_owner = BTreeMap::new();
     let mut opening_owner = BTreeMap::new();
     for (index, row) in rows.iter().enumerate() {
+        if row.variants.iter().all(Option::is_none) {
+            continue;
+        }
         let mut neighbours = Vec::new();
         for &opening in &row.openings {
             if let Some(old) = opening_owner.insert(opening, index) {
@@ -351,7 +457,7 @@ pub(super) fn merge(
         }
     }
     let mut local: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for index in 0..rows.len() {
+    for (index, _) in rows.iter().enumerate().filter(|(_, row)| row.variants.iter().any(Option::is_some)) {
         local
             .entry(root(&mut components, index))
             .or_default()
@@ -359,22 +465,9 @@ pub(super) fn merge(
     }
     let mut choices = vec![None; rows.len()];
     for indices in local.values() {
-        let mut search = Search {
-            rows: &rows,
-            indices,
-            opening_count: ids.len(),
-            packet_count: ids.len(),
-            best: None,
-        };
-        search.visit(
-            0,
-            &mut vec![None; ids.len()],
-            &mut BTreeSet::new(),
-            &mut BTreeSet::new(),
-            &mut Vec::new(),
-            0,
-        );
-        if let Some((_, best)) = search.best {
+        let best = independent_choices(&rows, indices)
+            .or_else(|| Search::solve(&rows, indices, ids.len()).map(|(_, choices)| choices));
+        if let Some(best) = best {
             for (&index, choice) in indices.iter().zip(best) {
                 choices[index] = choice;
             }
@@ -404,7 +497,6 @@ pub(super) fn merge(
                 if *layer == 0 || completed.contains(&(candidate.course_index, candidate.opening_id.clone())) {
                     continue;
                 }
-                let mut subset = requested.clone();
                 subset.lintel_candidates = vec![candidate.clone()];
                 preserve_upper_lintel_rows(blocks, topology, &subset, profile,
                     offsets[opening_index[&candidate.opening_id]] as i64);
@@ -429,6 +521,7 @@ mod tests {
                 ids.map(|ids| Variant {
                     removed: ids.iter().map(|id| (*id).to_owned()).collect(),
                     bridges: Vec::new(),
+                    cost: Cost::default(),
                 })
             }),
         }
@@ -439,22 +532,7 @@ mod tests {
         let mut indices: Vec<_> = (0..rows.len()).collect();
         indices.sort_by_key(|i| (rows[*i].openings[0], rows[*i].layer));
         let count = rows.iter().flat_map(|r| r.openings.iter().copied()).max().unwrap() + 1;
-        let mut search = Search {
-            rows,
-            indices: &indices,
-            opening_count: count,
-            packet_count: count,
-            best: None,
-        };
-        search.visit(
-            0,
-            &mut vec![None; count],
-            &mut BTreeSet::new(),
-            &mut BTreeSet::new(),
-            &mut Vec::new(),
-            0,
-        );
-        let (score, choices) = search.best.unwrap();
+        let (score, choices) = Search::solve(rows, &indices, count).unwrap();
         let mut selected = BTreeMap::new();
         for (index, choice) in indices.iter().zip(choices) {
             for (&opening, &layer) in rows[*index].openings.iter().zip(&rows[*index].layers) {
@@ -483,6 +561,44 @@ mod tests {
         let (reversed_score, reversed) = solve(&rows);
         assert!(score == reversed_score);
         assert_eq!(selected, reversed);
+    }
+
+    #[test]
+    fn neighbours_minimize_the_total_cuts_then_length_across_both_phases() {
+        let mut rows = vec![
+            row(0, 0, 0, [Some(&["shared"]), Some(&["a-shifted"])]),
+            row(1, 1, 0, [Some(&["shared"]), Some(&["b-shifted"])]),
+        ];
+        for (row, costs) in rows.iter_mut().zip([[(0, 100_000), (1, 95_000)], [(0, 100_000), (0, 140_000)]]) {
+            for (variant, (cuts, length_centimm)) in row.variants.iter_mut().zip(costs) {
+                variant.as_mut().unwrap().cost = Cost { cuts, length_centimm };
+            }
+        }
+        let (score, selected) = solve(&rows);
+        assert_eq!(score.total, 2);
+        assert_eq!(score.cost.0, Cost { cuts: 0, length_centimm: 240_000 });
+        assert_eq!(selected, BTreeMap::from([((0, 0), Some(0)), ((1, 0), Some(1))]));
+
+        rows[0].variants[1].as_mut().unwrap().cost.cuts = 0;
+        let (score, selected) = solve(&rows);
+        assert_eq!(score.cost.0, Cost { cuts: 0, length_centimm: 195_000 });
+        assert_eq!(selected, BTreeMap::from([((0, 0), Some(1)), ((1, 0), Some(0))]));
+    }
+
+    #[test]
+    fn shared_bridge_contributes_one_length_and_one_set_of_cuts() {
+        let mut combined = row(0, 0, 0, [None, Some(&["a", "pier", "b"])]);
+        combined.openings = vec![0, 1];
+        combined.layers = vec![0, 0];
+        combined.variants[1].as_mut().unwrap().cost = Cost { cuts: 1, length_centimm: 185_001 };
+        let mut left = row(0, 0, 0, [Some(&["left"]), None]);
+        left.variants[0].as_mut().unwrap().cost = Cost { cuts: 1, length_centimm: 100_000 };
+        let mut right = row(1, 1, 0, [Some(&["right"]), None]);
+        right.variants[0].as_mut().unwrap().cost = Cost { cuts: 0, length_centimm: 100_000 };
+        let (score, selected) = solve(&[left, right, combined]);
+        assert_eq!(score.total, 2);
+        assert_eq!(score.cost.0, Cost { cuts: 1, length_centimm: 185_001 });
+        assert_eq!(selected, BTreeMap::from([((0, 0), Some(1)), ((1, 0), Some(1))]));
     }
 
     #[test]

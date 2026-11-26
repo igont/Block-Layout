@@ -75,6 +75,47 @@ fn saved_geometry_roundoff_does_not_change_lamella_output() {
 }
 
 #[test]
+fn transverse_beam_stops_saved_lamellas_and_whole_side_recesses() {
+    let mut r = request();
+    r.model.beams[0].end_mm[0] = 964.0;
+    let mut transverse = r.model.beams[0].clone();
+    transverse.id = "transverse".into();
+    transverse.start_mm = [900.0, -500.0, 0.0];
+    transverse.end_mm = [900.0, 500.0, 0.0];
+    transverse.width_mm = 120.0;
+    r.model.beams.push(transverse);
+    let mut near = saved(600.0);
+    near.id = "near".into();
+    near.length_mm = 240.0;
+    near.grid_end_mm = Some([840.0, 0.0, 0.0]);
+    let mut across = saved(320.0);
+    across.id = "across".into();
+    let mut beyond = saved(960.0);
+    beyond.id = "beyond".into();
+    r.model.saved_blocks = Some(vec![across, near, beyond]);
+
+    let result = lamella_saved::export(&r, &profile()).unwrap();
+    let strips = result["lamellas"].as_array().unwrap();
+    assert_eq!(strips.len(), 2);
+    for l in strips {
+        assert_eq!(xbounds(l), (320.0, 840.0));
+        assert_eq!(l["recess_block_ids"], json!(["near"]));
+        assert_eq!(l["beam_ids"], json!(["beam"]));
+    }
+
+    r.model.beams[0].end_mm[0] = 1100.0;
+    let result = lamella_saved::export(&r, &profile()).unwrap();
+    let strips = result["lamellas"].as_array().unwrap();
+    assert_eq!(strips.len(), 4);
+    for l in strips {
+        let (from, to) = xbounds(l);
+        let id = if from >= 960.0 { "beyond" } else { "near" };
+        assert!(to <= 840.0 || from >= 960.0);
+        assert_eq!(l["recess_block_ids"], json!([id]));
+    }
+}
+
+#[test]
 fn short_full_width_remnant_keeps_base_cell_and_authorizes_only_its_recess() {
     let mut r = request();
     let mut short = saved(640.0);

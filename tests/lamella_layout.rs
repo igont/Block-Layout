@@ -424,3 +424,168 @@ fn five_mm_beam_allowance_does_not_select_neighbor_cells_or_lower_course() {
         }
     }
 }
+
+#[test]
+fn perpendicular_corner_uses_the_inner_and_outer_face_lengths() {
+    for reversed in [false, true] {
+        let endpoints = if reversed {
+            ([1920.0, 0.0], [0.0, 0.0])
+        } else {
+            ([0.0, 0.0], [1920.0, 0.0])
+        };
+        let r = request(
+            vec![
+                wall("through", endpoints.0, endpoints.1),
+                wall("return", [0.0, 0.0], [0.0, 900.0]),
+            ],
+            vec![beam("beam", [0.0, 0.0], [500.0, 0.0])],
+        );
+        let plan = lamella::calculate(&r, &profile(), &[]).unwrap();
+        for (side, expected) in [("left", (96.5, 320.0)), ("right", (-96.5, 320.0))] {
+            let first = plan
+                .lamellas
+                .iter()
+                .filter(|l| l.course_index == 0 && l.side == side)
+                .map(bounds)
+                .min_by(|a, b| a[0].total_cmp(&b[0]))
+                .unwrap();
+            close(first[0], expected.0);
+            close(first[1], expected.1);
+        }
+    }
+}
+
+#[test]
+fn tee_splits_the_near_face_at_the_stem_but_keeps_the_far_face_grid() {
+    let mut stem = wall("stem", [800.0, 0.0], [800.0, 900.0]);
+    stem["thicknessMm"] = json!(250);
+    let r = request(
+        vec![wall("through", [0.0, 0.0], [1920.0, 0.0]), stem],
+        vec![beam("beam", [650.0, 0.0], [710.0, 0.0])],
+    );
+    let plan = lamella::calculate(&r, &profile(), &[]).unwrap();
+    let spans: Vec<_> = plan
+        .lamellas
+        .iter()
+        .filter(|l| l.course_index == 0)
+        .map(|l| (l.side, bounds(l)))
+        .collect();
+    assert_eq!(spans.len(), 2);
+    for (side, expected) in [("left", (320.0, 675.0)), ("right", (320.0, 960.0))] {
+        let (_, part) = spans.iter().find(|(name, _)| *name == side).unwrap();
+        close(part[0], expected.0);
+        close(part[1], expected.1);
+    }
+}
+
+#[test]
+fn transverse_beam_blocks_only_the_side_and_courses_it_reaches() {
+    let mut facade_wall = wall("wall", [0.0, 0.0], [1920.0, 0.0]);
+    facade_wall["startTopZmm"] = json!(189);
+    facade_wall["endTopZmm"] = json!(189);
+    let mut stop = beam("transverse", [900.0, 500.0], [900.0, 50.0]);
+    stop["startZmm"] = json!(63);
+    stop["endZmm"] = json!(63);
+    stop["geometry"]["widthMm"] = json!(120);
+    stop["geometry"]["heightMm"] = json!(63);
+    let r = request(
+        vec![facade_wall],
+        vec![beam("longitudinal", [700.0, 0.0], [850.0, 0.0]), stop],
+    );
+    let plan = lamella::calculate(&r, &profile(), &[]).unwrap();
+    assert_eq!(plan.lamellas.len(), 6);
+    for part in plan.lamellas {
+        let expected = match (part.course_index, part.side) {
+            (1, "left") => (640.0, 840.0),
+            (1, "right") => (640.0, 1280.0),
+            _ => (320.0, 960.0),
+        };
+        assert_eq!(
+            part.beam_ids,
+            std::collections::BTreeSet::from(["longitudinal".to_owned()])
+        );
+        close(bounds(&part)[0], expected.0);
+        close(bounds(&part)[1], expected.1);
+    }
+}
+
+#[test]
+fn opening_jambs_clip_the_step_only_in_intersected_courses() {
+    let mut main = wall("wall", [0.0, 0.0], [1920.0, 0.0]);
+    main["startTopZmm"] = json!(189);
+    main["endTopZmm"] = json!(189);
+    let mut r = request(vec![main], vec![beam("beam", [0.0, 0.0], [1920.0, 0.0])]);
+    r.opening_volumes = serde_json::from_value(json!([
+        {"guid":"sloped-opening","openingType":"OPENING","isOutside":true,
+         "startXmm":1090,"startYmm":0,"endXmm":850,"endYmm":0,
+         "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":94.5,"endTopZmm":31.5},
+        {"guid":"other-wall","openingType":"WINDOW","isOutside":true,
+         "startXmm":550,"startYmm":450,"endXmm":800,"endYmm":450,
+         "startBottomZmm":0,"endBottomZmm":0,"startTopZmm":189,"endTopZmm":189}
+    ]))
+    .unwrap();
+    let plan = lamella::calculate(&r, &profile(), &[]).unwrap();
+    for side in ["left", "right"] {
+        for (course, opening_start) in [(0, 850.0), (1, 970.0)] {
+            let spans: Vec<_> = plan
+                .lamellas
+                .iter()
+                .filter(|l| l.side == side && l.course_index == course)
+                .map(bounds)
+                .collect();
+            assert!(spans
+                .iter()
+                .all(|b| b[1] <= opening_start || b[0] >= 1090.0));
+            assert!(spans.iter().any(|b| b[1] == opening_start));
+            assert!(spans.iter().any(|b| b[0] == 1090.0));
+            assert!(spans.iter().any(|b| b[0] <= 550.0 && b[1] > 550.0));
+        }
+        assert!(plan
+            .lamellas
+            .iter()
+            .any(|l| l.side == side && l.course_index == 2 && bounds(l)[0] == 960.0));
+    }
+}
+
+#[test]
+fn blind_beam_end_covers_the_far_face_and_meets_the_longitudinal_strip() {
+    for (end_x, has_cover) in [(-80.0, true), (-70.0, false), (-200.0, false)] {
+        let r = request(
+            vec![
+                wall("through", [0.0, 0.0], [1920.0, 0.0]),
+                wall("return", [0.0, -960.0], [0.0, 0.0]),
+            ],
+            vec![beam("beam", [end_x, 0.0], [900.0, 0.0])],
+        );
+        let plan = lamella::calculate(&r, &profile(), &[]).unwrap();
+        let covers: Vec<_> = plan
+            .lamellas
+            .iter()
+            .filter(|l| l.wall_ids.contains("return"))
+            .collect();
+        if has_cover {
+            assert_eq!(covers.len(), 2);
+            for cover in covers {
+                let b = bounds(cover);
+                close(b[0], -96.5);
+                close(b[1], -81.5);
+                close(b[3], 81.5);
+                assert!(b[2] < -80.0);
+                let mate = plan
+                    .lamellas
+                    .iter()
+                    .filter(|l| {
+                        l.course_index == cover.course_index
+                            && l.wall_ids.contains("through")
+                            && l.side == "left"
+                    })
+                    .map(bounds)
+                    .min_by(|a, b| a[0].total_cmp(&b[0]))
+                    .unwrap();
+                close(mate[2], b[3]);
+            }
+        } else {
+            assert!(covers.is_empty());
+        }
+    }
+}
