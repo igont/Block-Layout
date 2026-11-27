@@ -382,9 +382,14 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
         note.source_ids = special;
         diagnostics.push(note);
     }
-    let short: Vec<String> = layout
-        .layout
-        .blocks
+    let blocks = match layout::finalize_parts(request, profile, &layout.layout.blocks) {
+        Ok(blocks) => blocks,
+        Err(error) => return failure(vec![error]),
+    };
+    let (blocks,removed)=match roof::retain_material(request,blocks) {
+        Ok(result)=>result,Err(error)=>return failure(vec![error]),
+    };
+    let short: Vec<String> = blocks
         .iter()
         .filter(|b| b.kind == "ordinary" && b.length_centimm < profile.minimum_cut_centimm)
         .map(|b| b.id.clone())
@@ -394,13 +399,6 @@ pub fn inspect_request(request: &LayoutRequest, profile: &Profile) -> CandidateR
         note.source_ids = short;
         diagnostics.push(note);
     }
-    let blocks = match layout::finalize_parts(request, profile, &layout.layout.blocks) {
-        Ok(blocks) => blocks,
-        Err(error) => return failure(vec![error]),
-    };
-    let (blocks,removed)=match roof::retain_material(request,blocks) {
-        Ok(result)=>result,Err(error)=>return failure(vec![error]),
-    };
     if !removed.is_empty() {
         let mut note=ApiFailure::new("ROOF_BLOCKS_EXCLUDED",format!("Исключено {} деталей целиком выше границы кровли",removed.len()),None);
         note.source_ids=removed;diagnostics.push(note);

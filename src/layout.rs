@@ -4292,8 +4292,9 @@ pub fn calculate_candidate(
                 .map(|interval| interval.end - interval.start)
                 .unwrap_or(0);
             let mut warning = diagnostic(DiagnosticCode::NodeDistalWallTrim,
-                format!("Плечо узла подрезано реальной границей стены на {}: материал {}, каталожная заготовка {} сохранена вместе с фиксированным стыком",
-                    arm.nominal_length_centimm - actual, actual, arm.nominal_length_centimm), None, Some(course));
+                format!("Плечо узла подрезано по границе стены на {:.2} мм. Длина детали {:.2} мм, заготовка {:.2} мм. Фиксированный стык сохранён.",
+                    (arm.nominal_length_centimm - actual) as f64 / 100.0,
+                    actual as f64 / 100.0, arm.nominal_length_centimm as f64 / 100.0), None, Some(course));
             warning.edge_id = Some(arm.run_id.clone());
             warning.source_ids = arm.cut_source_ids.clone();
             vertical_errors.push(warning);
